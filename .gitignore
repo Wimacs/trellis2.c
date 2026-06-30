@@ -3,12 +3,16 @@
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
+cmake_install.cmake
 compile_commands.json
 CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
 Testing/
 *.o
 *.a
 *.so
+*.d
 *.dylib
 *.dll
 *.exe
@@ -29,3 +33,5 @@ outputs/
 __pycache__/
 *.swp
 .DS_Store
+*.tmp
+*.log
