@@ -1,0 +1,31 @@
+# Build outputs
+/build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Runtime dumps and generated outputs
+benchmark_outputs/
+out/
+outputs/
+*.ply
+*.obj
+*.glb
+*.bin
+*.f32
+*.i32
+
+# Local editor/cache files
+.cache/
+__pycache__/
+*.swp
+.DS_Store

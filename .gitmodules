@@ -1,0 +1,6 @@
+[submodule "3rd/ggml"]
+	path = 3rd/ggml
+	url = https://github.com/Wimacs/ggml.git
+[submodule "3rd/raylib"]
+	path = 3rd/raylib
+	url = https://github.com/raysan5/raylib.git
