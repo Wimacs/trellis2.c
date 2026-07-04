@@ -116,6 +116,73 @@ trellis_status trellis_tensor_store_load_safetensors_f32(
     bool transpose_linear_weights,
     size_t * loaded_tensors);
 
+typedef struct trellis_tensor_store_load_progress {
+    const char * path;
+    const char * tensor_name;
+    size_t tensor_index;
+    size_t tensor_count;
+    uint64_t bytes_loaded;
+    uint64_t total_bytes;
+} trellis_tensor_store_load_progress;
+
+typedef void (*trellis_tensor_store_load_progress_callback)(
+    const trellis_tensor_store_load_progress * progress,
+    void * user_data);
+
+trellis_status trellis_tensor_store_load_safetensors_f32_ex(
+    trellis_tensor_store * store,
+    const trellis_cuda_context * cuda,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors,
+    trellis_tensor_store_load_progress_callback progress_callback,
+    void * progress_user_data);
+
+typedef enum trellis_log_level {
+    TRELLIS_LOG_DEBUG = 0,
+    TRELLIS_LOG_INFO = 1,
+    TRELLIS_LOG_WARN = 2,
+    TRELLIS_LOG_ERROR = 3,
+} trellis_log_level;
+
+typedef struct trellis_model_load_result {
+    size_t tensors;
+    uint64_t bytes;
+    double seconds;
+} trellis_model_load_result;
+
+void trellis_set_verbose(int verbose);
+void trellis_log(trellis_log_level level, const char * fmt, ...);
+
+void trellis_progress_bytes(
+    const char * label,
+    int step,
+    int steps,
+    uint64_t bytes_processed,
+    uint64_t bytes_total,
+    int64_t elapsed_us);
+
+void trellis_progress_steps(
+    const char * label,
+    int step,
+    int steps,
+    int64_t step_us,
+    const char * detail);
+
+int trellis_load_tensor_store_f32(
+    const trellis_cuda_context * cuda,
+    const char * label,
+    const char * path,
+    bool transpose_linear_weights,
+    size_t tensor_slack,
+    trellis_tensor_store * store,
+    trellis_model_load_result * result);
+
+#define TRELLIS_DEBUG(...) trellis_log(TRELLIS_LOG_DEBUG, __VA_ARGS__)
+#define TRELLIS_INFO(...) trellis_log(TRELLIS_LOG_INFO, __VA_ARGS__)
+#define TRELLIS_WARN(...) trellis_log(TRELLIS_LOG_WARN, __VA_ARGS__)
+#define TRELLIS_ERROR(...) trellis_log(TRELLIS_LOG_ERROR, __VA_ARGS__)
+
 #define TRELLIS_DIT_FLOW_BLOCKS 30
 
 typedef struct trellis_dit_flow_block_weights {
@@ -195,6 +262,12 @@ trellis_status trellis_shape_slat_flow_bind_weights(
     char * first_issue,
     size_t first_issue_size);
 
+trellis_status trellis_tex_slat_flow_bind_weights(
+    trellis_tensor_store * store,
+    trellis_dit_flow_weights * weights,
+    char * first_issue,
+    size_t first_issue_size);
+
 struct ggml_tensor * trellis_dit_flow_forward(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -245,62 +318,124 @@ trellis_status trellis_ss_decoder_bind_weights(
 trellis_status trellis_ss_decoder_forward_f32_host(
     const trellis_ss_decoder_weights * weights,
     const float * latent,
-    int device,
+    const trellis_cuda_context * cuda,
     int batch,
     int latent_size,
     float ** logits_out,
     int * output_size);
 
-#define TRELLIS_SHAPE_DECODER_LEVELS 5
-#define TRELLIS_SHAPE_DECODER_MAX_BLOCKS 16
+#define TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS 5
+#define TRELLIS_SPARSE_UNET_VAE_DECODER_MAX_BLOCKS 16
+#define TRELLIS_SPARSE_UNET_VAE_DECODER_UP_LEVELS (TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS - 1)
+#define TRELLIS_SHAPE_DECODER_LEVELS TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS
+#define TRELLIS_SHAPE_DECODER_MAX_BLOCKS TRELLIS_SPARSE_UNET_VAE_DECODER_MAX_BLOCKS
 
-typedef struct trellis_shape_decoder_convnext_block_weights {
-    struct ggml_tensor * conv_w;
-    struct ggml_tensor * conv_b;
-    struct ggml_tensor * norm_gamma;
-    struct ggml_tensor * norm_beta;
-    struct ggml_tensor * mlp0_w;
-    struct ggml_tensor * mlp0_b;
-    struct ggml_tensor * mlp2_w;
-    struct ggml_tensor * mlp2_b;
+typedef struct trellis_sparse_unet_vae_decoder_convnext_block_weights {
+    const float * conv_w;
+    const float * conv_b;
+    const float * norm_gamma;
+    const float * norm_beta;
+    const float * mlp0_w;
+    const float * mlp0_b;
+    const float * mlp2_w;
+    const float * mlp2_b;
     int channels;
-} trellis_shape_decoder_convnext_block_weights;
+} trellis_sparse_unet_vae_decoder_convnext_block_weights;
 
-typedef struct trellis_shape_decoder_c2s_block_weights {
-    struct ggml_tensor * norm1_gamma;
-    struct ggml_tensor * norm1_beta;
-    struct ggml_tensor * conv1_w;
-    struct ggml_tensor * conv1_b;
-    struct ggml_tensor * conv2_w;
-    struct ggml_tensor * conv2_b;
-    struct ggml_tensor * to_subdiv_w;
-    struct ggml_tensor * to_subdiv_b;
+typedef struct trellis_sparse_unet_vae_decoder_c2s_block_weights {
+    const float * norm1_gamma;
+    const float * norm1_beta;
+    const float * conv1_w;
+    const float * conv1_b;
+    const float * conv2_w;
+    const float * conv2_b;
+    const float * to_subdiv_w;
+    const float * to_subdiv_b;
     int in_channels;
     int out_channels;
-} trellis_shape_decoder_c2s_block_weights;
+} trellis_sparse_unet_vae_decoder_c2s_block_weights;
 
-typedef struct trellis_shape_decoder_weights {
-    struct ggml_tensor * from_latent_w;
-    struct ggml_tensor * from_latent_b;
-    struct ggml_tensor * output_w;
-    struct ggml_tensor * output_b;
+typedef struct trellis_sparse_unet_vae_decoder_weights {
+    const float * from_latent_w;
+    const float * from_latent_b;
+    const float * output_w;
+    const float * output_b;
+    int latent_channels;
+    int out_channels;
+    int pred_subdiv;
     int levels;
-    int channels[TRELLIS_SHAPE_DECODER_LEVELS];
-    int blocks_per_level[TRELLIS_SHAPE_DECODER_LEVELS];
-    trellis_shape_decoder_convnext_block_weights
-        blocks[TRELLIS_SHAPE_DECODER_LEVELS][TRELLIS_SHAPE_DECODER_MAX_BLOCKS];
-    trellis_shape_decoder_c2s_block_weights up_blocks[TRELLIS_SHAPE_DECODER_LEVELS - 1];
-} trellis_shape_decoder_weights;
+    int channels[TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS];
+    int blocks_per_level[TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS];
+    trellis_sparse_unet_vae_decoder_convnext_block_weights
+        blocks[TRELLIS_SPARSE_UNET_VAE_DECODER_LEVELS][TRELLIS_SPARSE_UNET_VAE_DECODER_MAX_BLOCKS];
+    trellis_sparse_unet_vae_decoder_c2s_block_weights
+        up_blocks[TRELLIS_SPARSE_UNET_VAE_DECODER_UP_LEVELS];
+} trellis_sparse_unet_vae_decoder_weights;
+
+typedef trellis_sparse_unet_vae_decoder_convnext_block_weights
+    trellis_shape_decoder_convnext_block_weights;
+typedef trellis_sparse_unet_vae_decoder_c2s_block_weights
+    trellis_shape_decoder_c2s_block_weights;
+typedef trellis_sparse_unet_vae_decoder_weights
+    trellis_shape_decoder_weights;
+
+typedef struct trellis_sparse_c2s_guide_level {
+    int32_t * coords_bxyz; /* [n_coords, 4] */
+    int32_t * parent;      /* [n_coords] row in previous level */
+    int32_t * subidx;      /* [n_coords] channel-to-spatial child index [0, 7] */
+    int64_t n_coords;
+} trellis_sparse_c2s_guide_level;
+
+typedef struct trellis_sparse_c2s_guides {
+    trellis_sparse_c2s_guide_level levels[TRELLIS_SPARSE_UNET_VAE_DECODER_UP_LEVELS];
+    int n_levels;
+} trellis_sparse_c2s_guides;
+
+void trellis_sparse_c2s_guides_free(trellis_sparse_c2s_guides * guides);
 
 typedef struct trellis_shape_decoder_debug_options {
     const char * dump_dir;
 } trellis_shape_decoder_debug_options;
+
+trellis_status trellis_sparse_unet_vae_decoder_bind_weights(
+    trellis_tensor_store * store,
+    int out_channels,
+    bool pred_subdiv,
+    trellis_sparse_unet_vae_decoder_weights * weights,
+    char * first_issue,
+    size_t first_issue_size);
 
 trellis_status trellis_shape_decoder_bind_weights(
     trellis_tensor_store * store,
     trellis_shape_decoder_weights * weights,
     char * first_issue,
     size_t first_issue_size);
+
+trellis_status trellis_flexi_dual_grid_vae_decoder_bind_weights(
+    trellis_tensor_store * store,
+    trellis_sparse_unet_vae_decoder_weights * weights,
+    char * first_issue,
+    size_t first_issue_size);
+
+trellis_status trellis_tex_slat_decoder_bind_weights(
+    trellis_tensor_store * store,
+    trellis_sparse_unet_vae_decoder_weights * weights,
+    char * first_issue,
+    size_t first_issue_size);
+
+trellis_status trellis_sparse_unet_vae_decoder_forward_f32_host(
+    const trellis_sparse_unet_vae_decoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    int device,
+    int max_levels,
+    const trellis_sparse_c2s_guides * guide_subs,
+    trellis_sparse_c2s_guides * return_subs,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out);
 
 trellis_status trellis_shape_decoder_forward_f32_host(
     const trellis_shape_decoder_weights * weights,
@@ -372,15 +507,17 @@ trellis_status trellis_dino_vit_bind_weights(
     char * first_issue,
     size_t first_issue_size);
 
-trellis_status trellis_dino_patch_embed_f32_host(
-    const trellis_dino_vit_weights * weights,
-    const float * image,
-    int device,
-    int batch,
-    int image_h,
-    int image_w,
-    float ** tokens_out,
-    int * n_patches_out);
+struct ggml_tensor * trellis_dino_patch_embedding_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor * image,
+    const trellis_dino_vit_weights * weights);
+
+struct ggml_tensor * trellis_dino_image_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor * image,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase,
+    const trellis_dino_vit_weights * weights);
 
 struct ggml_tensor * trellis_dino_vit_forward(
     struct ggml_context * ctx,
@@ -389,34 +526,85 @@ struct ggml_tensor * trellis_dino_vit_forward(
     struct ggml_tensor * sin_phase,
     const trellis_dino_vit_weights * weights);
 
-trellis_status trellis_dino_vit_forward_f32_host(
+trellis_status trellis_dino_image_forward_f32_host(
     const trellis_cuda_context * cuda,
     const trellis_dino_vit_weights * weights,
-    const float * tokens,
+    const float * image,
+    int batch,
+    int image_h,
+    int image_w,
     const float * cos_phase,
     const float * sin_phase,
-    int batch,
-    int n_tokens,
-    float ** tokens_out);
+    float ** tokens_out,
+    int * n_tokens_out);
 
-typedef struct trellis_sparse_tensor_host {
-    int32_t * coords; /* [n, 4] = batch, x, y, z */
-    float * feats;    /* [n, channels] */
-    int64_t n;
-    int64_t channels;
-} trellis_sparse_tensor_host;
+/* 2D rotary phase table for DINO image patch tokens. */
+trellis_status trellis_dino_rope_2d_phases_f32(
+    int n_special_tokens,
+    int patches_h,
+    int patches_w,
+    int head_dim,
+    float freq_scale,
+    float freq_base,
+    float * cos_out,
+    float * sin_out,
+    size_t phase_count);
 
 typedef struct trellis_mesh_host {
     float * vertices; /* [n_vertices, 3] */
+    float * vertex_colors; /* optional [n_vertices, 3] in linear 0..1 RGB */
     int32_t * faces;  /* [n_faces, 3] */
     int64_t n_vertices;
     int64_t n_faces;
 } trellis_mesh_host;
 
-void trellis_sparse_tensor_free(trellis_sparse_tensor_host * tensor);
 void trellis_mesh_free(trellis_mesh_host * mesh);
 
-#include "trellis_ops.h"
+/* Extracts a mesh from FlexiDualGrid decoder logits. */
+trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    int channels,
+    int resolution,
+    trellis_mesh_host * mesh_out);
+
+typedef struct trellis_image_to_obj_options {
+    const char * model_dir;
+    const char * dino_dir;
+    const char * image_path;
+    const char * obj_path;
+    const char * gltf_path;
+    const char * flow_override_path;
+    const char * decoder_override_path;
+    int device;
+    int sparse_structure_steps;
+    int structured_latent_steps;
+    int latent_size;
+    int resolution;
+    int cond_resolution;
+    int sparse_resolution;
+    uint32_t seed;
+    uint32_t noise_seed;
+    float rescale_t;
+    float guidance_strength;
+    float guidance_rescale;
+    float guidance_min;
+    float guidance_max;
+    int flow_blocks_override;
+    int flow_block_parts_override;
+    int flow_no_rope;
+    int emulate_bf16_blocks;
+    int use_ggml_flash_attn;
+    int decode_max_levels;
+    int64_t decode_max_input_tokens;
+    int texture_size;
+} trellis_image_to_obj_options;
+
+trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options);
+
+#include "trellis_ggml_layers.h"
+#include "trellis_flow_sampler.h"
 
 typedef enum trellis_model_component {
     TRELLIS_COMPONENT_SPARSE_STRUCTURE_FLOW = 0,
@@ -438,37 +626,6 @@ typedef struct trellis_component_status {
 
 size_t trellis_component_status_count(void);
 const trellis_component_status * trellis_component_status_at(size_t index);
-
-typedef struct trellis_checkpoint_report {
-    size_t expected_tensors;
-    size_t actual_tensors;
-    size_t found_tensors;
-    size_t missing_tensors;
-    size_t shape_mismatches;
-    size_t dtype_mismatches;
-    size_t extra_tensors;
-    uint64_t expected_elements;
-    uint64_t expected_bytes;
-    char first_issue[256];
-} trellis_checkpoint_report;
-
-void trellis_checkpoint_report_clear(trellis_checkpoint_report * report);
-
-trellis_status trellis_ss_flow_validate_checkpoint(
-    const char * safetensors_path,
-    trellis_checkpoint_report * report);
-
-trellis_status trellis_shape_slat_flow_validate_checkpoint(
-    const char * safetensors_path,
-    trellis_checkpoint_report * report);
-
-trellis_status trellis_ss_decoder_validate_checkpoint(
-    const char * safetensors_path,
-    trellis_checkpoint_report * report);
-
-trellis_status trellis_shape_decoder_validate_checkpoint(
-    const char * safetensors_path,
-    trellis_checkpoint_report * report);
 
 trellis_status trellis_make_model_path(
     const char * model_dir,

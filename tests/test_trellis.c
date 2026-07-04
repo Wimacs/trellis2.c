@@ -1,4 +1,7 @@
 #include "trellis.h"
+#include "trellis_checkpoint_validate.h"
+#include "trellis_cuda_kernels.h"
+#include "trellis_sparse_reference.h"
 
 #include <errno.h>
 #include <math.h>
@@ -751,50 +754,6 @@ static void pixel_shuffle_3d_ref(
     }
 }
 
-static void channel_layer_norm_3d_ref(
-    const float * x,
-    const float * gamma,
-    const float * beta,
-    float * y,
-    int batch,
-    int channels,
-    int depth,
-    int height,
-    int width,
-    float eps) {
-    for (int b = 0; b < batch; ++b) {
-        for (int d = 0; d < depth; ++d) {
-            for (int h = 0; h < height; ++h) {
-                for (int w = 0; w < width; ++w) {
-                    float mean = 0.0f;
-                    for (int c = 0; c < channels; ++c) {
-                        const int64_t idx =
-                            (((int64_t) b * channels + c) * depth + d) * height * (int64_t) width +
-                            (int64_t) h * width + w;
-                        mean += x[idx];
-                    }
-                    mean /= (float) channels;
-                    float var = 0.0f;
-                    for (int c = 0; c < channels; ++c) {
-                        const int64_t idx =
-                            (((int64_t) b * channels + c) * depth + d) * height * (int64_t) width +
-                            (int64_t) h * width + w;
-                        const float diff = x[idx] - mean;
-                        var += diff * diff;
-                    }
-                    const float inv_std = 1.0f / sqrtf(var / (float) channels + eps);
-                    for (int c = 0; c < channels; ++c) {
-                        const int64_t idx =
-                            (((int64_t) b * channels + c) * depth + d) * height * (int64_t) width +
-                            (int64_t) h * width + w;
-                        y[idx] = (x[idx] - mean) * inv_std * gamma[c] + beta[c];
-                    }
-                }
-            }
-        }
-    }
-}
-
 static void dino_patch_embed_ref(
     const float * image,
     const float * weight,
@@ -967,8 +926,29 @@ static void test_custom_cuda_kernels(void) {
             bias[i] = 0.05f * (float) (i - 1);
         }
         conv3d_ref(x, w, bias, exp, B, IC, ID, IH, IW, OC, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW);
-        CHECK_TRUE(trellis_cuda_conv3d_f32_host(
-            x, w, bias, got, 0, B, IC, ID, IH, IW, OC, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW) == TRELLIS_STATUS_OK);
+
+        struct ggml_context * ctx = make_graph_ctx();
+        CHECK_TRUE(ctx != NULL);
+        struct ggml_tensor * x_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, ID, IC * B);
+        struct ggml_tensor * w_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KW, KH, KD, IC * OC);
+        struct ggml_tensor * b_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, OC);
+        struct ggml_tensor * y = ggml_conv_3d_direct(ctx, w_t, x_t, SW, SH, SD, PW, PH, PD, DW, DH, DD, IC, B, OC);
+        y = ggml_add(ctx, y, ggml_repeat(ctx, b_t, y));
+        CHECK_TRUE(x_t != NULL && w_t != NULL && b_t != NULL && y != NULL);
+
+        struct ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, y);
+        ggml_gallocr_t alloc = trellis_cuda_new_graph_allocator(&g_cuda);
+        CHECK_TRUE(alloc != NULL);
+        CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+        ggml_backend_tensor_set(x_t, x, 0, ggml_nbytes(x_t));
+        ggml_backend_tensor_set(w_t, w, 0, ggml_nbytes(w_t));
+        ggml_backend_tensor_set(b_t, bias, 0, ggml_nbytes(b_t));
+        CHECK_TRUE(trellis_cuda_compute_graph(&g_cuda, graph) == TRELLIS_STATUS_OK);
+        ggml_backend_tensor_get(y, got, 0, ggml_nbytes(y));
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+
         for (int i = 0; i < B * OC * OD * OH * OW; ++i) {
             CHECK_CLOSE(got[i], exp[i], 2e-5f);
         }
@@ -984,26 +964,26 @@ static void test_custom_cuda_kernels(void) {
             x[i] = (float) (i + 1);
         }
         pixel_shuffle_3d_ref(x, exp, B, IC, ID, IH, IW, SCALE);
-        CHECK_TRUE(trellis_cuda_pixel_shuffle_3d_f32_host(x, got, 0, B, IC, ID, IH, IW, SCALE) == TRELLIS_STATUS_OK);
+
+        struct ggml_context * ctx = make_graph_ctx();
+        CHECK_TRUE(ctx != NULL);
+        struct ggml_tensor * x_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, ID, IC * B);
+        struct ggml_tensor * y = ggml_pixel_shuffle_3d(ctx, x_t, SCALE);
+        CHECK_TRUE(x_t != NULL && y != NULL);
+
+        struct ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, y);
+        ggml_gallocr_t alloc = trellis_cuda_new_graph_allocator(&g_cuda);
+        CHECK_TRUE(alloc != NULL);
+        CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+        ggml_backend_tensor_set(x_t, x, 0, ggml_nbytes(x_t));
+        CHECK_TRUE(trellis_cuda_compute_graph(&g_cuda, graph) == TRELLIS_STATUS_OK);
+        ggml_backend_tensor_get(y, got, 0, ggml_nbytes(y));
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+
         for (int i = 0; i < B * OC * OD * OH * OW; ++i) {
             CHECK_CLOSE(got[i], exp[i], 1e-6f);
-        }
-    }
-
-    {
-        enum { B = 2, C = 3, D = 2, H = 2, W = 2, N = B * C * D * H * W };
-        float x[N];
-        float gamma[C] = {1.0f, 0.5f, -1.5f};
-        float beta[C] = {0.1f, -0.2f, 0.3f};
-        float got[N];
-        float exp[N];
-        for (int i = 0; i < N; ++i) {
-            x[i] = sinf(0.2f * (float) i) + 0.03f * (float) (i % 7);
-        }
-        channel_layer_norm_3d_ref(x, gamma, beta, exp, B, C, D, H, W, 1e-6f);
-        CHECK_TRUE(trellis_cuda_channel_layer_norm_3d_f32_host(x, gamma, beta, got, 0, B, C, D, H, W, 1e-6f) == TRELLIS_STATUS_OK);
-        for (int i = 0; i < N; ++i) {
-            CHECK_CLOSE(got[i], exp[i], 2e-5f);
         }
     }
 
@@ -1044,7 +1024,33 @@ static void test_custom_cuda_kernels(void) {
             weight[i] = sinf(0.13f * (float) (i + 1));
         }
         dino_patch_embed_ref(image, weight, bias, exp, B, IH, IW, OC, P);
-        CHECK_TRUE(trellis_cuda_dino_patch_embed_f32_host(image, weight, bias, got, 0, B, IH, IW, OC, P) == TRELLIS_STATUS_OK);
+
+        struct ggml_context * ctx = make_graph_ctx();
+        CHECK_TRUE(ctx != NULL);
+        struct ggml_tensor * image_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, 3, B);
+        struct ggml_tensor * weight_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, P, P, 3, OC);
+        struct ggml_tensor * bias_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, OC);
+        trellis_dino_vit_weights dino = {0};
+        dino.patch_w = weight_t;
+        dino.patch_b = bias_t;
+        dino.hidden_size = OC;
+        dino.patch_size = P;
+        struct ggml_tensor * y = trellis_dino_patch_embedding_forward(ctx, image_t, &dino);
+        CHECK_TRUE(image_t != NULL && weight_t != NULL && bias_t != NULL && y != NULL);
+
+        struct ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, y);
+        ggml_gallocr_t alloc = trellis_cuda_new_graph_allocator(&g_cuda);
+        CHECK_TRUE(alloc != NULL);
+        CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+        ggml_backend_tensor_set(image_t, image, 0, ggml_nbytes(image_t));
+        ggml_backend_tensor_set(weight_t, weight, 0, ggml_nbytes(weight_t));
+        ggml_backend_tensor_set(bias_t, bias, 0, ggml_nbytes(bias_t));
+        CHECK_TRUE(trellis_cuda_compute_graph(&g_cuda, graph) == TRELLIS_STATUS_OK);
+        ggml_backend_tensor_get(y, got, 0, ggml_nbytes(y));
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+
         for (int i = 0; i < B * T * OC; ++i) {
             CHECK_CLOSE(got[i], exp[i], 2e-5f);
         }
@@ -1067,6 +1073,59 @@ static void test_custom_cuda_kernels(void) {
         for (int i = 0; i < N; ++i) {
             CHECK_CLOSE(got[i], exp_add[i], 1e-6f);
         }
+    }
+
+    {
+        enum { N = 4, M = 6 };
+        int32_t coords[N * 4] = {
+            0, 1, 2, 3,
+            0, 4, 5, 6,
+            1, 0, 0, 0,
+            1, 2, 1, 0,
+        };
+        float subdiv[N * 8] = {
+             0.5f, -1.0f, -1.0f,  0.25f, -1.0f, -1.0f, -1.0f, -1.0f,
+            -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+            -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  0.1f,
+            -1.0f,  0.2f,  0.3f, -1.0f,  0.4f, -1.0f, -1.0f, -1.0f,
+        };
+        int32_t exp_coords[M * 4] = {
+            0, 2, 4, 6,
+            0, 3, 5, 6,
+            1, 1, 1, 1,
+            1, 5, 2, 0,
+            1, 4, 3, 0,
+            1, 4, 2, 1,
+        };
+        int32_t exp_parent[M] = {0, 0, 2, 3, 3, 3};
+        int32_t exp_subidx[M] = {0, 3, 7, 1, 2, 4};
+        int32_t got_coords[M * 4];
+        int32_t got_parent[M];
+        int32_t got_subidx[M];
+        int32_t * coords_dev = NULL;
+        float * subdiv_dev = NULL;
+        sparse_c2s_map_device map;
+        memset(&map, 0, sizeof(map));
+        CHECK_TRUE(cudaSetDevice(0) == cudaSuccess);
+        CHECK_TRUE(cudaMalloc((void **) &coords_dev, sizeof(coords)) == cudaSuccess);
+        CHECK_TRUE(cudaMalloc((void **) &subdiv_dev, sizeof(subdiv)) == cudaSuccess);
+        CHECK_TRUE(cudaMemcpy(coords_dev, coords, sizeof(coords), cudaMemcpyHostToDevice) == cudaSuccess);
+        CHECK_TRUE(cudaMemcpy(subdiv_dev, subdiv, sizeof(subdiv), cudaMemcpyHostToDevice) == cudaSuccess);
+        CHECK_TRUE(sparse_c2s_map_build_device(coords_dev, subdiv_dev, N, &map) == TRELLIS_STATUS_OK);
+        CHECK_TRUE(map.n == M);
+        CHECK_TRUE(cudaMemcpy(got_coords, map.coords, sizeof(got_coords), cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK_TRUE(cudaMemcpy(got_parent, map.parent, sizeof(got_parent), cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK_TRUE(cudaMemcpy(got_subidx, map.subidx, sizeof(got_subidx), cudaMemcpyDeviceToHost) == cudaSuccess);
+        for (int i = 0; i < M * 4; ++i) {
+            CHECK_TRUE(got_coords[i] == exp_coords[i]);
+        }
+        for (int i = 0; i < M; ++i) {
+            CHECK_TRUE(got_parent[i] == exp_parent[i]);
+            CHECK_TRUE(got_subidx[i] == exp_subidx[i]);
+        }
+        sparse_c2s_map_device_free(&map);
+        cudaFree(coords_dev);
+        cudaFree(subdiv_dev);
     }
 
     {
@@ -1115,29 +1174,6 @@ static void test_custom_cuda_kernels(void) {
         }
     }
 
-    {
-        enum { B = 2, T = 3, H = 2, D = 8, HALF = D / 2 };
-        float x[B * H * T * D];
-        float cos_phase[T * HALF];
-        float sin_phase[T * HALF];
-        float got[B * H * T * D];
-        float exp[B * H * T * D];
-        for (int i = 0; i < B * H * T * D; ++i) {
-            x[i] = 0.03f * (float) (i - 7);
-        }
-        for (int t = 0; t < T; ++t) {
-            for (int p = 0; p < HALF; ++p) {
-                const float phase = 0.2f * (float) t + 0.07f * (float) p;
-                cos_phase[t * HALF + p] = cosf(phase);
-                sin_phase[t * HALF + p] = sinf(phase);
-            }
-        }
-        apply_rope_ref(x, cos_phase, sin_phase, exp, B, T, H, D);
-        CHECK_TRUE(trellis_cuda_apply_rope_f32_host(x, cos_phase, sin_phase, got, 0, B, T, H, D) == TRELLIS_STATUS_OK);
-        for (int i = 0; i < B * H * T * D; ++i) {
-            CHECK_CLOSE(got[i], exp[i], 1e-6f);
-        }
-    }
 }
 
 static void test_rope_adjacent_ggml_cuda(void) {

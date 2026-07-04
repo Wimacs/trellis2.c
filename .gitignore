@@ -1,17 +1,23 @@
 # Build outputs
 /build/
+/build-obj/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
+compile_flags.txt
 CTestTestfile.cmake
 CPackConfig.cmake
 CPackSourceConfig.cmake
 Testing/
+.ninja_deps
+.ninja_log
+*.ninja
 *.o
 *.a
 *.so
+*.so.*
 *.d
 *.dylib
 *.dll
@@ -21,6 +27,9 @@ Testing/
 benchmark_outputs/
 out/
 outputs/
+artifacts/
+*.ckpt
+*.safetensors
 *.ply
 *.obj
 *.glb
@@ -28,8 +37,15 @@ outputs/
 *.f32
 *.i32
 
+# Local third-party checkouts that are not tracked submodules
+/3rd/cgltf/
+/3rd/stb/
+/3rd/xatlas/
+
 # Local editor/cache files
 .cache/
+.vscode/
+.idea/
 __pycache__/
 *.swp
 .DS_Store

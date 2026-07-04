@@ -5,24 +5,29 @@
 The goal is to run the TRELLIS.2 pipeline without Python or PyTorch:
 
 - encode an input image with DINOv3
-- run stage1 sparse-structure denoising
-- decode and visualize voxels at each stage1 step
-- run stage2 shape latent denoising
-- decode and visualize a mesh at each stage2 step
+- run sparse-structure flow denoising
+- decode sparse-structure voxel snapshots for debug/inspection
+- run structured-latent shape flow denoising
+- decode mesh snapshots for structured-latent debug/inspection
 
-The main app is `trellis-live`, a raylib viewer that shows the generation process as it runs.
+The main inference entry point is `trellis-image-to-obj`, a thin terminal CLI
+over the pipeline in `src/`. It reports model loading and sampler step
+progress without opening a GUI. Raylib viewers are optional replay/live debug
+tools.
 
 ## Status
 
 Implemented:
 
 - CUDA-backed ggml runtime setup
-- safetensors loading
+- safetensors loading with terminal progress
 - DINOv3 image conditioning
-- stage1 sparse-structure flow and decoder
-- stage2 shape flow
+- sparse-structure flow and decoder
+- structured-latent shape flow
 - shape decoder with FlexiDualGrid mesh extraction
-- raylib voxel and mesh visualization
+- one-shot image-to-OBJ pipeline
+- CLI sparse-structure image-to-voxel debug inference
+- optional raylib voxel and mesh visualization
 - custom CUDA kernels for the parts not covered by ggml
 
 Still in progress:
@@ -63,24 +68,30 @@ ctest --test-dir build --output-on-failure
 
 ## Run
 
-Place the TRELLIS.2 and DINOv3 checkpoints next to the project, then run:
+Place the TRELLIS.2 and DINOv3 checkpoints next to the project, then run one-shot OBJ inference:
 
 ```sh
-./build/trellis-live \
-  --model ../TRELLIS.2-4B \
-  --dino ../dinov3-vitl16-pretrain-lvd1689m \
-  --image ../assets/example_image/T.png
+./build/trellis-image-to-obj \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image ../assets/example_image/T.png \
+  --obj benchmark_outputs/output.obj
 ```
 
-`trellis-live` preloads model weights first, opens a raylib window, then visualizes stage1 voxels and stage2 meshes step by step.
+`trellis-image-to-obj` runs sparse-structure flow, structured-latent shape flow,
+and shape decode in one terminal command. It does not open a GUI, and sparse
+coords plus DINO condition data are passed directly in memory. Only the final OBJ
+is written by default; WebP inputs are converted to a temporary PNG because the
+current stb_image loader does not decode WebP directly.
 
 ## Useful Tools
 
-- `trellis-live`: full image-to-3D live viewer
+- `trellis-infer`: terminal sparse-structure image-to-voxel debug inference
+- `trellis-image-to-obj`: one-shot terminal image-to-OBJ executable
+- `trellis-live`: optional image-to-3D live viewer
 - `trellis-info`: inspect checkpoint coverage
-- `trellis-stage1`: stage1 validation helpers
-- `trellis-stage2`: stage2 tensor and decoder helpers
-- `trellis-infer`: stage1 image-to-voxel debug path
+- `trellis-sparse-structure`: sparse-structure validation helpers
+- `trellis-structured-latent`: structured-latent tensor and decoder helpers
 - `trellis-voxel-viewer`: replay voxel snapshots
 - `trellis-mesh-viewer`: replay mesh snapshots
 
@@ -88,10 +99,30 @@ Place the TRELLIS.2 and DINOv3 checkpoints next to the project, then run:
 
 ```text
 include/       public C API
-src/           inference, loaders, CUDA/ggml execution
-src/custom_ops custom CUDA kernels
-tools/         CLI tools and raylib viewers
+src/           C runtime implementation
+src/model      network definitions, weight binding, and model CUDA forward paths
+src/pipeline   image-to-OBJ orchestration and in-memory pipeline steps
+src/runtime    CUDA backend setup, logging/progress, model path/load helpers
+src/io         safetensors parser and ggml tensor-store loading
+src/mesh       FlexiDualGrid mesh extraction
+src/model      ggml network definitions plus CUDA sparse-conv model forward paths
+src/pipeline   samplers and end-to-end CLI orchestration
+tools/         thin CLIs, inspect/debug tools, and optional raylib viewers
 tests/         unit tests
 docs/          implementation notes
 3rd/           ggml and raylib submodules
 ```
+
+Primary pipeline files:
+
+- `src/runtime/trellis_runtime.c`: CUDA backend setup, logging/progress, model path/load helpers
+- `src/model/trellis_dino.c`: DINOv3 image encoder weight binding and graph definition
+- `src/model/trellis_cuda_forward.cu`: CUDA forward paths for sparse 3D decoder networks
+- `src/model/trellis_slat_flow_model.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition
+- `src/model/trellis_sparse_structure_decoder.c`: sparse-structure VAE decoder weight binding
+- `src/model/trellis_sparse_unet_vae_decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders
+- `src/pipeline/trellis_sparse_structure_pipeline.c`: image -> sparse coords + DINO condition
+- `src/pipeline/trellis_structured_latent_pipeline.c`: sparse coords + condition -> denormalized shape/texture SLat
+- `src/pipeline/trellis_pipeline.c`: image -> colored OBJ orchestration
+- `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests
+- `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug

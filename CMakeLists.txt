@@ -33,20 +33,22 @@ if (TRELLIS2_C_BUILD_RAYLIB_VIEWER AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/3rd/ray
 endif()
 
 add_library(trellis2_c
-    src/trellis_backend.c
-    src/custom_ops/trellis_cuda_ops.cu
-    src/trellis_cuda_inference.cu
-    src/trellis_decoder.c
-    src/trellis_dino.c
-    src/trellis_flex_dual_grid.c
-    src/trellis_flow_model.c
-    src/trellis_ops.c
-    src/trellis_pipeline.c
-    src/trellis_safetensors.c
-    src/trellis_shape_decoder.c
-    src/trellis_sparse.c
-    src/trellis_stage1.c
-    src/trellis_weights.c
+    src/runtime/trellis_runtime.c
+    src/model/trellis_cuda_kernels.cu
+    src/model/trellis_cuda_forward.cu
+    src/model/trellis_sparse_structure_decoder.c
+    src/model/trellis_dino.c
+    src/mesh/trellis_flex_dual_grid.c
+    src/model/trellis_slat_flow_model.c
+    src/model/trellis_ggml_layers.c
+    src/pipeline/trellis_pipeline.c
+    src/pipeline/trellis_dit_flow_executor.c
+    src/pipeline/trellis_flow_sampler.c
+    src/pipeline/trellis_sparse_structure_pipeline.c
+    src/pipeline/trellis_structured_latent_pipeline.c
+    src/io/trellis_safetensors.c
+    src/model/trellis_sparse_unet_vae_decoder.c
+    src/io/trellis_weights.c
 )
 
 target_include_directories(trellis2_c
@@ -55,7 +57,7 @@ target_include_directories(trellis2_c
 )
 
 find_package(CUDAToolkit REQUIRED)
-target_link_libraries(trellis2_c PUBLIC ggml CUDA::cudart)
+target_link_libraries(trellis2_c PUBLIC ggml CUDA::cudart CUDA::cublas)
 if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()
@@ -68,59 +70,87 @@ if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
     add_executable(trellis2_c_tests
         tests/test_trellis.c
+        tools/debug/trellis_checkpoint_validate.c
+        tools/debug/trellis_sparse_reference.c
     )
     target_compile_definitions(trellis2_c_tests PRIVATE _POSIX_C_SOURCE=200809L)
+    target_include_directories(trellis2_c_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/model"
+        "${CMAKE_CURRENT_LIST_DIR}/tools/debug")
     target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
     set_tests_properties(trellis2_c_tests PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 if (TRELLIS2_C_BUILD_TOOLS)
+    set(TRELLIS_TOOL_COMMON_SOURCES
+        tools/trellis_tool_cli.c
+        tools/trellis_tool_model.c
+    )
+
     add_executable(trellis-info tools/trellis_info.c)
     target_link_libraries(trellis-info PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-stage1 tools/trellis_stage1.c)
-    target_link_libraries(trellis-stage1 PRIVATE trellis2_c ggml)
+    add_executable(trellis-sparse-structure
+        tools/debug/trellis_sparse_structure.c
+        tools/debug/trellis_checkpoint_validate.c
+    )
+    target_link_libraries(trellis-sparse-structure PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-stage2 tools/trellis_stage2.c)
-    target_link_libraries(trellis-stage2 PRIVATE trellis2_c ggml)
+    add_executable(trellis-structured-latent
+        tools/debug/trellis_structured_latent.c
+        tools/debug/trellis_checkpoint_validate.c
+    )
+    target_link_libraries(trellis-structured-latent PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-infer tools/trellis_infer.c)
+    add_executable(trellis-infer tools/debug/trellis_infer.c ${TRELLIS_TOOL_COMMON_SOURCES})
+    target_include_directories(trellis-infer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
     target_link_libraries(trellis-infer PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-verify tools/trellis_verify.c)
+    add_executable(trellis-image-to-obj
+        tools/trellis_image_to_obj.c
+    )
+    target_link_libraries(trellis-image-to-obj PRIVATE trellis2_c ggml)
+    if (UNIX)
+        target_link_libraries(trellis-image-to-obj PRIVATE m)
+    endif()
+
+    add_executable(trellis-verify tools/debug/trellis_verify.c)
     if (UNIX)
         target_link_libraries(trellis-verify PRIVATE m)
     endif()
 
     if (TARGET raylib)
         add_executable(trellis-live
-            tools/trellis_live.c
-            tools/trellis_infer.c
-            tools/trellis_stage2_mesh_live_viewer.c
+            tools/viewers/trellis_live.c
+            tools/debug/trellis_infer.c
+            tools/viewers/trellis_structured_latent_mesh_live_viewer.c
+            ${TRELLIS_TOOL_COMMON_SOURCES}
         )
         target_compile_definitions(trellis-live PRIVATE TRELLIS_TOOL_LIBRARY)
+        target_include_directories(trellis-live PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
         target_link_libraries(trellis-live PRIVATE trellis2_c ggml raylib)
         if (UNIX)
             target_link_libraries(trellis-live PRIVATE m)
         endif()
 
-        add_executable(trellis-voxel-viewer tools/trellis_voxel_viewer.c)
+        add_executable(trellis-voxel-viewer tools/viewers/trellis_voxel_viewer.c)
         target_link_libraries(trellis-voxel-viewer PRIVATE raylib)
         if (UNIX)
             target_link_libraries(trellis-voxel-viewer PRIVATE m)
         endif()
 
-        add_executable(trellis-mesh-viewer tools/trellis_mesh_viewer.c)
+        add_executable(trellis-mesh-viewer tools/viewers/trellis_mesh_viewer.c)
         target_link_libraries(trellis-mesh-viewer PRIVATE raylib)
         if (UNIX)
             target_link_libraries(trellis-mesh-viewer PRIVATE m)
         endif()
 
-        add_executable(trellis-stage2-mesh-live-viewer tools/trellis_stage2_mesh_live_viewer.c)
-        target_link_libraries(trellis-stage2-mesh-live-viewer PRIVATE trellis2_c ggml raylib)
+        add_executable(trellis-structured-latent-mesh-live-viewer tools/viewers/trellis_structured_latent_mesh_live_viewer.c)
+        target_include_directories(trellis-structured-latent-mesh-live-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
+        target_link_libraries(trellis-structured-latent-mesh-live-viewer PRIVATE trellis2_c ggml raylib)
         if (UNIX)
-            target_link_libraries(trellis-stage2-mesh-live-viewer PRIVATE m)
+            target_link_libraries(trellis-structured-latent-mesh-live-viewer PRIVATE m)
         endif()
     endif()
 endif()

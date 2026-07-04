@@ -17,27 +17,28 @@ This file tracks the source checkpoint operator coverage in the C + ggml + CUDA 
 | full self/cross attention | `ggml_flash_attn_ext` through `trellis_ggml_sdpa` | `test_attention_cuda` |
 | `ModulatedTransformerCrossBlock` AdaLN/gate skeleton | `trellis_ggml_modulated_cross_block` | graph builder coverage through compile/tests |
 | `RotaryPositionEmbedder` 3D phases | `trellis_rope_3d_phases_f32` | `test_stage1_sampler_math` |
-| RoPE apply for ggml attention layout `[head_dim, tokens, heads, batch]` | `trellis_ggml_apply_rope_adjacent`, `trellis_cuda_apply_rope_f32` | `test_rope_adjacent_ggml_cuda`, `test_custom_cuda_kernels` |
+| RoPE apply for ggml attention layout `[head_dim, tokens, heads, batch]` | `trellis_ggml_apply_rope_adjacent` composed from ggml ops | `test_rope_adjacent_ggml_cuda` |
 | full stage1 flow graph with real checkpoint weights | `trellis_dit_flow_forward`, `trellis-infer --dry-forward` | manual real-weight run |
 | flow Euler step | `trellis_flow_euler_step_f32` | `test_flow_and_sparse_host` |
 | classifier-free guidance combine | `trellis_flow_cfg_combine_f32` | `test_flow_and_sparse_host` |
 | classifier-free guidance rescale | `trellis_flow_cfg_rescale_combine_f32` | `test_stage1_sampler_math` |
 
-## Dense Conv3D decoder kernels
+## Dense Conv3D decoder graph
 
-| Source op | CUDA implementation | Test |
+| Source op | C/ggml implementation | Test |
 | --- | --- | --- |
-| `nn.Conv3d` in `SparseStructureDecoder` | `trellis_cuda_conv3d_f32` direct NCDHW kernel with stride/pad/dilation/bias | `test_custom_cuda_kernels` |
-| `pixel_shuffle_3d(x, 2)` in `UpsampleBlock3d` | `trellis_cuda_pixel_shuffle_3d_f32` | `test_custom_cuda_kernels` |
-| `ChannelLayerNorm3d` | `trellis_cuda_channel_layer_norm_3d_f32` | `test_custom_cuda_kernels` |
+| `nn.Conv3d` in `SparseStructureDecoder` | `ggml_conv_3d_direct` + bias repeat/add | `test_custom_cuda_kernels`, `trellis-infer --dry-decode` |
+| `pixel_shuffle_3d(x, 2)` in `UpsampleBlock3d` | `ggml_pixel_shuffle_3d` | `test_custom_cuda_kernels`, `trellis-infer --dry-decode` |
+| `ChannelLayerNorm3d` | `ggml_norm` over channel-contiguous views + affine repeat/add | `trellis-infer --dry-decode` |
 | `SiLU` and residual add | `trellis_cuda_silu_f32`, `trellis_cuda_add_f32` | `test_custom_cuda_kernels` |
 | SparseStructureDecoder real-weight path | `trellis_ss_decoder_forward_f32_host`, `trellis-infer --dry-decode` | manual real-weight run |
 
 ## DINOv3 Image Encoder
 
-| Source op | CUDA implementation | Test |
+| Source op | C/ggml implementation | Test |
 | --- | --- | --- |
-| ViT patch embedding | `trellis_cuda_dino_patch_embed_f32`, `trellis_dino_patch_embed_f32_host` | `test_custom_cuda_kernels`, `trellis-infer --dry-dino-patch` |
+| ViT patch embedding | `trellis_dino_patch_embedding_forward`, `ggml_conv_2d_direct` + bias + token reshape | `test_custom_cuda_kernels` |
+| full image encoder graph | `trellis_dino_image_forward`, `trellis_dino_image_forward_f32_host` | `trellis-infer --dry-dino-patch`, full image-to-OBJ smoke |
 | DINOv3 checkpoint binding | `trellis_dino_vit_bind_weights` | manual real-weight run |
 
 ## Sparse tensor coordinate operators
@@ -79,14 +80,12 @@ CUDA kernel.
 
 ## Remaining custom CUDA work
 
-1. Complete the DINOv3 transformer graph after patch embedding.
-2. Add image file loading, resize, RGB conversion, and normalization in C.
-3. Run the full 12-step stage1 sampler at 16^3 latent resolution with CFG.
-4. Optimize Conv3D for full 16->64 decoder runs; the current direct kernel is correctness-first.
-5. Convert decoder logits to voxel coordinate buffers and stream them to the raylib viewer.
-6. Varlen FlashAttention packing for later sparse SLat stages.
-7. Wire the FlexiDualGridVaeDecoder graph around the tested sparse submanifold conv, then optimize it into a gather/GEMM/scatter path.
-8. O-Voxel flexible dual-grid mesh conversion in C/CUDA.
+1. Run the full 12-step stage1 sampler at 16^3 latent resolution with CFG.
+2. Optimize Conv3D for full 16->64 decoder runs; the current direct kernel is correctness-first.
+3. Convert decoder logits to voxel coordinate buffers and stream them to the raylib viewer.
+4. Varlen FlashAttention packing for later sparse SLat stages.
+5. Wire the FlexiDualGridVaeDecoder graph around the tested sparse submanifold conv, then optimize it into a gather/GEMM/scatter path.
+6. O-Voxel flexible dual-grid mesh conversion in C/CUDA.
 
 ## Component status
 
