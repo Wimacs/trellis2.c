@@ -111,6 +111,13 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
     set_tests_properties(trellis2_c_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(trellis2_c_backend_ops_tests
+        tests/test_ggml_backend_ops.c
+    )
+    target_link_libraries(trellis2_c_backend_ops_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_backend_ops_tests COMMAND trellis2_c_backend_ops_tests)
+    set_tests_properties(trellis2_c_backend_ops_tests PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 if (TRELLIS2_C_BUILD_TOOLS)
