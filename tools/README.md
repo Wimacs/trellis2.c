@@ -1,5 +1,21 @@
 # trellis2.c tools
 
+Download the default TRELLIS.2 and DINOv3 weights from Hugging Face:
+
+```sh
+python3 tools/download_weights.py --source huggingface
+```
+
+Or download the same layout from ModelScope:
+
+```sh
+python3 tools/download_weights.py --source modelscope
+```
+
+The downloader writes to `../TRELLIS.2/` by default. Use `--output-dir`,
+`--only trellis|dino`, `--revision`, `--include`, or `--full` when you need a
+custom layout or a non-default set of files.
+
 `trellis-image-to-obj` is the default terminal inference app:
 
 ```sh

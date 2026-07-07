@@ -68,7 +68,27 @@ ctest --test-dir build --output-on-failure
 
 ## Run
 
-Place the TRELLIS.2 and DINOv3 checkpoints next to the project, then run one-shot OBJ inference:
+Download the TRELLIS.2 and DINOv3 checkpoints next to the project:
+
+```sh
+python3 tools/download_weights.py --source huggingface
+```
+
+For ModelScope:
+
+```sh
+python3 tools/download_weights.py --source modelscope
+```
+
+Both commands write the default layout expected by the tools:
+
+```text
+../TRELLIS.2/
+|-- TRELLIS.2-4B/
+`-- dinov3-vitl16-pretrain-lvd1689m/
+```
+
+Then run one-shot OBJ inference:
 
 ```sh
 ./build/trellis-image-to-obj \
