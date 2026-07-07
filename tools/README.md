@@ -69,9 +69,11 @@ individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
 CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
 clustering is the GPU-accelerated part, then each chart is copied to CPU xatlas
-for parameterization and packing. The current vkmesh exporter still feeds the
-cleaned mesh directly to CPU xatlas; the next alignment step is to add the
-CuMesh-like GPU chart clustering stage before xatlas.
+for parameterization and packing. The vkmesh exporter now follows that shape:
+large meshes first run a Vulkan chart-key prepass and then add the resulting
+smaller chart meshes to xatlas. `TRELLIS_GLTF_UV_CHART_FACES` controls the
+target faces per chart, and `TRELLIS_GLTF_UV_CHART_GRID` can override the
+spatial grid used by the current prepass.
 
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:

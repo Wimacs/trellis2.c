@@ -15,6 +15,7 @@
 #include "trellis_gltf_bake_frag_spv.h"
 #include "trellis_gltf_dilate_spv.h"
 #include "trellis_gltf_fill_empty_spv.h"
+#include "trellis_gltf_chart_keys_spv.h"
 #endif
 
 #include <errno.h>
@@ -34,6 +35,20 @@ typedef struct trellis_gltf_mesh {
     uint32_t vertex_count;
     uint32_t index_count;
 } trellis_gltf_mesh;
+
+typedef struct trellis_gltf_chart_record {
+    uint32_t key;
+    uint32_t face;
+} trellis_gltf_chart_record;
+
+typedef struct trellis_gltf_chart_input {
+    float * positions;
+    float * normals;
+    uint32_t * indices;
+    uint32_t * vertex_map;
+    uint32_t vertex_count;
+    uint32_t face_count;
+} trellis_gltf_chart_input;
 
 typedef struct trellis_pbr_hash {
     uint64_t * keys;
@@ -293,7 +308,16 @@ static void gltf_mesh_free(trellis_gltf_mesh * mesh) {
     memset(mesh, 0, sizeof(*mesh));
 }
 
-static trellis_status unwrap_mesh_xatlas(
+static void gltf_chart_input_free(trellis_gltf_chart_input * chart) {
+    if (chart == NULL) return;
+    free(chart->positions);
+    free(chart->normals);
+    free(chart->indices);
+    free(chart->vertex_map);
+    memset(chart, 0, sizeof(*chart));
+}
+
+static trellis_status unwrap_mesh_xatlas_direct(
     const trellis_mesh_host * mesh,
     int texture_size,
     trellis_gltf_mesh * out) {
@@ -559,14 +583,15 @@ typedef struct trellis_gltf_vk {
     VkPipelineLayout pipeline_layout;
     VkRenderPass render_pass;
     VkPipeline graphics_pipeline;
-    VkPipeline compute_pipelines[2];
+    VkPipeline compute_pipelines[3];
     VkDescriptorPool descriptor_pool;
 } trellis_gltf_vk;
 
 typedef enum trellis_gltf_vk_compute_pipeline {
     TRELLIS_GLTF_COMPUTE_DILATE = 0,
     TRELLIS_GLTF_COMPUTE_FILL_EMPTY = 1,
-    TRELLIS_GLTF_COMPUTE_COUNT = 2,
+    TRELLIS_GLTF_COMPUTE_CHART_KEYS = 2,
+    TRELLIS_GLTF_COMPUTE_COUNT = 3,
 } trellis_gltf_vk_compute_pipeline;
 
 typedef struct trellis_gltf_vk_shader {
@@ -590,6 +615,7 @@ static const trellis_gltf_vk_shader g_gltf_bake_frag_shader = {
 static const trellis_gltf_vk_shader g_gltf_compute_shaders[TRELLIS_GLTF_COMPUTE_COUNT] = {
     { trellis_gltf_dilate_spv, trellis_gltf_dilate_spv_len, "gltf_dilate" },
     { trellis_gltf_fill_empty_spv, trellis_gltf_fill_empty_spv_len, "gltf_fill_empty" },
+    { trellis_gltf_chart_keys_spv, trellis_gltf_chart_keys_spv_len, "gltf_chart_keys" },
 };
 
 typedef struct trellis_gltf_vk_push {
@@ -601,6 +627,14 @@ typedef struct trellis_gltf_vk_push {
     uint32_t resolution;
     uint32_t pad0;
     uint32_t pad1;
+    float bounds_min_x;
+    float bounds_min_y;
+    float bounds_min_z;
+    float bounds_inv_extent;
+    uint32_t chart_grid;
+    uint32_t chart_target_faces;
+    uint32_t chart_normal_bins;
+    uint32_t chart_flags;
 } trellis_gltf_vk_push;
 
 static uint32_t hash_coord_export32(int32_t x, int32_t y, int32_t z) {
@@ -1212,6 +1246,365 @@ static int gltf_vk_dispatch(
     return ok;
 }
 
+static uint32_t gltf_uv_chart_target_faces(void) {
+    uint32_t value = 8192u;
+    const char * env = getenv("TRELLIS_GLTF_UV_CHART_FACES");
+    if (env != NULL && env[0] != '\0') {
+        char * end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed >= 512ul && parsed <= 65536ul) {
+            value = (uint32_t) parsed;
+        }
+    }
+    return value;
+}
+
+static uint32_t gltf_uv_chart_grid(uint32_t face_count, uint32_t target_faces) {
+    uint32_t grid = 1u;
+    uint64_t desired = ((uint64_t) face_count + (uint64_t) target_faces - 1u) / (uint64_t) target_faces;
+    while (grid < 255u && (uint64_t) grid * (uint64_t) grid * (uint64_t) grid < desired) {
+        ++grid;
+    }
+    const char * env = getenv("TRELLIS_GLTF_UV_CHART_GRID");
+    if (env != NULL && env[0] != '\0') {
+        char * end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed >= 1ul && parsed <= 255ul) {
+            grid = (uint32_t) parsed;
+        }
+    }
+    return grid;
+}
+
+static int gltf_chart_record_compare(const void * a, const void * b) {
+    const trellis_gltf_chart_record * ra = (const trellis_gltf_chart_record *) a;
+    const trellis_gltf_chart_record * rb = (const trellis_gltf_chart_record *) b;
+    if (ra->key != rb->key) return ra->key < rb->key ? -1 : 1;
+    if (ra->face != rb->face) return ra->face < rb->face ? -1 : 1;
+    return 0;
+}
+
+static int gltf_compute_chart_records_vulkan(
+    const trellis_mesh_host * mesh,
+    uint32_t target_faces,
+    trellis_gltf_chart_record ** records_out,
+    uint32_t * grid_out) {
+    *records_out = NULL;
+    *grid_out = 1u;
+    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
+        mesh->n_vertices > UINT32_MAX || mesh->n_faces > UINT32_MAX) {
+        return 0;
+    }
+
+    float min_x = mesh->vertices[0], min_y = mesh->vertices[1], min_z = mesh->vertices[2];
+    float max_x = min_x, max_y = min_y, max_z = min_z;
+    for (int64_t i = 1; i < mesh->n_vertices; ++i) {
+        const float * p = mesh->vertices + (size_t) i * 3u;
+        if (p[0] < min_x) min_x = p[0];
+        if (p[1] < min_y) min_y = p[1];
+        if (p[2] < min_z) min_z = p[2];
+        if (p[0] > max_x) max_x = p[0];
+        if (p[1] > max_y) max_y = p[1];
+        if (p[2] > max_z) max_z = p[2];
+    }
+    float extent_x = max_x - min_x;
+    float extent_y = max_y - min_y;
+    float extent_z = max_z - min_z;
+    float extent = fmaxf(extent_x, fmaxf(extent_y, extent_z));
+    if (extent <= 1e-20f) extent = 1.0f;
+
+    uint32_t face_count = (uint32_t) mesh->n_faces;
+    uint32_t grid = gltf_uv_chart_grid(face_count, target_faces);
+    trellis_gltf_chart_record * records =
+        (trellis_gltf_chart_record *) malloc((size_t) face_count * sizeof(trellis_gltf_chart_record));
+    if (records == NULL) return 0;
+
+    trellis_gltf_vk vk;
+    trellis_gltf_vk_buffer buffers[10];
+    memset(&vk, 0, sizeof(vk));
+    memset(buffers, 0, sizeof(buffers));
+    int ok = 0;
+    if (!gltf_vk_init(&vk)) goto cleanup;
+
+    size_t positions_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
+    size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
+    size_t records_bytes = (size_t) face_count * sizeof(trellis_gltf_chart_record);
+    if (!gltf_vk_buffer_create(&vk, positions_bytes, &buffers[0]) ||
+        !gltf_vk_buffer_create(&vk, faces_bytes, &buffers[1]) ||
+        !gltf_vk_buffer_create(&vk, records_bytes, &buffers[2])) {
+        goto cleanup;
+    }
+    for (uint32_t i = 3; i < 10; ++i) {
+        if (!gltf_vk_buffer_create(&vk, 4u, &buffers[i])) goto cleanup;
+    }
+
+    memcpy(buffers[0].mapped, mesh->vertices, positions_bytes);
+    memcpy(buffers[1].mapped, mesh->faces, faces_bytes);
+    memset(buffers[2].mapped, 0, records_bytes);
+
+    trellis_gltf_vk_push push;
+    memset(&push, 0, sizeof(push));
+    push.triangle_count = face_count;
+    push.bounds_min_x = min_x;
+    push.bounds_min_y = min_y;
+    push.bounds_min_z = min_z;
+    push.bounds_inv_extent = 1.0f / extent;
+    push.chart_grid = grid;
+    push.chart_target_faces = target_faces;
+    push.chart_normal_bins = 6u;
+
+    trellis_gltf_vk_buffer * desc[10];
+    for (int i = 0; i < 10; ++i) desc[i] = &buffers[i];
+    uint32_t groups = (face_count + 127u) / 128u;
+    if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_CHART_KEYS, desc, &push, groups, 1u)) {
+        goto cleanup;
+    }
+    memcpy(records, buffers[2].mapped, records_bytes);
+    *records_out = records;
+    *grid_out = grid;
+    records = NULL;
+    ok = 1;
+
+cleanup:
+    for (int i = 0; i < 10; ++i) gltf_vk_buffer_destroy(&vk, &buffers[i]);
+    gltf_vk_destroy(&vk);
+    free(records);
+    return ok;
+}
+
+static trellis_status unwrap_mesh_xatlas_charted_vulkan(
+    const trellis_mesh_host * mesh,
+    int texture_size,
+    trellis_gltf_mesh * out) {
+    if (mesh == NULL || out == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
+        mesh->n_vertices > UINT32_MAX || mesh->n_faces > UINT32_MAX / 3) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out, 0, sizeof(*out));
+
+    uint32_t target_faces = gltf_uv_chart_target_faces();
+    if ((uint64_t) mesh->n_faces < (uint64_t) target_faces * 2u) {
+        return TRELLIS_STATUS_NOT_IMPLEMENTED;
+    }
+
+    float * input_normals = (float *) malloc((size_t) mesh->n_vertices * 3u * sizeof(float));
+    if (input_normals == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
+    mesh_compute_normals(mesh, input_normals);
+
+    trellis_gltf_chart_record * records = NULL;
+    uint32_t grid = 1u;
+    if (!gltf_compute_chart_records_vulkan(mesh, target_faces, &records, &grid)) {
+        free(input_normals);
+        return TRELLIS_STATUS_ERROR;
+    }
+    qsort(records, (size_t) mesh->n_faces, sizeof(*records), gltf_chart_record_compare);
+
+    uint32_t chart_count = 0;
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        if (i == 0 || records[i].key != records[i - 1].key) ++chart_count;
+    }
+    if (chart_count <= 1u) {
+        free(records);
+        free(input_normals);
+        return TRELLIS_STATUS_NOT_IMPLEMENTED;
+    }
+
+    trellis_gltf_chart_input * charts =
+        (trellis_gltf_chart_input *) calloc((size_t) chart_count, sizeof(trellis_gltf_chart_input));
+    int32_t * global_to_local = (int32_t *) malloc((size_t) mesh->n_vertices * sizeof(int32_t));
+    if (charts == NULL || global_to_local == NULL) {
+        free(charts);
+        free(global_to_local);
+        free(records);
+        free(input_normals);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (int64_t i = 0; i < mesh->n_vertices; ++i) global_to_local[i] = -1;
+
+    xatlasSetPrint(NULL, false);
+    xatlasAtlas * atlas = xatlasCreate();
+    if (atlas == NULL) {
+        free(global_to_local);
+        free(charts);
+        free(records);
+        free(input_normals);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    trellis_status status = TRELLIS_STATUS_OK;
+    uint32_t chart_index = 0;
+    int64_t start = 0;
+    while (start < mesh->n_faces) {
+        int64_t end = start + 1;
+        while (end < mesh->n_faces && records[end].key == records[start].key) ++end;
+        uint32_t face_count = (uint32_t) (end - start);
+        uint32_t max_vertices = face_count * 3u;
+        trellis_gltf_chart_input * chart = &charts[chart_index];
+        chart->positions = (float *) malloc((size_t) max_vertices * 3u * sizeof(float));
+        chart->normals = (float *) malloc((size_t) max_vertices * 3u * sizeof(float));
+        chart->indices = (uint32_t *) malloc((size_t) face_count * 3u * sizeof(uint32_t));
+        chart->vertex_map = (uint32_t *) malloc((size_t) max_vertices * sizeof(uint32_t));
+        uint32_t * touched = (uint32_t *) malloc((size_t) max_vertices * sizeof(uint32_t));
+        if (chart->positions == NULL || chart->normals == NULL ||
+            chart->indices == NULL || chart->vertex_map == NULL || touched == NULL) {
+            free(touched);
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            break;
+        }
+
+        uint32_t local_vertices = 0;
+        uint32_t touched_count = 0;
+        for (uint32_t f = 0; f < face_count; ++f) {
+            uint32_t face_id = records[start + f].face;
+            const int32_t * face = mesh->faces + (size_t) face_id * 3u;
+            for (uint32_t k = 0; k < 3u; ++k) {
+                int32_t gv_i32 = face[k];
+                if (gv_i32 < 0 || (uint32_t) gv_i32 >= (uint32_t) mesh->n_vertices) {
+                    status = TRELLIS_STATUS_INVALID_ARGUMENT;
+                    break;
+                }
+                uint32_t gv = (uint32_t) gv_i32;
+                int32_t local = global_to_local[gv];
+                if (local < 0) {
+                    local = (int32_t) local_vertices;
+                    global_to_local[gv] = local;
+                    touched[touched_count++] = gv;
+                    memcpy(chart->positions + (size_t) local_vertices * 3u,
+                        mesh->vertices + (size_t) gv * 3u,
+                        3u * sizeof(float));
+                    memcpy(chart->normals + (size_t) local_vertices * 3u,
+                        input_normals + (size_t) gv * 3u,
+                        3u * sizeof(float));
+                    chart->vertex_map[local_vertices] = gv;
+                    ++local_vertices;
+                }
+                chart->indices[(size_t) f * 3u + k] = (uint32_t) local;
+            }
+            if (status != TRELLIS_STATUS_OK) break;
+        }
+        for (uint32_t i = 0; i < touched_count; ++i) global_to_local[touched[i]] = -1;
+        free(touched);
+        if (status != TRELLIS_STATUS_OK) break;
+
+        chart->vertex_count = local_vertices;
+        chart->face_count = face_count;
+        xatlasMeshDecl decl;
+        xatlasMeshDeclInit(&decl);
+        decl.vertexCount = chart->vertex_count;
+        decl.vertexPositionData = chart->positions;
+        decl.vertexPositionStride = 3u * sizeof(float);
+        decl.vertexNormalData = chart->normals;
+        decl.vertexNormalStride = 3u * sizeof(float);
+        decl.indexCount = chart->face_count * 3u;
+        decl.indexData = chart->indices;
+        decl.indexFormat = XATLAS_INDEX_FORMAT_UINT32;
+        xatlasAddMeshError add_error = xatlasAddMesh(atlas, &decl, chart_count);
+        if (add_error != XATLAS_ADD_MESH_ERROR_SUCCESS) {
+            TRELLIS_ERROR("glTF export: xatlas AddMesh chart failed: %s", xatlasAddMeshErrorString(add_error));
+            status = TRELLIS_STATUS_ERROR;
+            break;
+        }
+        ++chart_index;
+        start = end;
+    }
+
+    if (status == TRELLIS_STATUS_OK) {
+        xatlasPackOptions pack_options;
+        xatlasPackOptionsInit(&pack_options);
+        pack_options.resolution = (uint32_t) texture_size;
+        pack_options.padding = 4;
+        pack_options.createImage = false;
+        xatlasGenerate(atlas, NULL, &pack_options);
+        if (atlas->meshCount != chart_count || atlas->meshes == NULL) {
+            status = TRELLIS_STATUS_ERROR;
+        }
+    }
+
+    uint64_t total_vertices = 0;
+    uint64_t total_indices = 0;
+    if (status == TRELLIS_STATUS_OK) {
+        for (uint32_t c = 0; c < chart_count; ++c) {
+            total_vertices += atlas->meshes[c].vertexCount;
+            total_indices += atlas->meshes[c].indexCount;
+        }
+        if (total_vertices == 0 || total_vertices > UINT32_MAX || total_indices > UINT32_MAX) {
+            status = TRELLIS_STATUS_ERROR;
+        }
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        out->vertex_count = (uint32_t) total_vertices;
+        out->index_count = (uint32_t) total_indices;
+        out->positions = (float *) malloc((size_t) out->vertex_count * 3u * sizeof(float));
+        out->normals = (float *) malloc((size_t) out->vertex_count * 3u * sizeof(float));
+        out->uvs = (float *) malloc((size_t) out->vertex_count * 2u * sizeof(float));
+        out->indices = (uint32_t *) malloc((size_t) out->index_count * sizeof(uint32_t));
+        if (out->positions == NULL || out->normals == NULL || out->uvs == NULL || out->indices == NULL) {
+            gltf_mesh_free(out);
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        const float atlas_w = atlas->width > 0 ? (float) atlas->width : (float) texture_size;
+        const float atlas_h = atlas->height > 0 ? (float) atlas->height : (float) texture_size;
+        uint32_t vertex_base = 0;
+        uint32_t index_base = 0;
+        for (uint32_t c = 0; c < chart_count; ++c) {
+            const xatlasMesh * xm = &atlas->meshes[c];
+            const trellis_gltf_chart_input * chart = &charts[c];
+            for (uint32_t i = 0; i < xm->vertexCount; ++i) {
+                const xatlasVertex * v = &xm->vertexArray[i];
+                uint32_t src = v->xref;
+                if (src >= chart->vertex_count) {
+                    status = TRELLIS_STATUS_ERROR;
+                    break;
+                }
+                uint32_t global = chart->vertex_map[src];
+                memcpy(out->positions + (size_t) (vertex_base + i) * 3u,
+                    mesh->vertices + (size_t) global * 3u,
+                    3u * sizeof(float));
+                memcpy(out->normals + (size_t) (vertex_base + i) * 3u,
+                    input_normals + (size_t) global * 3u,
+                    3u * sizeof(float));
+                out->uvs[(size_t) (vertex_base + i) * 2u + 0u] = clamp01_export(v->uv[0] / atlas_w);
+                out->uvs[(size_t) (vertex_base + i) * 2u + 1u] = clamp01_export(1.0f - v->uv[1] / atlas_h);
+            }
+            if (status != TRELLIS_STATUS_OK) break;
+            for (uint32_t i = 0; i < xm->indexCount; ++i) {
+                if (xm->indexArray[i] >= xm->vertexCount) {
+                    status = TRELLIS_STATUS_ERROR;
+                    break;
+                }
+                out->indices[index_base + i] = vertex_base + xm->indexArray[i];
+            }
+            if (status != TRELLIS_STATUS_OK) break;
+            vertex_base += xm->vertexCount;
+            index_base += xm->indexCount;
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            TRELLIS_INFO(
+                "glTF export: Vulkan charted xatlas unwrap faces=%" PRId64 " grid=%u charts=%u xatlas_charts=%u vertices=%u atlas=%ux%u",
+                mesh->n_faces,
+                grid,
+                chart_count,
+                atlas->chartCount,
+                out->vertex_count,
+                atlas->width,
+                atlas->height);
+        }
+    }
+
+    xatlasDestroy(atlas);
+    for (uint32_t i = 0; i < chart_count; ++i) gltf_chart_input_free(&charts[i]);
+    free(global_to_local);
+    free(charts);
+    free(records);
+    free(input_normals);
+    if (status != TRELLIS_STATUS_OK) gltf_mesh_free(out);
+    return status;
+}
+
 static int gltf_vk_render_bake(
     trellis_gltf_vk * vk,
     trellis_gltf_vk_buffer * buffers[10],
@@ -1561,6 +1954,24 @@ cleanup:
     return status;
 }
 #endif
+
+static trellis_status unwrap_mesh_xatlas(
+    const trellis_mesh_host * mesh,
+    int texture_size,
+    trellis_gltf_mesh * out) {
+#ifdef GGML_USE_VULKAN
+    if (mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
+        trellis_status status = unwrap_mesh_xatlas_charted_vulkan(mesh, texture_size, out);
+        if (status == TRELLIS_STATUS_OK) {
+            return status;
+        }
+        if (status != TRELLIS_STATUS_NOT_IMPLEMENTED) {
+            TRELLIS_INFO("glTF export: Vulkan charted UV unwrap failed, falling back to direct xatlas");
+        }
+    }
+#endif
+    return unwrap_mesh_xatlas_direct(mesh, texture_size, out);
+}
 
 static void transform_mesh_to_viewer_axes(trellis_gltf_mesh * mesh) {
     for (uint32_t i = 0; i < mesh->vertex_count; ++i) {

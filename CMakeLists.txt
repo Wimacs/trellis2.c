@@ -134,6 +134,8 @@ if (GGML_VULKAN)
     set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
     set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
     set(TRELLIS_GLTF_FILL_EMPTY_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_fill_empty_spv.h")
+    set(TRELLIS_GLTF_CHART_KEYS_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_chart_keys.spv")
+    set(TRELLIS_GLTF_CHART_KEYS_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_chart_keys_spv.h")
     add_custom_command(
         OUTPUT "${TRELLIS_SPARSE_VK_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
@@ -197,6 +199,13 @@ if (GGML_VULKAN)
         DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
     add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_CHART_KEYS_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_chart_keys.comp"
+                -o "${TRELLIS_GLTF_CHART_KEYS_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_chart_keys.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan UV chart key shader")
+    add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
         COMMAND "${CMAKE_COMMAND}"
@@ -236,12 +245,23 @@ if (GGML_VULKAN)
                 -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         DEPENDS "${TRELLIS_GLTF_FILL_EMPTY_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS glTF Vulkan texture fill shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_CHART_KEYS_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_CHART_KEYS_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_CHART_KEYS_HEADER}"
+                -DSYMBOL=trellis_gltf_chart_keys_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_CHART_KEYS_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan UV chart key shader header")
     add_custom_target(trellis_sparse_vk_shader DEPENDS "${TRELLIS_SPARSE_VK_HEADER}" "${TRELLIS_SPARSE_VK_MAT_HEADER}")
     add_custom_target(trellis_gltf_vk_shader DEPENDS
         "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
         "${TRELLIS_GLTF_DILATE_HEADER}"
-        "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
+        "${TRELLIS_GLTF_FILL_EMPTY_HEADER}"
+        "${TRELLIS_GLTF_CHART_KEYS_HEADER}")
     add_dependencies(trellis2_c trellis_sparse_vk_shader)
     add_dependencies(trellis2_c trellis_gltf_vk_shader)
 endif()

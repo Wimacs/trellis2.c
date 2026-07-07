@@ -1,0 +1,75 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, binding = 1) readonly buffer Faces { int faces[]; };
+layout(std430, binding = 2) buffer Records { uint records[]; };
+
+layout(push_constant) uniform Push {
+    uint texture_size;
+    uint triangle_count;
+    uint voxel_count;
+    uint channels;
+    uint hash_size;
+    uint resolution;
+    uint pad0;
+    uint pad1;
+    float bounds_min_x;
+    float bounds_min_y;
+    float bounds_min_z;
+    float bounds_inv_extent;
+    uint chart_grid;
+    uint chart_target_faces;
+    uint chart_normal_bins;
+    uint chart_flags;
+} pc;
+
+vec3 load_position(uint vertex_id) {
+    uint base = vertex_id * 3u;
+    return vec3(positions[base + 0u], positions[base + 1u], positions[base + 2u]);
+}
+
+uint quantize_axis(float x, float min_v) {
+    float scaled = (x - min_v) * pc.bounds_inv_extent * float(pc.chart_grid);
+    int q = int(floor(scaled));
+    q = clamp(q, 0, int(pc.chart_grid) - 1);
+    return uint(q);
+}
+
+uint normal_bin(vec3 n) {
+    vec3 a = abs(n);
+    if (a.x >= a.y && a.x >= a.z) return n.x < 0.0 ? 1u : 0u;
+    if (a.y >= a.z) return n.y < 0.0 ? 3u : 2u;
+    return n.z < 0.0 ? 5u : 4u;
+}
+
+void main() {
+    uint face_id = gl_GlobalInvocationID.x;
+    if (face_id >= pc.triangle_count) return;
+
+    uint fbase = face_id * 3u;
+    uint i0 = uint(faces[fbase + 0u]);
+    uint i1 = uint(faces[fbase + 1u]);
+    uint i2 = uint(faces[fbase + 2u]);
+
+    vec3 p0 = load_position(i0);
+    vec3 p1 = load_position(i1);
+    vec3 p2 = load_position(i2);
+    vec3 c = (p0 + p1 + p2) * (1.0 / 3.0);
+    vec3 n = cross(p1 - p0, p2 - p0);
+    float len2 = dot(n, n);
+    if (len2 > 1e-20) n *= inversesqrt(len2);
+    else n = vec3(0.0, 1.0, 0.0);
+
+    uint grid = clamp(pc.chart_grid, 1u, 255u);
+    uint qx = quantize_axis(c.x, pc.bounds_min_x);
+    uint qy = quantize_axis(c.y, pc.bounds_min_y);
+    uint qz = quantize_axis(c.z, pc.bounds_min_z);
+    uint nb = normal_bin(n);
+    uint key = (nb << 24u) | (qx << 16u) | (qy << 8u) | qz;
+
+    uint obase = face_id * 2u;
+    records[obase + 0u] = key;
+    records[obase + 1u] = face_id;
+}
