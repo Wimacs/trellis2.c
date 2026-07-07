@@ -997,7 +997,12 @@ trellis_status trellis_birefnet_load_gguf_with_backend(
 trellis_status trellis_birefnet_load_gguf(
     trellis_birefnet_model * model,
     const char * gguf_path) {
-    return trellis_birefnet_load_gguf_with_backend(model, gguf_path, TRELLIS_BACKEND_CPU, 0);
+    trellis_backend_kind backend_kind = TRELLIS_BACKEND_CPU;
+    trellis_status status = trellis_backend_kind_from_name(TRELLIS_DEFAULT_BACKEND, &backend_kind);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+    return trellis_birefnet_load_gguf_with_backend(model, gguf_path, backend_kind, 0);
 }
 
 void trellis_birefnet_free(trellis_birefnet_model * model) {

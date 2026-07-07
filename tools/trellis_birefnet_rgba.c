@@ -19,7 +19,7 @@ static void usage(FILE * out, const char * argv0) {
         "  --birefnet FILE   BiRefNet GGUF model\n"
         "  --image FILE      Input RGB/RGBA image readable by stb_image\n"
         "  --out FILE        Output RGBA PNG path\n"
-        "  --backend NAME    Backend for BiRefNet graph: cpu, cuda, or vulkan; default cpu\n"
+        "  --backend NAME    Backend for BiRefNet graph: cpu, cuda, or vulkan; default " TRELLIS_DEFAULT_BACKEND "\n"
         "  --device N        Backend device index, default 0\n"
         "  --verbose         Print debug logs\n"
         "  --help, -h        Show this help\n",
@@ -52,6 +52,10 @@ int main(int argc, char ** argv) {
     const char * image_path = NULL;
     const char * out_path = NULL;
     trellis_backend_kind backend_kind = TRELLIS_BACKEND_CPU;
+    if (trellis_backend_kind_from_name(TRELLIS_DEFAULT_BACKEND, &backend_kind) != TRELLIS_STATUS_OK) {
+        fprintf(stderr, "invalid compiled default backend: %s\n", TRELLIS_DEFAULT_BACKEND);
+        return 2;
+    }
     int device = 0;
 
     for (int i = 1; i < argc; ++i) {

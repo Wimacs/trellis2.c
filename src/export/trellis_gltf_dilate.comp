@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 6) readonly buffer SrcBase { uint src_base[]; };
+layout(std430, binding = 7) readonly buffer SrcMr { uint src_mr[]; };
+layout(std430, binding = 8) buffer DstBase { uint dst_base[]; };
+layout(std430, binding = 9) buffer DstMr { uint dst_mr[]; };
+
+layout(push_constant) uniform Push {
+    uint texture_size;
+    uint triangle_count;
+    uint voxel_count;
+    uint channels;
+    uint hash_size;
+    uint resolution;
+    uint pad0;
+    uint pad1;
+} pc;
+
+uint alpha_of(uint p) {
+    return p >> 24;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.texture_size || y >= pc.texture_size) return;
+    uint idx = y * pc.texture_size + x;
+    uint b = src_base[idx];
+    uint m = src_mr[idx];
+    if (alpha_of(b) != 0u) {
+        dst_base[idx] = b;
+        dst_mr[idx] = m;
+        return;
+    }
+    int tex = int(pc.texture_size);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = int(x) + dx;
+            int ny = int(y) + dy;
+            if (nx < 0 || ny < 0 || nx >= tex || ny >= tex) continue;
+            uint nidx = uint(ny) * pc.texture_size + uint(nx);
+            uint nb = src_base[nidx];
+            if (alpha_of(nb) == 0u) continue;
+            dst_base[idx] = nb;
+            dst_mr[idx] = src_mr[nidx];
+            return;
+        }
+    }
+    dst_base[idx] = 0u;
+    dst_mr[idx] = 0u;
+}

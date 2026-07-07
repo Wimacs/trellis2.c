@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 6) buffer BaseImage { uint base_image[]; };
+layout(std430, binding = 7) buffer MrImage { uint mr_image[]; };
+
+layout(push_constant) uniform Push {
+    uint texture_size;
+    uint triangle_count;
+    uint voxel_count;
+    uint channels;
+    uint hash_size;
+    uint resolution;
+    uint pad0;
+    uint pad1;
+} pc;
+
+uint alpha_of(uint p) {
+    return p >> 24;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.texture_size || y >= pc.texture_size) return;
+    uint idx = y * pc.texture_size + x;
+    if (alpha_of(base_image[idx]) != 0u) return;
+    base_image[idx] = 0xffccccccu;
+    mr_image[idx] = 0xff00cc00u;
+}

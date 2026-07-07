@@ -720,6 +720,10 @@ typedef struct trellis_image_to_obj_options {
     int decode_max_levels;
     int64_t decode_max_input_tokens;
     int texture_size;
+    int mesh_postprocess;
+    int mesh_postprocess_no_simplify;
+    int mesh_postprocess_decimation_target;
+    const char * vkmesh_path;
 } trellis_image_to_obj_options;
 
 trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options);

@@ -1683,10 +1683,24 @@ static int vkmesh_simplify(
         int before = (int) mesh->n_faces;
         int collapsed = 0;
         int removed = 0;
+        fprintf(stderr,
+            "vkmesh: simplify step=%d begin faces=%" PRId64 " target=%d threshold=%.9g\n",
+            step + 1,
+            mesh->n_faces,
+            target_faces,
+            threshold);
+        fflush(stderr);
         if (!vkmesh_simplify_step(mesh, lambda_edge_length, lambda_skinny, threshold, &collapsed, &removed)) return 0;
         *total_collapsed += collapsed;
         *total_removed += removed;
         ++step;
+        fprintf(stderr,
+            "vkmesh: simplify step=%d end collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
+            step,
+            collapsed,
+            removed,
+            mesh->n_faces);
+        fflush(stderr);
         if (mesh->n_faces <= target_faces) break;
         if (collapsed == 0 || removed == 0 || removed * 100 < before) threshold *= 10.0f;
     }
@@ -2235,12 +2249,179 @@ static int vkmesh_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, int *
     return 1;
 }
 
+static int vkmesh_log_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, const char * label) {
+    int filled = 0;
+    int added_faces = 0;
+    int64_t before_v = mesh->n_vertices;
+    int64_t before_f = mesh->n_faces;
+    if (!vkmesh_fill_holes(mesh, max_hole_perimeter, &filled, &added_faces)) return 0;
+    fprintf(stderr,
+        "vkmesh: %s fill_holes loops=%d added_vertices=%" PRId64 " added_faces=%d faces=%" PRId64 "->%" PRId64 "\n",
+        label,
+        filled,
+        mesh->n_vertices - before_v,
+        added_faces,
+        before_f,
+        mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_log_remove_duplicate_faces(vkmesh_mesh * mesh, const char * label) {
+    int removed = 0;
+    if (!vkmesh_remove_duplicate_faces(mesh, &removed)) return 0;
+    fprintf(stderr, "vkmesh: %s remove_duplicate_faces removed=%d faces=%" PRId64 "\n", label, removed, mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_log_remove_degenerate_faces(
+    vkmesh_mesh * mesh,
+    float degenerate_abs,
+    float degenerate_rel,
+    const char * label) {
+    int removed = 0;
+    if (!vkmesh_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, &removed)) return 0;
+    fprintf(stderr, "vkmesh: %s remove_degenerate_faces removed=%d faces=%" PRId64 "\n", label, removed, mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_log_repair_non_manifold_edges(vkmesh_mesh * mesh, const char * label) {
+    int old_v = 0;
+    int new_v = 0;
+    if (!vkmesh_repair_non_manifold_edges(mesh, &old_v, &new_v)) return 0;
+    fprintf(stderr, "vkmesh: %s repair_non_manifold_edges vertices=%d->%d faces=%" PRId64 "\n", label, old_v, new_v, mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_log_remove_small_connected_components(vkmesh_mesh * mesh, float min_component_area, const char * label) {
+    int removed = 0;
+    if (!vkmesh_remove_small_connected_components(mesh, min_component_area, &removed)) return 0;
+    fprintf(stderr, "vkmesh: %s remove_small_connected_components removed=%d faces=%" PRId64 "\n", label, removed, mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_log_unify_face_orientations(vkmesh_mesh * mesh, const char * label) {
+    int flipped = 0;
+    if (!vkmesh_unify_face_orientations(mesh, &flipped)) return 0;
+    fprintf(stderr, "vkmesh: %s unify_face_orientations flipped=%d\n", label, flipped);
+    return 1;
+}
+
+static int vkmesh_log_simplify(
+    vkmesh_mesh * mesh,
+    int target_faces,
+    float lambda_edge_length,
+    float lambda_skinny,
+    float simplify_threshold,
+    int simplify_steps,
+    const char * label) {
+    int collapsed = 0;
+    int removed = 0;
+    if (target_faces <= 0) target_faces = 1;
+    fprintf(stderr,
+        "vkmesh: %s simplify begin target=%d faces=%" PRId64 "\n",
+        label,
+        target_faces,
+        mesh->n_faces);
+    fflush(stderr);
+    if (!vkmesh_simplify(
+            mesh,
+            target_faces,
+            lambda_edge_length,
+            lambda_skinny,
+            simplify_threshold,
+            simplify_steps,
+            &collapsed,
+            &removed)) {
+        return 0;
+    }
+    fprintf(stderr,
+        "vkmesh: %s simplify target=%d collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
+        label,
+        target_faces,
+        collapsed,
+        removed,
+        mesh->n_faces);
+    return 1;
+}
+
+static int vkmesh_trellis_postprocess(
+    vkmesh_mesh * mesh,
+    int decimation_target,
+    float max_hole_perimeter,
+    float degenerate_abs,
+    float degenerate_rel,
+    float min_component_area,
+    float lambda_edge_length,
+    float lambda_skinny,
+    float simplify_threshold,
+    int simplify_steps,
+    int run_degenerate_cleanup) {
+    if (decimation_target <= 0) decimation_target = 1000000;
+    fprintf(stderr,
+        "vkmesh: trellis_postprocess begin target=%d max_hole_perimeter=%.9g min_component_area=%.9g\n",
+        decimation_target,
+        max_hole_perimeter,
+        min_component_area);
+
+    if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pre")) return 0;
+
+    int64_t first_target = (int64_t) decimation_target * 3;
+    if (first_target > INT_MAX) first_target = INT_MAX;
+    if (mesh->n_faces > first_target) {
+        if (!vkmesh_log_simplify(
+                mesh,
+                (int) first_target,
+                lambda_edge_length,
+                lambda_skinny,
+                simplify_threshold,
+                simplify_steps,
+                "trellis.pass1")) {
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "vkmesh: trellis.pass1 simplify skipped faces=%" PRId64 " target=%" PRId64 "\n", mesh->n_faces, first_target);
+    }
+
+    if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass1")) return 0;
+    if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass1")) return 0;
+    if (!vkmesh_log_repair_non_manifold_edges(mesh, "trellis.pass1")) return 0;
+    if (!vkmesh_log_remove_small_connected_components(mesh, min_component_area, "trellis.pass1")) return 0;
+    if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pass1")) return 0;
+
+    if (mesh->n_faces > decimation_target) {
+        if (!vkmesh_log_simplify(
+                mesh,
+                decimation_target,
+                lambda_edge_length,
+                lambda_skinny,
+                simplify_threshold,
+                simplify_steps,
+                "trellis.pass2")) {
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "vkmesh: trellis.pass2 simplify skipped faces=%" PRId64 " target=%d\n", mesh->n_faces, decimation_target);
+    }
+
+    if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass2")) return 0;
+    if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass2")) return 0;
+    if (!vkmesh_log_repair_non_manifold_edges(mesh, "trellis.pass2")) return 0;
+    if (!vkmesh_log_remove_small_connected_components(mesh, min_component_area, "trellis.pass2")) return 0;
+    if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pass2")) return 0;
+    if (!vkmesh_log_unify_face_orientations(mesh, "trellis.final")) return 0;
+
+    fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
+    return 1;
+}
+
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s --input in.obj --output out.obj [options]\n"
         "\n"
         "Postprocess stages:\n"
-        "  --postprocess                 Run cleanup order after TRELLIS.2 export\n"
+        "  --postprocess                 Run PyTorch/o-voxel TRELLIS postprocess preset\n"
+        "  --trellis-postprocess         Alias of --postprocess\n"
+        "  --cleanup                     Run one cleanup pass using selected primitive stages\n"
         "  --fill-holes                  Fill small manifold boundary loops (default)\n"
         "  --no-fill-holes               Disable default fill_holes\n"
         "  --remove-duplicate-faces      Remove duplicate triangle index sets\n"
@@ -2249,14 +2430,17 @@ static void print_usage(const char * argv0) {
         "  --remove-small-components     Remove components below --min-component-area\n"
         "  --unify-face-orientations     Make winding consistent per manifold component\n"
         "  --simplify                    Run CuMesh-style simplify loop\n"
+        "  --no-simplify                 Disable simplify even if --target-faces was set\n"
         "  --uv-unwrap                   Run xatlas unwrap and write OBJ vt records\n"
+        "  --no-uv-unwrap                Disable UV unwrap after a preset enabled it\n"
         "\n"
         "Parameters:\n"
         "  --max-hole-perimeter X        Default 0.03, matching CuMesh/TRELLIS.2\n"
         "  --degenerate-abs X            Default 1e-24\n"
         "  --degenerate-rel X            Default 1e-12\n"
         "  --min-component-area X        Default 1e-5\n"
-        "  --target-faces N              Enables simplify to N faces\n"
+        "  --target-faces N              Enables simplify to N faces; TRELLIS default is 1000000\n"
+        "  --decimation-target N         Alias of --target-faces\n"
         "  --simplify-steps N            0 means no explicit step limit\n"
         "  --simplify-threshold X        Default 1e-8\n"
         "  --lambda-edge-length X        Default 1e-2\n"
@@ -2285,6 +2469,7 @@ int main(int argc, char ** argv) {
     int target_faces = 0;
     int simplify_steps = 0;
     int texture_size = 1024;
+    int trellis_postprocess = 0;
     int fill_holes = 1;
     int remove_duplicate_faces = 0;
     int remove_degenerate_faces = 0;
@@ -2292,13 +2477,17 @@ int main(int argc, char ** argv) {
     int remove_small_components = 0;
     int unify_face_orientations = 0;
     int simplify = 0;
+    int disable_simplify = 0;
     int uv_unwrap = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
             input = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output = argv[++i];
-        } else if (strcmp(argv[i], "--postprocess") == 0) {
+        } else if (strcmp(argv[i], "--postprocess") == 0 || strcmp(argv[i], "--trellis-postprocess") == 0) {
+            trellis_postprocess = 1;
+            uv_unwrap = 1;
+        } else if (strcmp(argv[i], "--cleanup") == 0) {
             fill_holes = 1;
             remove_duplicate_faces = 1;
             remove_degenerate_faces = 1;
@@ -2313,9 +2502,10 @@ int main(int argc, char ** argv) {
             degenerate_rel = (float) atof(argv[++i]);
         } else if (strcmp(argv[i], "--min-component-area") == 0 && i + 1 < argc) {
             min_component_area = (float) atof(argv[++i]);
-        } else if (strcmp(argv[i], "--target-faces") == 0 && i + 1 < argc) {
+        } else if ((strcmp(argv[i], "--target-faces") == 0 || strcmp(argv[i], "--decimation-target") == 0) && i + 1 < argc) {
             target_faces = atoi(argv[++i]);
             simplify = 1;
+            disable_simplify = 0;
         } else if (strcmp(argv[i], "--simplify-steps") == 0 && i + 1 < argc) {
             simplify_steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--simplify-threshold") == 0 && i + 1 < argc) {
@@ -2346,8 +2536,14 @@ int main(int argc, char ** argv) {
             unify_face_orientations = 1;
         } else if (strcmp(argv[i], "--simplify") == 0) {
             simplify = 1;
+            disable_simplify = 0;
+        } else if (strcmp(argv[i], "--no-simplify") == 0) {
+            simplify = 0;
+            disable_simplify = 1;
         } else if (strcmp(argv[i], "--uv-unwrap") == 0) {
             uv_unwrap = 1;
+        } else if (strcmp(argv[i], "--no-uv-unwrap") == 0) {
+            uv_unwrap = 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -2373,76 +2569,63 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "vkmesh: loaded %" PRId64 " vertices, %" PRId64 " faces\n", mesh.n_vertices, mesh.n_faces);
-    if (fill_holes) {
-        int filled = 0;
-        int added_faces = 0;
-        int64_t before_v = mesh.n_vertices;
-        int64_t before_f = mesh.n_faces;
-        if (!vkmesh_fill_holes(&mesh, max_hole_perimeter, &filled, &added_faces)) {
+    if (trellis_postprocess) {
+        int decimation_target = disable_simplify ? INT_MAX : target_faces;
+        if (!vkmesh_trellis_postprocess(
+                &mesh,
+                decimation_target,
+                max_hole_perimeter,
+                degenerate_abs,
+                degenerate_rel,
+                min_component_area,
+                lambda_edge_length,
+                lambda_skinny,
+                simplify_threshold,
+                simplify_steps,
+                remove_degenerate_faces)) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr,
-            "vkmesh: fill_holes loops=%d added_vertices=%" PRId64 " added_faces=%d faces=%" PRId64 "->%" PRId64 "\n",
-            filled,
-            mesh.n_vertices - before_v,
-            added_faces,
-            before_f,
-            mesh.n_faces);
-    }
-    if (remove_duplicate_faces) {
-        int removed = 0;
-        if (!vkmesh_remove_duplicate_faces(&mesh, &removed)) {
+    } else {
+        if (fill_holes && !vkmesh_log_fill_holes(&mesh, max_hole_perimeter, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr, "vkmesh: remove_duplicate_faces removed=%d faces=%" PRId64 "\n", removed, mesh.n_faces);
-    }
-    if (remove_degenerate_faces) {
-        int removed = 0;
-        if (!vkmesh_remove_degenerate_faces(&mesh, degenerate_abs, degenerate_rel, &removed)) {
+        if (remove_duplicate_faces && !vkmesh_log_remove_duplicate_faces(&mesh, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr, "vkmesh: remove_degenerate_faces removed=%d faces=%" PRId64 "\n", removed, mesh.n_faces);
-    }
-    if (repair_non_manifold_edges) {
-        int old_v = 0;
-        int new_v = 0;
-        if (!vkmesh_repair_non_manifold_edges(&mesh, &old_v, &new_v)) {
+        if (remove_degenerate_faces && !vkmesh_log_remove_degenerate_faces(&mesh, degenerate_abs, degenerate_rel, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr, "vkmesh: repair_non_manifold_edges vertices=%d->%d faces=%" PRId64 "\n", old_v, new_v, mesh.n_faces);
-    }
-    if (remove_small_components) {
-        int removed = 0;
-        if (!vkmesh_remove_small_connected_components(&mesh, min_component_area, &removed)) {
+        if (repair_non_manifold_edges && !vkmesh_log_repair_non_manifold_edges(&mesh, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr, "vkmesh: remove_small_connected_components removed=%d faces=%" PRId64 "\n", removed, mesh.n_faces);
-    }
-    if (unify_face_orientations) {
-        int flipped = 0;
-        if (!vkmesh_unify_face_orientations(&mesh, &flipped)) {
+        if (remove_small_components && !vkmesh_log_remove_small_connected_components(&mesh, min_component_area, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr, "vkmesh: unify_face_orientations flipped=%d\n", flipped);
-    }
-    if (simplify) {
-        int collapsed = 0;
-        int removed = 0;
-        if (target_faces <= 0) target_faces = (int) (mesh.n_faces / 2);
-        if (target_faces <= 0) target_faces = 1;
-        if (!vkmesh_simplify(&mesh, target_faces, lambda_edge_length, lambda_skinny, simplify_threshold, simplify_steps, &collapsed, &removed)) {
+        if (unify_face_orientations && !vkmesh_log_unify_face_orientations(&mesh, "stage")) {
             mesh_free(&mesh);
             return 1;
         }
-        fprintf(stderr,
-            "vkmesh: simplify target=%d collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
-            target_faces, collapsed, removed, mesh.n_faces);
+        if (simplify && !disable_simplify) {
+            if (target_faces <= 0) target_faces = (int) (mesh.n_faces / 2);
+            if (target_faces <= 0) target_faces = 1;
+            if (!vkmesh_log_simplify(
+                    &mesh,
+                    target_faces,
+                    lambda_edge_length,
+                    lambda_skinny,
+                    simplify_threshold,
+                    simplify_steps,
+                    "stage")) {
+                mesh_free(&mesh);
+                return 1;
+            }
+        }
     }
     if (uv_unwrap) {
         int old_v = 0;

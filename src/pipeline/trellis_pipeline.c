@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -168,7 +169,9 @@ static void unlink_if_set(const char * path) {
 static trellis_status apply_birefnet_background_removal(
     const char * input_path,
     const char * gguf_path,
-    const char * output_path) {
+    const char * output_path,
+    trellis_backend_kind backend_kind,
+    int device) {
     if (input_path == NULL || gguf_path == NULL || output_path == NULL ||
         input_path[0] == '\0' || gguf_path[0] == '\0' || output_path[0] == '\0') {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -184,10 +187,14 @@ static trellis_status apply_birefnet_background_removal(
         return TRELLIS_STATUS_IO_ERROR;
     }
 
-    TRELLIS_INFO("BiRefNet: loading background-removal GGUF: %s", gguf_path);
+    TRELLIS_INFO(
+        "BiRefNet: loading background-removal GGUF on %s device=%d: %s",
+        trellis_backend_kind_name(backend_kind),
+        device,
+        gguf_path);
     trellis_birefnet_model model;
     memset(&model, 0, sizeof(model));
-    trellis_status status = trellis_birefnet_load_gguf(&model, gguf_path);
+    trellis_status status = trellis_birefnet_load_gguf_with_backend(&model, gguf_path, backend_kind, device);
     unsigned char * mask = NULL;
     if (status == TRELLIS_STATUS_OK) {
         status = trellis_birefnet_compute_mask_u8(&model, rgba, width, height, &mask);
@@ -817,6 +824,260 @@ trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_
     return fclose(f) == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_IO_ERROR;
 }
 
+static int postprocess_mesh_reserve_vertices(trellis_mesh_host * mesh, int64_t need, int64_t * vertex_capacity) {
+    if (need <= *vertex_capacity) {
+        return 1;
+    }
+    int64_t cap = *vertex_capacity > 0 ? *vertex_capacity : 1024;
+    while (cap < need) {
+        if (cap > INT64_MAX / 2) return 0;
+        cap *= 2;
+    }
+    float * vertices = (float *) realloc(mesh->vertices, (size_t) cap * 3u * sizeof(float));
+    if (vertices == NULL) return 0;
+    mesh->vertices = vertices;
+    *vertex_capacity = cap;
+    return 1;
+}
+
+static int postprocess_mesh_reserve_faces(trellis_mesh_host * mesh, int64_t need, int64_t * face_capacity) {
+    if (need <= *face_capacity) {
+        return 1;
+    }
+    int64_t cap = *face_capacity > 0 ? *face_capacity : 1024;
+    while (cap < need) {
+        if (cap > INT64_MAX / 2) return 0;
+        cap *= 2;
+    }
+    int32_t * faces = (int32_t *) realloc(mesh->faces, (size_t) cap * 3u * sizeof(int32_t));
+    if (faces == NULL) return 0;
+    mesh->faces = faces;
+    *face_capacity = cap;
+    return 1;
+}
+
+static int postprocess_mesh_add_vertex(
+    trellis_mesh_host * mesh,
+    int64_t * vertex_capacity,
+    float obj_x,
+    float obj_y,
+    float obj_z) {
+    if (!postprocess_mesh_reserve_vertices(mesh, mesh->n_vertices + 1, vertex_capacity)) {
+        return 0;
+    }
+    float * v = mesh->vertices + (size_t) mesh->n_vertices * 3u;
+    v[0] = obj_x;
+    v[1] = -obj_z;
+    v[2] = obj_y;
+    ++mesh->n_vertices;
+    return 1;
+}
+
+static int postprocess_mesh_add_face(trellis_mesh_host * mesh, int64_t * face_capacity, int32_t a, int32_t b, int32_t c) {
+    if (a < 0 || b < 0 || c < 0 ||
+        a >= mesh->n_vertices || b >= mesh->n_vertices || c >= mesh->n_vertices) {
+        return 0;
+    }
+    if (!postprocess_mesh_reserve_faces(mesh, mesh->n_faces + 1, face_capacity)) {
+        return 0;
+    }
+    int32_t * f = mesh->faces + (size_t) mesh->n_faces * 3u;
+    f[0] = a;
+    f[1] = b;
+    f[2] = c;
+    ++mesh->n_faces;
+    return 1;
+}
+
+static int postprocess_parse_obj_index(const char * token, int64_t n_vertices, int32_t * out) {
+    char * end = NULL;
+    long idx = strtol(token, &end, 10);
+    if (end == token || idx == 0) {
+        return 0;
+    }
+    int64_t resolved = idx > 0 ? (int64_t) idx - 1 : n_vertices + (int64_t) idx;
+    if (resolved < 0 || resolved >= n_vertices || resolved > INT32_MAX) {
+        return 0;
+    }
+    *out = (int32_t) resolved;
+    return 1;
+}
+
+static trellis_status load_postprocessed_obj_mesh(const char * path, trellis_mesh_host * mesh_out) {
+    if (path == NULL || mesh_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    FILE * f = fopen(path, "r");
+    if (f == NULL) {
+        TRELLIS_ERROR("mesh postprocess: failed to open processed OBJ %s", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    trellis_mesh_host mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int64_t vertex_capacity = 0;
+    int64_t face_capacity = 0;
+    char line[8192];
+    int64_t line_no = 0;
+    trellis_status status = TRELLIS_STATUS_OK;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        ++line_no;
+        char * p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (p[0] == 'v' && isspace((unsigned char) p[1])) {
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (sscanf(p + 1, "%f %f %f", &x, &y, &z) != 3 ||
+                !postprocess_mesh_add_vertex(&mesh, &vertex_capacity, x, y, z)) {
+                TRELLIS_ERROR("mesh postprocess: bad vertex at %s:%lld", path, (long long) line_no);
+                status = TRELLIS_STATUS_IO_ERROR;
+                break;
+            }
+        } else if (p[0] == 'f' && isspace((unsigned char) p[1])) {
+            int32_t ids[256];
+            int n = 0;
+            char * q = p + 1;
+            while (*q != '\0') {
+                while (*q != '\0' && isspace((unsigned char) *q)) ++q;
+                if (*q == '\0' || *q == '#') break;
+                if (n >= (int) (sizeof(ids) / sizeof(ids[0])) ||
+                    !postprocess_parse_obj_index(q, mesh.n_vertices, &ids[n])) {
+                    TRELLIS_ERROR("mesh postprocess: bad face index at %s:%lld", path, (long long) line_no);
+                    status = TRELLIS_STATUS_IO_ERROR;
+                    break;
+                }
+                ++n;
+                while (*q != '\0' && !isspace((unsigned char) *q)) ++q;
+            }
+            if (status != TRELLIS_STATUS_OK) break;
+            if (n < 3) {
+                TRELLIS_ERROR("mesh postprocess: face has fewer than 3 vertices at %s:%lld", path, (long long) line_no);
+                status = TRELLIS_STATUS_IO_ERROR;
+                break;
+            }
+            for (int i = 1; i + 1 < n; ++i) {
+                if (!postprocess_mesh_add_face(&mesh, &face_capacity, ids[0], ids[i], ids[i + 1])) {
+                    TRELLIS_ERROR("mesh postprocess: failed to append face at %s:%lld", path, (long long) line_no);
+                    status = TRELLIS_STATUS_IO_ERROR;
+                    break;
+                }
+            }
+            if (status != TRELLIS_STATUS_OK) break;
+        }
+    }
+    fclose(f);
+    if (status == TRELLIS_STATUS_OK && (mesh.n_vertices <= 0 || mesh.n_faces <= 0)) {
+        TRELLIS_ERROR("mesh postprocess: processed OBJ has no usable triangle mesh: %s", path);
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_mesh_free(&mesh);
+        return status;
+    }
+    *mesh_out = mesh;
+    return TRELLIS_STATUS_OK;
+}
+
+static int run_vkmesh_postprocess_command(
+    const char * vkmesh_path,
+    const char * input_obj,
+    const char * output_obj,
+    int decimation_target,
+    int no_simplify) {
+    char target[64];
+    snprintf(target, sizeof(target), "%d", decimation_target > 0 ? decimation_target : 1000000);
+    const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : "vkmesh";
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 0;
+    }
+    if (pid == 0) {
+        char * argv[12];
+        int argc = 0;
+        argv[argc++] = (char *) exe;
+        argv[argc++] = (char *) "--input";
+        argv[argc++] = (char *) input_obj;
+        argv[argc++] = (char *) "--output";
+        argv[argc++] = (char *) output_obj;
+        argv[argc++] = (char *) "--postprocess";
+        argv[argc++] = (char *) "--decimation-target";
+        argv[argc++] = target;
+        if (no_simplify) {
+            argv[argc++] = (char *) "--no-simplify";
+        }
+        argv[argc++] = (char *) "--no-uv-unwrap";
+        argv[argc] = NULL;
+        if (strchr(exe, '/') != NULL) {
+            execv(exe, argv);
+        } else {
+            execvp(exe, argv);
+        }
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return 0;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
+    trellis_mesh_host * mesh,
+    const char * vkmesh_path,
+    int decimation_target,
+    int no_simplify) {
+    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    char input_obj[4096];
+    char output_obj[4096];
+    int n0 = snprintf(input_obj, sizeof(input_obj), "/tmp/trellis2_vkmesh_in_%ld.obj", (long) getpid());
+    int n1 = snprintf(output_obj, sizeof(output_obj), "/tmp/trellis2_vkmesh_out_%ld.obj", (long) getpid());
+    if (n0 < 0 || (size_t) n0 >= sizeof(input_obj) || n1 < 0 || (size_t) n1 >= sizeof(output_obj)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    trellis_status status = trellis_pipeline_write_obj(input_obj, mesh);
+    if (status != TRELLIS_STATUS_OK) {
+        unlink_if_set(input_obj);
+        unlink_if_set(output_obj);
+        return status;
+    }
+
+    TRELLIS_INFO(
+        "mesh postprocess: running vkmesh target=%d no_simplify=%d input_faces=%lld",
+        decimation_target > 0 ? decimation_target : 1000000,
+        no_simplify ? 1 : 0,
+        (long long) mesh->n_faces);
+    if (!run_vkmesh_postprocess_command(vkmesh_path, input_obj, output_obj, decimation_target, no_simplify)) {
+        TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
+        unlink_if_set(input_obj);
+        unlink_if_set(output_obj);
+        return TRELLIS_STATUS_ERROR;
+    }
+
+    trellis_mesh_host processed;
+    status = load_postprocessed_obj_mesh(output_obj, &processed);
+    unlink_if_set(input_obj);
+    unlink_if_set(output_obj);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    int64_t old_vertices = mesh->n_vertices;
+    int64_t old_faces = mesh->n_faces;
+    trellis_mesh_free(mesh);
+    *mesh = processed;
+    TRELLIS_INFO(
+        "mesh postprocess: done vertices=%lld->%lld faces=%lld->%lld",
+        (long long) old_vertices,
+        (long long) mesh->n_vertices,
+        (long long) old_faces,
+        (long long) mesh->n_faces);
+    return TRELLIS_STATUS_OK;
+}
+
 trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options) {
     if (options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
         options->image_path == NULL ||
@@ -829,6 +1090,25 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     char temp_birefnet_image[4096];
     temp_image[0] = '\0';
     temp_birefnet_image[0] = '\0';
+    trellis_status status = TRELLIS_STATUS_OK;
+    const char * backend_name =
+        options->backend != NULL && options->backend[0] != '\0' ?
+            options->backend :
+            TRELLIS_DEFAULT_BACKEND;
+    trellis_backend_kind graph_backend_kind = TRELLIS_BACKEND_CUDA;
+    status = trellis_backend_kind_from_name(backend_name, &graph_backend_kind);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("backend: invalid backend '%s'", backend_name);
+        return status;
+    }
+    if (strcmp(trellis_backend_kind_name(graph_backend_kind), TRELLIS_DEFAULT_BACKEND) != 0) {
+        TRELLIS_ERROR(
+            "backend: this binary was compiled for %s; rebuild with -DTRELLIS2_C_BACKEND=%s for that backend",
+            TRELLIS_DEFAULT_BACKEND,
+            trellis_backend_kind_name(graph_backend_kind));
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
     const char * sparse_structure_image_path = options->image_path;
     if (path_has_ext(options->image_path, "webp")) {
         int n = snprintf(
@@ -847,7 +1127,6 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         }
         sparse_structure_image_path = temp_image;
     }
-    trellis_status status = TRELLIS_STATUS_OK;
     if (options->birefnet_path != NULL && options->birefnet_path[0] != '\0') {
         int n = snprintf(
             temp_birefnet_image,
@@ -862,7 +1141,9 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         status = apply_birefnet_background_removal(
             sparse_structure_image_path,
             options->birefnet_path,
-            temp_birefnet_image);
+            temp_birefnet_image,
+            graph_backend_kind,
+            options->device);
         if (status != TRELLIS_STATUS_OK) {
             unlink_if_set(temp_birefnet_image);
             unlink_if_set(temp_image);
@@ -875,27 +1156,6 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     trellis_cuda_context cuda;
     memset(&graph_backend, 0, sizeof(graph_backend));
     memset(&cuda, 0, sizeof(cuda));
-    const char * backend_name =
-        options->backend != NULL && options->backend[0] != '\0' ?
-            options->backend :
-            TRELLIS_DEFAULT_BACKEND;
-    trellis_backend_kind graph_backend_kind = TRELLIS_BACKEND_CUDA;
-    status = trellis_backend_kind_from_name(backend_name, &graph_backend_kind);
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("backend: invalid backend '%s'", backend_name);
-        unlink_if_set(temp_birefnet_image);
-        unlink_if_set(temp_image);
-        return status;
-    }
-    if (strcmp(trellis_backend_kind_name(graph_backend_kind), TRELLIS_DEFAULT_BACKEND) != 0) {
-        TRELLIS_ERROR(
-            "backend: this binary was compiled for %s; rebuild with -DTRELLIS2_C_BACKEND=%s for that backend",
-            TRELLIS_DEFAULT_BACKEND,
-            trellis_backend_kind_name(graph_backend_kind));
-        unlink_if_set(temp_birefnet_image);
-        unlink_if_set(temp_image);
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
     trellis_sparse_backend_kind sparse_backend_kind = TRELLIS_SPARSE_BACKEND_CUDA;
     status = sparse_backend_kind_from_graph_backend(graph_backend_kind, &sparse_backend_kind);
     if (status != TRELLIS_STATUS_OK) {
@@ -1040,6 +1300,16 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     status = trellis_pipeline_decode_shape_latent_mesh(&mesh_options, &shape_subs, &mesh);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
+    }
+    if (options->mesh_postprocess) {
+        status = trellis_pipeline_postprocess_mesh_with_vkmesh(
+            &mesh,
+            options->vkmesh_path,
+            options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000,
+            options->mesh_postprocess_no_simplify);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
     }
 
     TRELLIS_INFO(

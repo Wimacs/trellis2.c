@@ -126,6 +126,12 @@ if (GGML_VULKAN)
     set(TRELLIS_SPARSE_VK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_spv.h")
     set(TRELLIS_SPARSE_VK_MAT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk_mat.spv")
     set(TRELLIS_SPARSE_VK_MAT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_mat_spv.h")
+    set(TRELLIS_GLTF_BAKE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake.spv")
+    set(TRELLIS_GLTF_BAKE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_spv.h")
+    set(TRELLIS_GLTF_DILATE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_dilate.spv")
+    set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
+    set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
+    set(TRELLIS_GLTF_FILL_EMPTY_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_fill_empty_spv.h")
     add_custom_command(
         OUTPUT "${TRELLIS_SPARSE_VK_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
@@ -160,8 +166,64 @@ if (GGML_VULKAN)
                 -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         DEPENDS "${TRELLIS_SPARSE_VK_MAT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS sparse Vulkan tiled matmul shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_bake.comp"
+                -o "${TRELLIS_GLTF_BAKE_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_bake.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture bake shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_dilate.comp"
+                -o "${TRELLIS_GLTF_DILATE_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_dilate.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture dilation shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_fill_empty.comp"
+                -o "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_fill_empty.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_BAKE_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_BAKE_HEADER}"
+                -DSYMBOL=trellis_gltf_bake_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_BAKE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture bake shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DILATE_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_DILATE_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_DILATE_HEADER}"
+                -DSYMBOL=trellis_gltf_dilate_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_DILATE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture dilation shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_FILL_EMPTY_HEADER}"
+                -DSYMBOL=trellis_gltf_fill_empty_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_FILL_EMPTY_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture fill shader header")
     add_custom_target(trellis_sparse_vk_shader DEPENDS "${TRELLIS_SPARSE_VK_HEADER}" "${TRELLIS_SPARSE_VK_MAT_HEADER}")
+    add_custom_target(trellis_gltf_vk_shader DEPENDS
+        "${TRELLIS_GLTF_BAKE_HEADER}"
+        "${TRELLIS_GLTF_DILATE_HEADER}"
+        "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
     add_dependencies(trellis2_c trellis_sparse_vk_shader)
+    add_dependencies(trellis2_c trellis_gltf_vk_shader)
 endif()
 
 target_include_directories(trellis2_c

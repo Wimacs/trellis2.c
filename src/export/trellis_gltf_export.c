@@ -8,7 +8,16 @@
 #include "stb_image_write.h"
 #include "xatlas_c.h"
 
+#ifdef GGML_USE_VULKAN
+#include <vulkan/vulkan.h>
+
+#include "trellis_gltf_bake_spv.h"
+#include "trellis_gltf_dilate_spv.h"
+#include "trellis_gltf_fill_empty_spv.h"
+#endif
+
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

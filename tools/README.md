@@ -36,6 +36,34 @@ stb_image loader does not decode WebP directly.
 `trellis-image-to-obj.c` is intentionally thin: it parses arguments and calls
 `trellis_pipeline_image_to_obj()` from `src/pipeline/trellis_pipeline.c`.
 
+`vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
+mirrors the standard PyTorch/o-voxel export cleanup order: fill small holes,
+simplify toward `3 * target`, remove duplicate/non-manifold/small-component
+artifacts, fill again, simplify to the final target, repeat cleanup, fill once
+more, unify winding, then unwrap UVs by default.
+
+```sh
+../build/trellis-image-to-obj \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --birefnet ../TRELLIS.2/BiRefNet/model.gguf \
+  --image ../assets/example_image/T.png \
+  --gltf benchmark_outputs/output_post.gltf \
+  --backend vulkan \
+  --mesh-postprocess \
+  --mesh-postprocess-no-simplify \
+  --mesh-decimation-target 1000000 \
+  --vkmesh ../build/vkmesh
+```
+
+In the full pipeline, `vkmesh` cleans topology before PBR voxel baking, so the
+glTF exporter unwraps and bakes textures on the processed mesh. BiRefNet follows
+the same `--backend` and `--device` settings as the rest of the image-to-3D
+pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for geometry-only
+OBJ output, `--cleanup` for a single primitive cleanup pass, or individual flags
+such as `--fill-holes`, `--repair-non-manifold-edges`, and
+`--remove-small-components` when debugging one stage at a time.
+
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:
 
@@ -46,7 +74,9 @@ writes an RGBA PNG:
   --out /tmp/T_rgba.png
 ```
 
-Use `--backend cuda|vulkan|cpu --device N` to test a specific graph backend.
+By default it uses the compiled graph backend (`cuda` in CUDA builds,
+`vulkan` in Vulkan builds). Use `--backend cuda|vulkan|cpu --device N` to test
+a specific graph backend.
 
 Pipeline code lives under `src/`:
 

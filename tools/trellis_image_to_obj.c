@@ -29,11 +29,15 @@ static void usage(FILE * out, const char * argv0) {
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
-        "  --birefnet FILE         Optional BiRefNet GGUF background-removal model\n"
+        "  --birefnet FILE         Optional BiRefNet GGUF background-removal model; uses --backend/--device\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
         "  --obj FILE              Output OBJ path with vertex colors; no UV texture files\n"
         "  --gltf FILE             Output glTF 2.0 path; writes .gltf + .bin + PBR PNG textures\n"
         "  --texture-size N        glTF texture size, default 1024\n"
+        "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before OBJ/glTF export\n"
+        "  --mesh-postprocess-no-simplify Skip vkmesh simplify, keeping cleanup/orientation only\n"
+        "  --mesh-decimation-target N Postprocess final face target, default 1000000\n"
+        "  --vkmesh FILE           vkmesh executable path, default searches PATH\n"
         "  --backend NAME          Full pipeline backend: " TRELLIS_DEFAULT_BACKEND " for this build\n"
         "  --device N              Backend device, default 0\n"
         "  --steps N               Sparse-structure and structured-latent Euler steps, default 12\n"
@@ -145,6 +149,7 @@ int main(int argc, char ** argv) {
     options.guidance_max = 1.0f;
     options.flow_blocks_override = -1;
     options.flow_block_parts_override = -1;
+    options.mesh_postprocess_decimation_target = 1000000;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0) {
@@ -159,6 +164,15 @@ int main(int argc, char ** argv) {
             options.obj_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--gltf") == 0) {
             options.gltf_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--mesh-postprocess") == 0) {
+            options.mesh_postprocess = 1;
+        } else if (strcmp(argv[i], "--mesh-postprocess-no-simplify") == 0) {
+            options.mesh_postprocess = 1;
+            options.mesh_postprocess_no_simplify = 1;
+        } else if (strcmp(argv[i], "--mesh-decimation-target") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.mesh_postprocess_decimation_target)) goto bad_args;
+        } else if (strcmp(argv[i], "--vkmesh") == 0) {
+            options.vkmesh_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--backend") == 0) {
             options.backend = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--ggml-backend") == 0 || strcmp(argv[i], "--sparse-backend") == 0 ||
@@ -235,6 +249,7 @@ int main(int argc, char ** argv) {
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
         options.latent_size <= 0 || options.cond_resolution <= 0 ||
         options.sparse_resolution <= 0 || options.texture_size <= 0 ||
+        options.mesh_postprocess_decimation_target <= 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }
