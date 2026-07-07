@@ -1,6 +1,7 @@
 # Build outputs
 /build/
 /build-obj/
+/build-cuda/
 /build-vulkan/
 cmake-build-*/
 CMakeFiles/
