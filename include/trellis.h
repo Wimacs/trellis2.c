@@ -654,6 +654,12 @@ trellis_status trellis_birefnet_load_gguf(
     trellis_birefnet_model * model,
     const char * gguf_path);
 
+trellis_status trellis_birefnet_load_gguf_with_backend(
+    trellis_birefnet_model * model,
+    const char * gguf_path,
+    trellis_backend_kind backend_kind,
+    int device);
+
 void trellis_birefnet_free(trellis_birefnet_model * model);
 
 trellis_status trellis_birefnet_compute_mask_u8(

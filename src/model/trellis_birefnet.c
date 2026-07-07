@@ -102,11 +102,33 @@ static struct ggml_tensor * add_bias_whcn(
 }
 
 static struct ggml_tensor * cwhn_to_whcn(struct ggml_context * ctx, struct ggml_tensor * x) {
-    return ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    return ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));
 }
 
 static struct ggml_tensor * whcn_to_cwhn(struct ggml_context * ctx, struct ggml_tensor * x) {
-    return ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));
+    return ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+}
+
+static struct ggml_tensor * conv_2d_cwhn_layout(
+    struct ggml_context * ctx,
+    trellis_tensor_store * store,
+    const char * prefix,
+    struct ggml_tensor * x,
+    int stride,
+    int pad,
+    int weight_is_cwhn) {
+    struct ggml_tensor * w = weightf(store, "%s.weight", prefix);
+    struct ggml_tensor * b = weightf(store, "%s.bias", prefix);
+    if (w == NULL || x == NULL) {
+        return NULL;
+    }
+    if (weight_is_cwhn) {
+        w = cwhn_to_whcn(ctx, w);
+    }
+    struct ggml_tensor * xw = cwhn_to_whcn(ctx, x);
+    struct ggml_tensor * y = ggml_conv_2d_direct(ctx, w, xw, stride, stride, pad, pad, 1, 1);
+    y = add_bias_whcn(ctx, y, b);
+    return whcn_to_cwhn(ctx, y);
 }
 
 static struct ggml_tensor * conv_2d_cwhn(
@@ -116,15 +138,7 @@ static struct ggml_tensor * conv_2d_cwhn(
     struct ggml_tensor * x,
     int stride,
     int pad) {
-    struct ggml_tensor * w = weightf(store, "%s.weight", prefix);
-    struct ggml_tensor * b = weightf(store, "%s.bias", prefix);
-    if (w == NULL || x == NULL) {
-        return NULL;
-    }
-    struct ggml_tensor * xw = cwhn_to_whcn(ctx, x);
-    struct ggml_tensor * y = ggml_conv_2d_direct(ctx, w, xw, stride, stride, pad, pad, 1, 1);
-    y = add_bias_whcn(ctx, y, b);
-    return whcn_to_cwhn(ctx, y);
+    return conv_2d_cwhn_layout(ctx, store, prefix, x, stride, pad, 0);
 }
 
 static struct ggml_tensor * linear_prefixed(
@@ -172,163 +186,6 @@ static struct ggml_tensor * batch_norm_prefixed(
     }
     x = ggml_mul(ctx, x, repeat_param(ctx, gamma, x));
     return ggml_add(ctx, x, repeat_param(ctx, beta, x));
-}
-
-static size_t whcn_offset(
-    int64_t w,
-    int64_t h,
-    int64_t c,
-    int64_t x,
-    int64_t y,
-    int64_t ch,
-    int64_t n) {
-    return (size_t) x +
-        (size_t) w * ((size_t) y + (size_t) h * ((size_t) ch + (size_t) c * (size_t) n));
-}
-
-static size_t kernel_whio_offset(
-    int64_t kw,
-    int64_t kh,
-    int64_t ic,
-    int64_t kx,
-    int64_t ky,
-    int64_t in_c,
-    int64_t out_c) {
-    return (size_t) kx +
-        (size_t) kw * ((size_t) ky + (size_t) kh * ((size_t) in_c + (size_t) ic * (size_t) out_c));
-}
-
-static float bilinear_sample_whcn(
-    const float * src,
-    int64_t w,
-    int64_t h,
-    int64_t c,
-    int64_t ic,
-    float x,
-    float y) {
-    const int64_t x0 = (int64_t) floorf(x);
-    const int64_t y0 = (int64_t) floorf(y);
-    const int64_t x1 = x0 + 1;
-    const int64_t y1 = y0 + 1;
-    const float dx = x - (float) x0;
-    const float dy = y - (float) y0;
-    float v00 = 0.0f;
-    float v01 = 0.0f;
-    float v10 = 0.0f;
-    float v11 = 0.0f;
-    if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
-        v00 = src[whcn_offset(w, h, c, x0, y0, ic, 0)];
-    }
-    if (x1 >= 0 && x1 < w && y0 >= 0 && y0 < h) {
-        v01 = src[whcn_offset(w, h, c, x1, y0, ic, 0)];
-    }
-    if (x0 >= 0 && x0 < w && y1 >= 0 && y1 < h) {
-        v10 = src[whcn_offset(w, h, c, x0, y1, ic, 0)];
-    }
-    if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h) {
-        v11 = src[whcn_offset(w, h, c, x1, y1, ic, 0)];
-    }
-    const float v0 = v00 * (1.0f - dx) + v01 * dx;
-    const float v1 = v10 * (1.0f - dx) + v11 * dx;
-    return v0 * (1.0f - dy) + v1 * dy;
-}
-
-static void deform_conv_2d_whcn_custom(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    (void) userdata;
-    const struct ggml_tensor * kernel = dst->src[0];
-    const struct ggml_tensor * input = dst->src[1];
-    const struct ggml_tensor * offset = dst->src[2];
-    const struct ggml_tensor * mask = dst->src[3];
-    if (kernel == NULL || input == NULL || offset == NULL ||
-        kernel->type != GGML_TYPE_F32 || input->type != GGML_TYPE_F32 ||
-        offset->type != GGML_TYPE_F32 || (mask != NULL && mask->type != GGML_TYPE_F32)) {
-        return;
-    }
-
-    const int64_t kw = kernel->ne[0];
-    const int64_t kh = kernel->ne[1];
-    const int64_t ic = kernel->ne[2];
-    const int64_t oc = kernel->ne[3];
-    const int64_t iw = input->ne[0];
-    const int64_t ih = input->ne[1];
-    const int64_t ow = dst->ne[0];
-    const int64_t oh = dst->ne[1];
-    const int64_t batch = dst->ne[3];
-    const int64_t pad_x = kw / 2;
-    const int64_t pad_y = kh / 2;
-    const int64_t total = batch * oh * ow * oc;
-    const int64_t per = (total + nth - 1) / nth;
-    const int64_t begin = per * ith;
-    int64_t end = begin + per;
-    if (end > total) {
-        end = total;
-    }
-
-    const float * in_data = (const float *) input->data;
-    const float * w_data = (const float *) kernel->data;
-    const float * off_data = (const float *) offset->data;
-    const float * mask_data = mask == NULL ? NULL : (const float *) mask->data;
-    float * out_data = (float *) dst->data;
-
-    for (int64_t index = begin; index < end; ++index) {
-        const int64_t x = index % ow;
-        const int64_t y = (index / ow) % oh;
-        const int64_t out_c = (index / (ow * oh)) % oc;
-        const int64_t b = index / (ow * oh * oc);
-        float acc = 0.0f;
-        const float * input_b = in_data + (size_t) b * (size_t) iw * (size_t) ih * (size_t) ic;
-        for (int64_t ky = 0; ky < kh; ++ky) {
-            for (int64_t kx = 0; kx < kw; ++kx) {
-                const int64_t k = ky * kw + kx;
-                const float off_y = off_data[whcn_offset(ow, oh, kw * kh * 2, x, y, 2 * k + 0, b)];
-                const float off_x = off_data[whcn_offset(ow, oh, kw * kh * 2, x, y, 2 * k + 1, b)];
-                const float sx = (float) x + (float) kx - (float) pad_x + off_x;
-                const float sy = (float) y + (float) ky - (float) pad_y + off_y;
-                if (sx <= -1.0f || sx >= (float) iw || sy <= -1.0f || sy >= (float) ih) {
-                    continue;
-                }
-                const float m = mask_data == NULL ? 1.0f :
-                    mask_data[whcn_offset(ow, oh, kw * kh, x, y, k, b)];
-                for (int64_t in_c = 0; in_c < ic; ++in_c) {
-                    const float v = bilinear_sample_whcn(input_b, iw, ih, ic, in_c, sx, sy);
-                    const size_t wi = kernel_whio_offset(kw, kh, ic, kx, ky, in_c, out_c);
-                    acc += v * m * w_data[wi];
-                }
-            }
-        }
-        out_data[whcn_offset(ow, oh, oc, x, y, out_c, b)] = acc;
-    }
-}
-
-static struct ggml_tensor * deform_conv_2d_cwhn(
-    struct ggml_context * ctx,
-    struct ggml_tensor * kernel_whcn,
-    struct ggml_tensor * x_cwhn,
-    struct ggml_tensor * offset_cwhn,
-    struct ggml_tensor * mask_cwhn) {
-    struct ggml_tensor * kernel = kernel_whcn->type == GGML_TYPE_F32 ? kernel_whcn : ggml_cast(ctx, kernel_whcn, GGML_TYPE_F32);
-    struct ggml_tensor * x = cwhn_to_whcn(ctx, x_cwhn);
-    struct ggml_tensor * offset = cwhn_to_whcn(ctx, offset_cwhn);
-    struct ggml_tensor * mask = cwhn_to_whcn(ctx, mask_cwhn);
-    x = x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx, x, GGML_TYPE_F32);
-    offset = offset->type == GGML_TYPE_F32 ? offset : ggml_cast(ctx, offset, GGML_TYPE_F32);
-    mask = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx, mask, GGML_TYPE_F32);
-    const int64_t ow = x->ne[0];
-    const int64_t oh = x->ne[1];
-    struct ggml_tensor * args[4] = { kernel, x, offset, mask };
-    struct ggml_tensor * y = ggml_custom_4d(
-        ctx,
-        GGML_TYPE_F32,
-        ow,
-        oh,
-        kernel->ne[3],
-        x->ne[3],
-        args,
-        4,
-        deform_conv_2d_whcn_custom,
-        GGML_N_TASKS_MAX,
-        NULL);
-    return whcn_to_cwhn(ctx, y);
 }
 
 static struct ggml_tensor * simple_conv(
@@ -400,18 +257,39 @@ static struct ggml_tensor * deformable_conv_2d(
     struct ggml_context * ctx,
     trellis_tensor_store * store,
     const char * prefix,
-    struct ggml_tensor * x) {
+    struct ggml_tensor * x,
+    int padding) {
     char p[256];
     birefnet_format(p, sizeof(p), "%s.offset", prefix);
-    struct ggml_tensor * offset = conv_2d_cwhn(ctx, store, p, x, 1, 1);
+    struct ggml_tensor * offset = conv_2d_cwhn(ctx, store, p, x, 1, padding);
     birefnet_format(p, sizeof(p), "%s.modulator", prefix);
-    struct ggml_tensor * modulator = conv_2d_cwhn(ctx, store, p, x, 1, 1);
+    struct ggml_tensor * modulator = conv_2d_cwhn(ctx, store, p, x, 1, padding);
     modulator = ggml_scale(ctx, ggml_sigmoid(ctx, modulator), 2.0f);
     struct ggml_tensor * kernel = weightf(store, "%s.conv.weight", prefix);
     if (kernel == NULL || offset == NULL || modulator == NULL) {
         return NULL;
     }
-    return deform_conv_2d_cwhn(ctx, kernel, x, offset, modulator);
+
+    kernel = (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16) ?
+        kernel : ggml_cast(ctx, kernel, GGML_TYPE_F32);
+    x = cwhn_to_whcn(ctx, x);
+    offset = cwhn_to_whcn(ctx, offset);
+    modulator = cwhn_to_whcn(ctx, modulator);
+    x = x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx, x, GGML_TYPE_F32);
+    offset = offset->type == GGML_TYPE_F32 ? offset : ggml_cast(ctx, offset, GGML_TYPE_F32);
+    modulator = modulator->type == GGML_TYPE_F32 ? modulator : ggml_cast(ctx, modulator, GGML_TYPE_F32);
+
+    struct ggml_tensor * y = ggml_conv_2d_deform(
+        ctx,
+        kernel,
+        x,
+        offset,
+        modulator,
+        1,
+        1,
+        padding,
+        padding);
+    return whcn_to_cwhn(ctx, y);
 }
 
 static struct ggml_tensor * aspp_module_deformable(
@@ -420,10 +298,9 @@ static struct ggml_tensor * aspp_module_deformable(
     const char * prefix,
     struct ggml_tensor * x,
     int padding) {
-    (void) padding;
     char p[256];
     birefnet_format(p, sizeof(p), "%s.conv", prefix);
-    x = deformable_conv_2d(ctx, store, p, x);
+    x = deformable_conv_2d(ctx, store, p, x, padding);
     birefnet_format(p, sizeof(p), "%s.bn", prefix);
     x = batch_norm_prefixed(ctx, store, p, x);
     return ggml_relu(ctx, x);
@@ -451,10 +328,10 @@ static struct ggml_tensor * aspp_deformable(
     struct ggml_tensor * x1 = aspp_module_deformable(ctx, store, p, x, 0);
     struct ggml_tensor * xs[5];
     xs[0] = x1;
-    const int pads[3] = { 0, 1, 3 };
+    const int kernel_sizes[3] = { 1, 3, 7 };
     for (int i = 0; i < 3; ++i) {
         birefnet_format(p, sizeof(p), "%s.aspp_deforms.%d", prefix, i);
-        xs[i + 1] = aspp_module_deformable(ctx, store, p, x, pads[i]);
+        xs[i + 1] = aspp_module_deformable(ctx, store, p, x, kernel_sizes[i] / 2);
     }
     birefnet_format(p, sizeof(p), "%s.global_avg_pool", prefix);
     xs[4] = upscale_to_cwhn(ctx, global_avg_pool(ctx, store, p, x), x1);
@@ -943,7 +820,7 @@ static struct ggml_tensor * patch_embed(
     struct ggml_context * ctx,
     trellis_tensor_store * store,
     struct ggml_tensor * x) {
-    x = conv_2d_cwhn(ctx, store, "bb.patch_embed.proj", x, 4, 0);
+    x = conv_2d_cwhn_layout(ctx, store, "bb.patch_embed.proj", x, 4, 0, 1);
     if (weightf(store, "bb.patch_embed.norm.weight") != NULL) {
         const int64_t c = x->ne[0];
         const int64_t w = x->ne[1];
@@ -1068,9 +945,11 @@ static void set_swin_params(trellis_birefnet_params * params, int embed_dim) {
     }
 }
 
-trellis_status trellis_birefnet_load_gguf(
+trellis_status trellis_birefnet_load_gguf_with_backend(
     trellis_birefnet_model * model,
-    const char * gguf_path) {
+    const char * gguf_path,
+    trellis_backend_kind backend_kind,
+    int device) {
     if (model == NULL || gguf_path == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -1098,7 +977,7 @@ trellis_status trellis_birefnet_load_gguf(
     gguf_free(gguf);
     set_swin_params(&model->params, embed_dim);
 
-    trellis_status status = trellis_backend_init(&model->backend, TRELLIS_BACKEND_CPU, 0);
+    trellis_status status = trellis_backend_init(&model->backend, backend_kind, device);
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
@@ -1108,8 +987,17 @@ trellis_status trellis_birefnet_load_gguf(
         trellis_backend_free(&model->backend);
         return status;
     }
-    TRELLIS_INFO("BiRefNet: loaded %zu GGUF tensors on CPU", loaded);
+    TRELLIS_INFO(
+        "BiRefNet: loaded %zu GGUF tensors on %s",
+        loaded,
+        trellis_backend_kind_name(model->backend.kind));
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_birefnet_load_gguf(
+    trellis_birefnet_model * model,
+    const char * gguf_path) {
+    return trellis_birefnet_load_gguf_with_backend(model, gguf_path, TRELLIS_BACKEND_CPU, 0);
 }
 
 void trellis_birefnet_free(trellis_birefnet_model * model) {

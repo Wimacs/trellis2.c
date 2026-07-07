@@ -64,7 +64,7 @@ static const trellis_component_status g_status[] = {
         TRELLIS_COMPONENT_BIREFNET_BACKGROUND_REMOVAL,
         "BiRefNet background removal",
         true,
-        "GGUF loading, Swin/BiRefNet graph, and CLI pre-mask PNG wiring are implemented; deformable convolution currently runs through a CPU custom op",
+        "GGUF loading, Swin/BiRefNet graph, CLI pre-mask PNG wiring, and ggml deformable convolution backends are implemented",
     },
     {
         TRELLIS_COMPONENT_OVOXEL_POSTPROCESS,

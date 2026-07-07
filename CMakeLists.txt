@@ -252,6 +252,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
     add_executable(trellis-info tools/trellis_info.c)
     target_link_libraries(trellis-info PRIVATE trellis2_c ggml)
 
+    add_executable(trellis-birefnet-rgba tools/trellis_birefnet_rgba.c)
+    target_link_libraries(trellis-birefnet-rgba PRIVATE trellis2_c ggml)
+    if (UNIX)
+        target_link_libraries(trellis-birefnet-rgba PRIVATE m)
+    endif()
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis-sparse-structure
             tools/debug/trellis_sparse_structure.c

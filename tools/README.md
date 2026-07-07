@@ -36,6 +36,18 @@ stb_image loader does not decode WebP directly.
 `trellis-image-to-obj.c` is intentionally thin: it parses arguments and calls
 `trellis_pipeline_image_to_obj()` from `src/pipeline/trellis_pipeline.c`.
 
+`trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
+writes an RGBA PNG:
+
+```sh
+../build/trellis-birefnet-rgba \
+  --birefnet ../TRELLIS.2/BiRefNet/model.gguf \
+  --image ../example_image/T.png \
+  --out /tmp/T_rgba.png
+```
+
+Use `--backend cuda|vulkan|cpu --device N` to test a specific graph backend.
+
 Pipeline code lives under `src/`:
 
 - `src/runtime/trellis_runtime.c`: CUDA backend setup, logging/progress, model path/load helpers.
