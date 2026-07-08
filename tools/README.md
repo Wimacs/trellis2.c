@@ -74,14 +74,11 @@ only when using a custom binary.
 CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
 clustering is the GPU-accelerated part, then each chart is copied to CPU xatlas
 for parameterization and packing. The Vulkan glTF exporter follows that shape
-with a connected, batched xatlas prepass by default: manifold face adjacency is
-used to build local chunks, then small chunks are batched up to the xatlas input
-target. Set `TRELLIS_GLTF_UV_CHARTED=0` to force the slower whole-mesh xatlas
-path. `TRELLIS_GLTF_UV_CHART_FACES` controls the target faces per xatlas input
-mesh, and `TRELLIS_GLTF_UV_CONE_DEGREES` can tighten the connected chunk growth
-from the default connectivity-only `180`.
-Set `TRELLIS_GLTF_BAKE_CPU=1` only for debugging texture bake issues; it keeps
-the same UV output but bypasses the Vulkan raster bake path.
+with a connected xatlas prepass: manifold face adjacency builds local chunks,
+and each chunk is added to xatlas as its own mesh. `TRELLIS_GLTF_UV_CHART_FACES`
+controls the target faces per xatlas input mesh, and
+`TRELLIS_GLTF_UV_CONE_DEGREES` controls connected chunk growth from the default
+90 degree cone threshold.
 
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:

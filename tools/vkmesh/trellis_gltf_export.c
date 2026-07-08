@@ -56,12 +56,6 @@ typedef struct trellis_gltf_chart_input {
     uint32_t face_count;
 } trellis_gltf_chart_input;
 
-typedef struct trellis_pbr_hash {
-    uint64_t * keys;
-    int32_t * values;
-    size_t size;
-} trellis_pbr_hash;
-
 static int mkdir_p_export(const char * path) {
     if (path == NULL || path[0] == '\0') {
         return 1;
@@ -160,22 +154,6 @@ static float clamp01_export(float x) {
     return x;
 }
 
-static uint64_t coord_key_export(int32_t x, int32_t y, int32_t z) {
-    uint64_t key = (((uint64_t) (uint32_t) x) << 42) ^
-        (((uint64_t) (uint32_t) y) << 21) ^
-        ((uint64_t) (uint32_t) z);
-    return key == 0 ? 1 : key;
-}
-
-static uint64_t hash_u64_export(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
 static int next_pow2_export(size_t n, size_t * out) {
     size_t v = 1;
     while (v < n) {
@@ -186,113 +164,6 @@ static int next_pow2_export(size_t n, size_t * out) {
     }
     *out = v;
     return 1;
-}
-
-static void pbr_hash_free(trellis_pbr_hash * hash) {
-    if (hash == NULL) {
-        return;
-    }
-    free(hash->keys);
-    free(hash->values);
-    memset(hash, 0, sizeof(*hash));
-}
-
-static trellis_status pbr_hash_build(const trellis_pbr_voxels * voxels, trellis_pbr_hash * hash) {
-    if (voxels == NULL || hash == NULL || voxels->coords_bxyz == NULL || voxels->n_coords <= 0) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-    memset(hash, 0, sizeof(*hash));
-    size_t table_size = 0;
-    if (!next_pow2_export((size_t) voxels->n_coords * 4u, &table_size)) {
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-    hash->keys = (uint64_t *) calloc(table_size, sizeof(uint64_t));
-    hash->values = (int32_t *) malloc(table_size * sizeof(int32_t));
-    if (hash->keys == NULL || hash->values == NULL) {
-        pbr_hash_free(hash);
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-    hash->size = table_size;
-    for (size_t i = 0; i < table_size; ++i) {
-        hash->values[i] = -1;
-    }
-    for (int64_t i = 0; i < voxels->n_coords; ++i) {
-        const int32_t * c = voxels->coords_bxyz + (size_t) i * 4u;
-        const uint64_t key = coord_key_export(c[1], c[2], c[3]);
-        size_t slot = (size_t) hash_u64_export(key) & (table_size - 1u);
-        while (hash->values[slot] >= 0 && hash->keys[slot] != key) {
-            slot = (slot + 1u) & (table_size - 1u);
-        }
-        hash->keys[slot] = key;
-        hash->values[slot] = (int32_t) i;
-    }
-    return TRELLIS_STATUS_OK;
-}
-
-static int pbr_hash_find(const trellis_pbr_hash * hash, int32_t x, int32_t y, int32_t z) {
-    const uint64_t key = coord_key_export(x, y, z);
-    size_t slot = (size_t) hash_u64_export(key) & (hash->size - 1u);
-    while (hash->values[slot] >= 0) {
-        if (hash->keys[slot] == key) {
-            return hash->values[slot];
-        }
-        slot = (slot + 1u) & (hash->size - 1u);
-    }
-    return -1;
-}
-
-static void sample_pbr(
-    const trellis_pbr_voxels * voxels,
-    const trellis_pbr_hash * hash,
-    const float p[3],
-    float out[6]) {
-    const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
-    const float qx = (p[0] + 0.5f) * (float) resolution;
-    const float qy = (p[1] + 0.5f) * (float) resolution;
-    const float qz = (p[2] + 0.5f) * (float) resolution;
-    const int32_t bx = (int32_t) floorf(qx - 0.5f);
-    const int32_t by = (int32_t) floorf(qy - 0.5f);
-    const int32_t bz = (int32_t) floorf(qz - 0.5f);
-    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    float sum_w = 0.0f;
-    for (int dz = 0; dz < 2; ++dz) {
-        for (int dy = 0; dy < 2; ++dy) {
-            for (int dx = 0; dx < 2; ++dx) {
-                int32_t x = bx + dx, y = by + dy, z = bz + dz;
-                if (x < 0 || y < 0 || z < 0 || x >= resolution || y >= resolution || z >= resolution) {
-                    continue;
-                }
-                const float wx = 1.0f - fabsf(qx - (float) x - 0.5f);
-                const float wy = 1.0f - fabsf(qy - (float) y - 0.5f);
-                const float wz = 1.0f - fabsf(qz - (float) z - 0.5f);
-                const float w = wx * wy * wz;
-                if (w <= 0.0f) {
-                    continue;
-                }
-                int idx = pbr_hash_find(hash, x, y, z);
-                if (idx < 0) {
-                    continue;
-                }
-                float v[6] = {0.8f, 0.8f, 0.8f, 0.0f, 0.8f, 1.0f};
-                const float * src = voxels->attrs + (size_t) idx * (size_t) voxels->channels;
-                for (int c = 0; c < voxels->channels && c < 6; ++c) {
-                    v[c] = clamp01_export(src[c]);
-                }
-                v[5] = 1.0f;
-                for (int c = 0; c < 6; ++c) {
-                    acc[c] += v[c] * w;
-                }
-                sum_w += w;
-            }
-        }
-    }
-    if (sum_w > 1e-12f) {
-        for (int c = 0; c < 6; ++c) {
-            out[c] = acc[c] / sum_w;
-        }
-    } else {
-        memset(out, 0, 6u * sizeof(float));
-    }
 }
 
 static void mesh_compute_normals(const trellis_mesh_host * mesh, float * normals) {
@@ -440,149 +311,6 @@ static trellis_status unwrap_mesh_xatlas_direct(
     xatlasDestroy(atlas);
     free(input_normals);
     free(input_indices);
-    return TRELLIS_STATUS_OK;
-}
-
-static float edge2(float ax, float ay, float bx, float by, float px, float py) {
-    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
-}
-
-static void write_texel(uint8_t * base, uint8_t * mr, int offset, const float pbr[6]) {
-    base[offset + 0] = (uint8_t) lrintf(clamp01_export(pbr[0]) * 255.0f);
-    base[offset + 1] = (uint8_t) lrintf(clamp01_export(pbr[1]) * 255.0f);
-    base[offset + 2] = (uint8_t) lrintf(clamp01_export(pbr[2]) * 255.0f);
-    base[offset + 3] = (uint8_t) lrintf(clamp01_export(pbr[5]) * 255.0f);
-    mr[offset + 0] = 0;
-    mr[offset + 1] = (uint8_t) lrintf(clamp01_export(pbr[4]) * 255.0f);
-    mr[offset + 2] = (uint8_t) lrintf(clamp01_export(pbr[3]) * 255.0f);
-    mr[offset + 3] = 255;
-}
-
-static void dilate_textures(uint8_t * base, uint8_t * mr, int size, int iterations) {
-    for (int it = 0; it < iterations; ++it) {
-        int changed = 0;
-        for (int y = 0; y < size; ++y) {
-            for (int x = 0; x < size; ++x) {
-                int off = (y * size + x) * 4;
-                if (base[off + 3] != 0) {
-                    continue;
-                }
-                int found = -1;
-                for (int dy = -1; found < 0 && dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        int nx = x + dx, ny = y + dy;
-                        if (nx < 0 || ny < 0 || nx >= size || ny >= size) {
-                            continue;
-                        }
-                        int noff = (ny * size + nx) * 4;
-                        if (base[noff + 3] != 0) {
-                            found = noff;
-                            break;
-                        }
-                    }
-                }
-                if (found >= 0) {
-                    memcpy(base + off, base + found, 4);
-                    memcpy(mr + off, mr + found, 4);
-                    changed = 1;
-                }
-            }
-        }
-        if (!changed) {
-            break;
-        }
-    }
-}
-
-static trellis_status bake_textures(
-    const trellis_gltf_mesh * mesh,
-    const trellis_pbr_voxels * voxels,
-    int texture_size,
-    uint8_t ** base_out,
-    uint8_t ** mr_out) {
-    if (mesh == NULL || voxels == NULL || base_out == NULL || mr_out == NULL ||
-        mesh->positions == NULL || mesh->uvs == NULL || mesh->indices == NULL ||
-        voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->channels < 3) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-    *base_out = NULL;
-    *mr_out = NULL;
-    const size_t image_bytes = (size_t) texture_size * (size_t) texture_size * 4u;
-    uint8_t * base = (uint8_t *) calloc(image_bytes, 1);
-    uint8_t * mr = (uint8_t *) calloc(image_bytes, 1);
-    if (base == NULL || mr == NULL) {
-        free(base);
-        free(mr);
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-    trellis_pbr_hash hash;
-    trellis_status status = pbr_hash_build(voxels, &hash);
-    if (status != TRELLIS_STATUS_OK) {
-        free(base);
-        free(mr);
-        return status;
-    }
-    for (uint32_t tri = 0; tri < mesh->index_count / 3u; ++tri) {
-        uint32_t i0 = mesh->indices[tri * 3u + 0u];
-        uint32_t i1 = mesh->indices[tri * 3u + 1u];
-        uint32_t i2 = mesh->indices[tri * 3u + 2u];
-        const float * uv0 = mesh->uvs + (size_t) i0 * 2u;
-        const float * uv1 = mesh->uvs + (size_t) i1 * 2u;
-        const float * uv2 = mesh->uvs + (size_t) i2 * 2u;
-        float x0 = uv0[0] * (float) (texture_size - 1);
-        float y0 = uv0[1] * (float) (texture_size - 1);
-        float x1 = uv1[0] * (float) (texture_size - 1);
-        float y1 = uv1[1] * (float) (texture_size - 1);
-        float x2 = uv2[0] * (float) (texture_size - 1);
-        float y2 = uv2[1] * (float) (texture_size - 1);
-        float area = edge2(x0, y0, x1, y1, x2, y2);
-        if (fabsf(area) < 1e-8f) {
-            continue;
-        }
-        int min_x = (int) floorf(fminf(x0, fminf(x1, x2))) - 1;
-        int max_x = (int) ceilf(fmaxf(x0, fmaxf(x1, x2))) + 1;
-        int min_y = (int) floorf(fminf(y0, fminf(y1, y2))) - 1;
-        int max_y = (int) ceilf(fmaxf(y0, fmaxf(y1, y2))) + 1;
-        if (min_x < 0) min_x = 0; if (min_y < 0) min_y = 0;
-        if (max_x >= texture_size) max_x = texture_size - 1;
-        if (max_y >= texture_size) max_y = texture_size - 1;
-        const float * p0 = mesh->positions + (size_t) i0 * 3u;
-        const float * p1 = mesh->positions + (size_t) i1 * 3u;
-        const float * p2 = mesh->positions + (size_t) i2 * 3u;
-        for (int y = min_y; y <= max_y; ++y) {
-            for (int x = min_x; x <= max_x; ++x) {
-                float px = (float) x + 0.5f;
-                float py = (float) y + 0.5f;
-                float w0 = edge2(x1, y1, x2, y2, px, py) / area;
-                float w1 = edge2(x2, y2, x0, y0, px, py) / area;
-                float w2 = edge2(x0, y0, x1, y1, px, py) / area;
-                if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) {
-                    continue;
-                }
-                float p[3] = {
-                    w0 * p0[0] + w1 * p1[0] + w2 * p2[0],
-                    w0 * p0[1] + w1 * p1[1] + w2 * p2[1],
-                    w0 * p0[2] + w1 * p1[2] + w2 * p2[2],
-                };
-                float pbr[6];
-                sample_pbr(voxels, &hash, p, pbr);
-                write_texel(base, mr, (y * texture_size + x) * 4, pbr);
-            }
-        }
-    }
-    dilate_textures(base, mr, texture_size, 32);
-    for (int y = 0; y < texture_size; ++y) {
-        for (int x = 0; x < texture_size; ++x) {
-            int off = (y * texture_size + x) * 4;
-            if (base[off + 3] == 0) {
-                base[off + 0] = 204; base[off + 1] = 204; base[off + 2] = 204; base[off + 3] = 255;
-                mr[off + 0] = 0; mr[off + 1] = 204; mr[off + 2] = 0; mr[off + 3] = 255;
-            }
-        }
-    }
-    pbr_hash_free(&hash);
-    *base_out = base;
-    *mr_out = mr;
     return TRELLIS_STATUS_OK;
 }
 
@@ -1477,27 +1205,6 @@ static uint32_t gltf_uv_chart_target_faces(void) {
     return value;
 }
 
-static int gltf_uv_batch_clusters_enabled(void) {
-    const char * env = getenv("TRELLIS_GLTF_UV_BATCH_CLUSTERS");
-    return env != NULL &&
-        (strcmp(env, "1") == 0 ||
-         strcmp(env, "true") == 0 ||
-         strcmp(env, "TRUE") == 0);
-}
-
-static int gltf_uv_charted_enabled(void) {
-    const char * env = getenv("TRELLIS_GLTF_UV_CHARTED");
-    return env == NULL || !(strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "FALSE") == 0);
-}
-
-static int gltf_env_truthy(const char * name) {
-    const char * env = getenv(name);
-    return env != NULL && env[0] != '\0' &&
-        strcmp(env, "0") != 0 &&
-        strcmp(env, "false") != 0 &&
-        strcmp(env, "FALSE") != 0;
-}
-
 static int gltf_chart_record_compare(const void * a, const void * b) {
     const trellis_gltf_chart_record * ra = (const trellis_gltf_chart_record *) a;
     const trellis_gltf_chart_record * rb = (const trellis_gltf_chart_record *) b;
@@ -1674,14 +1381,10 @@ static int gltf_compute_chart_records_connected(
 
     const float cone_cos = gltf_uv_chart_cone_cos();
     uint32_t chunk_count = 0;
-    uint32_t batch_count = 0;
-    uint32_t current_batch = 0;
-    uint32_t current_batch_faces = 0;
-    uint32_t max_batch_faces = 0;
-    const int batch_clusters = gltf_uv_batch_clusters_enabled();
+    uint32_t max_chart_faces = 0;
     for (uint32_t seed = 0; seed < face_count; ++seed) {
         if (chart_ids[seed] >= 0) continue;
-        if (chunk_count == INT32_MAX || batch_count == UINT32_MAX) {
+        if (chunk_count == INT32_MAX) {
             free(records);
             free(neighbors);
             free(face_normals);
@@ -1729,27 +1432,17 @@ static int gltf_compute_chart_records_connected(
                 gltf_vec3_normalize(axis);
             }
         }
-        if (batch_clusters) {
-            if (current_batch_faces == 0 || current_batch_faces + chart_faces > target_faces) {
-                current_batch = batch_count++;
-                current_batch_faces = 0;
-            }
-        } else {
-            current_batch = batch_count++;
-            current_batch_faces = 0;
-        }
         for (uint32_t i = 0; i < tail; ++i) {
             uint32_t f = queue[i];
-            records[f].key = current_batch;
+            records[f].key = chunk;
             records[f].face = f;
         }
-        current_batch_faces += chart_faces;
-        if (current_batch_faces > max_batch_faces) max_batch_faces = current_batch_faces;
+        if (chart_faces > max_chart_faces) max_chart_faces = chart_faces;
     }
 
     *records_out = records;
-    *chart_count_out = batch_count;
-    *max_chart_faces_out = max_batch_faces;
+    *chart_count_out = chunk_count;
+    *max_chart_faces_out = max_chart_faces;
     records = NULL;
     free(records);
     free(neighbors);
@@ -2230,13 +1923,7 @@ static trellis_status bake_textures_vulkan(
     uint32_t projection_vertex_count = 0;
     uint32_t projection_face_count = 0;
     uint32_t projection_node_count = 0;
-    const char * project_env = getenv("TRELLIS_GLTF_PROJECT_SOURCE");
-    const int projection_disabled =
-        project_env != NULL &&
-        (strcmp(project_env, "0") == 0 ||
-         strcmp(project_env, "false") == 0 ||
-         strcmp(project_env, "FALSE") == 0);
-    const int projection_enabled = sample_mesh != NULL && !projection_disabled;
+    const int projection_enabled = sample_mesh != NULL;
     if (projection_enabled) {
         status = build_projection_bvh_buffer(
             sample_mesh,
@@ -2416,7 +2103,7 @@ static trellis_status unwrap_mesh_xatlas(
     int texture_size,
     trellis_gltf_mesh * out) {
 #ifdef GGML_USE_VULKAN
-    if (gltf_uv_charted_enabled() && mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
+    if (mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
         trellis_status status = unwrap_mesh_xatlas_charted_vulkan(mesh, texture_size, out);
         if (status == TRELLIS_STATUS_OK) {
             return status;
@@ -2800,16 +2487,11 @@ trellis_status trellis_pipeline_write_gltf(
     trellis_status status = unwrap_mesh_xatlas(mesh, texture_size, &gltf_mesh);
     if (status == TRELLIS_STATUS_OK) {
 #ifdef GGML_USE_VULKAN
-        if (gltf_env_truthy("TRELLIS_GLTF_BAKE_CPU")) {
-            TRELLIS_ERROR(
-                "glTF export: TRELLIS_GLTF_BAKE_CPU is a legacy debug path and does not match CuMesh source projection; unset it to use Vulkan bake");
-            status = TRELLIS_STATUS_NOT_IMPLEMENTED;
-        } else {
-            status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, &base, &mr);
-        }
+        status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, &base, &mr);
 #else
         (void) sample_mesh;
-        status = bake_textures(&gltf_mesh, voxels, texture_size, &base, &mr);
+        TRELLIS_ERROR("glTF export: texture bake requires a Vulkan build");
+        status = TRELLIS_STATUS_NOT_IMPLEMENTED;
 #endif
     }
     if (status == TRELLIS_STATUS_OK) {
