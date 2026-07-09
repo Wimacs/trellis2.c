@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -378,18 +379,208 @@ static int viewer_parent_path(const char * path, char * dst, size_t dst_size) {
     return dst[0] != '\0';
 }
 
-static int viewer_weights_root_looks_valid(const char * dir);
+typedef struct viewer_weight_scan {
+    char root_dir[VIEWER_MAX_PATH];
+    char model_dir[VIEWER_MAX_PATH];
+    char dino_dir[VIEWER_MAX_PATH];
+    char birefnet_path[VIEWER_MAX_PATH];
+    int has_model;
+    int has_dino;
+    int has_birefnet;
+    int visited_dirs;
+} viewer_weight_scan;
 
-static int viewer_find_weights_root(const char * selected, char * root, size_t root_size) {
-    if (text_is_empty(selected) || root == NULL || root_size == 0) {
+static int viewer_path_basename_equals(const char * path, const char * name) {
+    if (path == NULL || name == NULL) {
         return 0;
     }
+    const char * slash = trellis_path_last_sep_const(path);
+    const char * base = slash != NULL ? slash + 1 : path;
+#ifdef _WIN32
+    return _stricmp(base, name) == 0;
+#else
+    return strcmp(base, name) == 0;
+#endif
+}
+
+static int path_has_ext_ci(const char * path, const char * ext);
+
+static int viewer_file_contains_text(const char * path, const char * needle) {
+    if (text_is_empty(path) || text_is_empty(needle)) {
+        return 0;
+    }
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, needle) != NULL;
+}
+
+static int viewer_file_has_magic(const char * path, const unsigned char * magic, size_t magic_size) {
+    if (text_is_empty(path) || magic == NULL || magic_size == 0 || magic_size > 32u) {
+        return 0;
+    }
+    unsigned char buf[32];
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    size_t n = fread(buf, 1, magic_size, f);
+    fclose(f);
+    return n == magic_size && memcmp(buf, magic, magic_size) == 0;
+}
+
+static int viewer_trellis_model_dir_valid(const char * dir) {
+    char path[VIEWER_MAX_PATH];
+    if (!viewer_join_path(dir, "pipeline.json", path, sizeof(path)) ||
+        !viewer_file_exists(path) ||
+        !viewer_file_contains_text(path, "Trellis2ImageTo3DPipeline") ||
+        !viewer_file_contains_text(path, "sparse_structure_flow_model")) {
+        return 0;
+    }
+    if (!viewer_join_path2(dir, "ckpts", "ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path)) ||
+        !viewer_file_exists(path)) {
+        return 0;
+    }
+    if (!viewer_join_path2(dir, "ckpts", "ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path)) ||
+        !viewer_file_exists(path)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int viewer_dino_dir_valid(const char * dir) {
+    char path[VIEWER_MAX_PATH];
+    if (!viewer_join_path(dir, "config.json", path, sizeof(path)) ||
+        !viewer_file_exists(path) ||
+        !viewer_file_contains_text(path, "\"model_type\"") ||
+        !viewer_file_contains_text(path, "dinov3_vit")) {
+        return 0;
+    }
+    if (!viewer_join_path(dir, "model.safetensors", path, sizeof(path)) ||
+        !viewer_file_exists(path)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void viewer_weight_scan_visit_dir(viewer_weight_scan * scan, const char * dir) {
+    if (scan == NULL || text_is_empty(dir)) {
+        return;
+    }
+    if (!scan->has_model && viewer_trellis_model_dir_valid(dir)) {
+        copy_text(scan->model_dir, sizeof(scan->model_dir), dir);
+        scan->has_model = 1;
+    }
+    if (!scan->has_dino && viewer_dino_dir_valid(dir)) {
+        copy_text(scan->dino_dir, sizeof(scan->dino_dir), dir);
+        scan->has_dino = 1;
+    }
+}
+
+static void viewer_weight_scan_visit_file(viewer_weight_scan * scan, const char * path) {
+    static const unsigned char gguf_magic[4] = { 'G', 'G', 'U', 'F' };
+    if (scan == NULL || text_is_empty(path) || scan->has_birefnet) {
+        return;
+    }
+    if ((path_has_ext_ci(path, ".gguf") || viewer_file_has_magic(path, gguf_magic, sizeof(gguf_magic))) &&
+        viewer_file_has_magic(path, gguf_magic, sizeof(gguf_magic))) {
+        copy_text(scan->birefnet_path, sizeof(scan->birefnet_path), path);
+        scan->has_birefnet = 1;
+    }
+}
+
+static int viewer_weight_scan_done(const viewer_weight_scan * scan) {
+    return scan != NULL && scan->has_model && scan->has_dino && scan->has_birefnet;
+}
+
+static void viewer_scan_weights_recursive(viewer_weight_scan * scan, const char * dir, int depth) {
+    if (scan == NULL || text_is_empty(dir) || depth > 8 || scan->visited_dirs > 4096) {
+        return;
+    }
+    if (viewer_path_basename_equals(dir, ".cache") || viewer_path_basename_equals(dir, ".git")) {
+        return;
+    }
+    scan->visited_dirs += 1;
+    viewer_weight_scan_visit_dir(scan, dir);
+    if (viewer_weight_scan_done(scan)) {
+        return;
+    }
+
+#ifdef _WIN32
+    char pattern[VIEWER_MAX_PATH];
+    if (!viewer_join_path(dir, "*", pattern, sizeof(pattern))) {
+        return;
+    }
+    WIN32_FIND_DATAA data;
+    HANDLE h = FindFirstFileA(pattern, &data);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) {
+            continue;
+        }
+        char child[VIEWER_MAX_PATH];
+        if (!viewer_join_path(dir, data.cFileName, child, sizeof(child))) {
+            continue;
+        }
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            viewer_scan_weights_recursive(scan, child, depth + 1);
+        } else {
+            viewer_weight_scan_visit_file(scan, child);
+        }
+        if (viewer_weight_scan_done(scan)) {
+            break;
+        }
+    } while (FindNextFileA(h, &data));
+    FindClose(h);
+#else
+    DIR * d = opendir(dir);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent * ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char child[VIEWER_MAX_PATH];
+        if (!viewer_join_path(dir, ent->d_name, child, sizeof(child))) {
+            continue;
+        }
+        if (viewer_dir_exists(child)) {
+            viewer_scan_weights_recursive(scan, child, depth + 1);
+        } else if (viewer_file_exists(child)) {
+            viewer_weight_scan_visit_file(scan, child);
+        }
+        if (viewer_weight_scan_done(scan)) {
+            break;
+        }
+    }
+    closedir(d);
+#endif
+}
+
+static int viewer_scan_weights_pool(const char * selected, viewer_weight_scan * out) {
+    if (text_is_empty(selected) || out == NULL) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
 
     char current[VIEWER_MAX_PATH];
     copy_text(current, sizeof(current), selected);
     for (int depth = 0; depth < 6 && !text_is_empty(current); ++depth) {
-        if (viewer_weights_root_looks_valid(current)) {
-            copy_text(root, root_size, current);
+        viewer_weight_scan scan;
+        memset(&scan, 0, sizeof(scan));
+        copy_text(scan.root_dir, sizeof(scan.root_dir), current);
+        viewer_scan_weights_recursive(&scan, current, 0);
+        if (scan.has_model && scan.has_dino) {
+            *out = scan;
             return 1;
         }
         char parent[VIEWER_MAX_PATH];
@@ -401,27 +592,40 @@ static int viewer_find_weights_root(const char * selected, char * root, size_t r
     return 0;
 }
 
+static int viewer_find_weights_root(const char * selected, char * root, size_t root_size) {
+    if (text_is_empty(selected) || root == NULL || root_size == 0) {
+        return 0;
+    }
+    viewer_weight_scan scan;
+    if (viewer_scan_weights_pool(selected, &scan)) {
+        copy_text(root, root_size, scan.root_dir);
+        return 1;
+    }
+    return 0;
+}
+
 static void viewer_apply_weights_dir(viewer_options * options, const char * dir) {
     if (options == NULL || text_is_empty(dir)) {
         return;
     }
-    char root[VIEWER_MAX_PATH];
-    const char * weights_root = dir;
-    if (viewer_find_weights_root(dir, root, sizeof(root))) {
-        weights_root = root;
+    viewer_weight_scan scan;
+    if (viewer_scan_weights_pool(dir, &scan)) {
+        copy_text(options->weights_dir, sizeof(options->weights_dir), scan.root_dir);
+        copy_text(options->model_dir, sizeof(options->model_dir), scan.model_dir);
+        copy_text(options->dino_dir, sizeof(options->dino_dir), scan.dino_dir);
+        copy_text(options->birefnet_path, sizeof(options->birefnet_path), scan.birefnet_path);
+        return;
     }
-    copy_text(options->weights_dir, sizeof(options->weights_dir), weights_root);
-    viewer_join_path(weights_root, "TRELLIS.2-4B", options->model_dir, sizeof(options->model_dir));
-    viewer_join_path(weights_root, "dinov3-vitl16-pretrain-lvd1689m", options->dino_dir, sizeof(options->dino_dir));
-    viewer_join_path2(weights_root, "BiRefNet", "BiRefNet-F16.gguf", options->birefnet_path, sizeof(options->birefnet_path));
+
+    copy_text(options->weights_dir, sizeof(options->weights_dir), dir);
+    options->model_dir[0] = '\0';
+    options->dino_dir[0] = '\0';
+    options->birefnet_path[0] = '\0';
 }
 
 static int viewer_weights_root_looks_valid(const char * dir) {
-    char path[VIEWER_MAX_PATH];
-    return viewer_join_path2(dir, "TRELLIS.2-4B", "pipeline.json", path, sizeof(path)) &&
-        viewer_file_exists(path) &&
-        viewer_join_path2(dir, "dinov3-vitl16-pretrain-lvd1689m", "model.safetensors", path, sizeof(path)) &&
-        viewer_file_exists(path);
+    viewer_weight_scan scan;
+    return viewer_scan_weights_pool(dir, &scan);
 }
 
 static int viewer_weights_ready(const viewer_options * options, int require_birefnet, char * issue, size_t issue_size) {
@@ -434,11 +638,11 @@ static int viewer_weights_ready(const viewer_options * options, int require_bire
         return 0;
     }
     if (!viewer_dir_exists(options->model_dir)) {
-        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS.2-4B folder");
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS model folder");
         return 0;
     }
     if (!viewer_join_path(options->model_dir, "pipeline.json", path, sizeof(path)) || !viewer_file_exists(path)) {
-        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS.2-4B/pipeline.json");
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS pipeline manifest");
         return 0;
     }
     if (!viewer_join_path2(options->model_dir, "ckpts", "ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path)) ||
@@ -447,11 +651,11 @@ static int viewer_weights_ready(const viewer_options * options, int require_bire
         return 0;
     }
     if (!viewer_join_path(options->dino_dir, "model.safetensors", path, sizeof(path)) || !viewer_file_exists(path)) {
-        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing DINOv3/model.safetensors");
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing DINOv3 image encoder");
         return 0;
     }
     if (require_birefnet && (text_is_empty(options->birefnet_path) || !viewer_file_exists(options->birefnet_path))) {
-        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing BiRefNet/BiRefNet-F16.gguf");
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing BiRefNet GGUF model");
         return 0;
     }
     return 1;
@@ -732,7 +936,7 @@ static void usage(FILE * out, const char * argv0) {
         "Local raylib image-to-3D GUI. Launch without arguments, then choose a weights folder and image in the window.\n"
         "\n"
         "Core options mirror trellis-image-to-gltf:\n"
-        "  --weights DIR            Folder containing TRELLIS.2-4B/, dinov3-vitl16-pretrain-lvd1689m/, and BiRefNet/\n"
+        "  --weights DIR            Folder containing downloaded TRELLIS, DINO, and optional BiRefNet weights\n"
         "  --model DIR, --dino DIR, --birefnet FILE, --image FILE\n"
         "  --out-dir DIR, --gltf FILE, --backend NAME, --device N\n"
         "  --pipeline 512|1024       GUI stage mode, default 512\n"
@@ -2219,7 +2423,7 @@ static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_
     if (dialog_available != NULL) {
         *dialog_available = 1;
     }
-    if (trellis_win32_select_folder(out, out_size, L"Select TRELLIS.2 weights folder")) {
+    if (trellis_win32_select_folder(out, out_size, L"Select weights folder")) {
         return 1;
     }
 #else
@@ -2228,7 +2432,7 @@ static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_
             *dialog_available = 1;
         }
         if (read_first_line_from_command(
-                "zenity --file-selection --directory --title='Select TRELLIS.2 weights folder' 2>/dev/null",
+                "zenity --file-selection --directory --title='Select weights folder' 2>/dev/null",
                 out,
                 out_size)) {
             return 1;
@@ -2239,7 +2443,7 @@ static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_
             *dialog_available = 1;
         }
         if (read_first_line_from_command(
-                "kdialog --getexistingdirectory \"$HOME\" 'Select TRELLIS.2 weights folder' 2>/dev/null",
+                "kdialog --getexistingdirectory \"$HOME\" 'Select weights folder' 2>/dev/null",
                 out,
                 out_size)) {
             return 1;
@@ -2285,7 +2489,7 @@ static void * file_picker_main(void * user_data) {
     } else if (unsupported) {
         copy_text(shared->stage, sizeof(shared->stage), kind == VIEWER_PICKER_WEIGHTS ? "Unsupported weights folder" : "Unsupported image");
         copy_text(shared->detail, sizeof(shared->detail), kind == VIEWER_PICKER_WEIGHTS ?
-            "choose the folder that contains TRELLIS.2-4B and dinov3-vitl16-pretrain-lvd1689m" :
+            "choose the folder created by the weights download script" :
             "use png, jpg, jpeg, webp, or bmp");
     }
     shared->file_picker_running = 0;
