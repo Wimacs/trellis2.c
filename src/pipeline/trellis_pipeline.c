@@ -3,6 +3,7 @@
 #endif
 
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "sparse/trellis_sparse_backend.h"
 #include "trellis_pipeline_internal.h"
 
@@ -14,14 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
 
 static void trellis_perf_stage_log(const char * name, int64_t elapsed_us) {
     TRELLIS_INFO(
@@ -172,36 +165,25 @@ static int path_has_ext(const char * path, const char * ext) {
 }
 
 static int convert_webp_to_png_ffmpeg(const char * input_path, const char * output_path) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        return 0;
-    }
-    if (pid == 0) {
-        execlp(
-            "ffmpeg",
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            input_path,
-            "-frames:v",
-            "1",
-            output_path,
-            (char *) NULL);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return 0;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    char * argv[] = {
+        (char *) "ffmpeg",
+        (char *) "-y",
+        (char *) "-hide_banner",
+        (char *) "-loglevel",
+        (char *) "error",
+        (char *) "-i",
+        (char *) input_path,
+        (char *) "-frames:v",
+        (char *) "1",
+        (char *) output_path,
+        NULL,
+    };
+    return trellis_run_process_search_path(argv);
 }
 
 static void unlink_if_set(const char * path) {
     if (path != NULL && path[0] != '\0') {
-        unlink(path);
+        trellis_unlink(path);
     }
 }
 
@@ -261,44 +243,11 @@ static trellis_status apply_birefnet_background_removal(
 }
 
 static int mkdir_p(const char * path) {
-    if (path == NULL || path[0] == '\0') {
-        return 1;
-    }
-    char tmp[4096];
-    int n = snprintf(tmp, sizeof(tmp), "%s", path);
-    if (n < 0 || (size_t) n >= sizeof(tmp)) {
-        return 0;
-    }
-    for (char * p = tmp + 1; *p != '\0'; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-                return 0;
-            }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-        return 0;
-    }
-    return 1;
+    return trellis_mkdir_p(path);
 }
 
 static int mkdir_parent(const char * path) {
-    if (path == NULL || path[0] == '\0') {
-        return 0;
-    }
-    char dir[4096];
-    int n = snprintf(dir, sizeof(dir), "%s", path);
-    if (n < 0 || (size_t) n >= sizeof(dir)) {
-        return 0;
-    }
-    char * slash = strrchr(dir, '/');
-    if (slash == NULL || slash == dir) {
-        return 1;
-    }
-    *slash = '\0';
-    return mkdir_p(dir);
+    return trellis_mkdir_parent(path);
 }
 
 static int make_shape_decoder_path(
@@ -1027,16 +976,16 @@ static int run_vkmesh_postprocess_command(
     char sibling_vkmesh[PATH_MAX];
     const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : NULL;
     if (exe == NULL) {
-        ssize_t self_len = readlink("/proc/self/exe", sibling_vkmesh, sizeof(sibling_vkmesh) - 1u);
-        if (self_len > 0) {
-            sibling_vkmesh[self_len] = '\0';
-            char * slash = strrchr(sibling_vkmesh, '/');
+        if (trellis_current_executable_path(sibling_vkmesh, sizeof(sibling_vkmesh))) {
+            char * slash = trellis_path_last_sep(sibling_vkmesh);
             if (slash != NULL) {
                 slash[1] = '\0';
                 size_t dir_len = strlen(sibling_vkmesh);
-                if (dir_len + strlen("vkmesh") < sizeof(sibling_vkmesh)) {
-                    memcpy(sibling_vkmesh + dir_len, "vkmesh", sizeof("vkmesh"));
-                    if (access(sibling_vkmesh, X_OK) == 0) {
+                const char * vkmesh_name = "vkmesh" TRELLIS_EXE_SUFFIX;
+                size_t name_len = strlen(vkmesh_name);
+                if (dir_len + name_len + 1u < sizeof(sibling_vkmesh)) {
+                    memcpy(sibling_vkmesh + dir_len, vkmesh_name, name_len + 1u);
+                    if (trellis_access_executable(sibling_vkmesh)) {
                         exe = sibling_vkmesh;
                     }
                 }
@@ -1047,42 +996,28 @@ static int run_vkmesh_postprocess_command(
         exe = "vkmesh";
     }
     TRELLIS_INFO("mesh postprocess: using vkmesh executable %s", exe);
-    pid_t pid = fork();
-    if (pid < 0) {
-        return 0;
+    char * argv[16];
+    int argc = 0;
+    argv[argc++] = (char *) exe;
+    argv[argc++] = (char *) "--input";
+    argv[argc++] = (char *) input_mesh;
+    argv[argc++] = (char *) "--output";
+    argv[argc++] = (char *) output_mesh;
+    if (projection_mesh != NULL && projection_mesh[0] != '\0') {
+        argv[argc++] = (char *) "--projection-mesh-output";
+        argv[argc++] = (char *) projection_mesh;
     }
-    if (pid == 0) {
-        char * argv[16];
-        int argc = 0;
-        argv[argc++] = (char *) exe;
-        argv[argc++] = (char *) "--input";
-        argv[argc++] = (char *) input_mesh;
-        argv[argc++] = (char *) "--output";
-        argv[argc++] = (char *) output_mesh;
-        if (projection_mesh != NULL && projection_mesh[0] != '\0') {
-            argv[argc++] = (char *) "--projection-mesh-output";
-            argv[argc++] = (char *) projection_mesh;
-        }
-        argv[argc++] = (char *) "--postprocess";
-        argv[argc++] = (char *) "--decimation-target";
-        argv[argc++] = target;
-        if (no_simplify) {
-            argv[argc++] = (char *) "--no-simplify";
-        }
-        argv[argc++] = (char *) "--no-uv-unwrap";
-        argv[argc] = NULL;
-        if (strchr(exe, '/') != NULL) {
-            execv(exe, argv);
-        } else {
-            execvp(exe, argv);
-        }
-        _exit(127);
+    argv[argc++] = (char *) "--postprocess";
+    argv[argc++] = (char *) "--decimation-target";
+    argv[argc++] = target;
+    if (no_simplify) {
+        argv[argc++] = (char *) "--no-simplify";
     }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return 0;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    argv[argc++] = (char *) "--no-uv-unwrap";
+    argv[argc] = NULL;
+    return trellis_path_has_sep(exe) ?
+        trellis_run_process_exact(argv) :
+        trellis_run_process_search_path(argv);
 }
 
 static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
@@ -1152,12 +1087,9 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     char input_mesh[4096];
     char output_mesh[4096];
     char projection_mesh[4096];
-    int n0 = snprintf(input_mesh, sizeof(input_mesh), "/tmp/trellis2_vkmesh_in_%ld.meshbin", (long) getpid());
-    int n1 = snprintf(output_mesh, sizeof(output_mesh), "/tmp/trellis2_vkmesh_out_%ld.meshbin", (long) getpid());
-    int n2 = snprintf(projection_mesh, sizeof(projection_mesh), "/tmp/trellis2_vkmesh_projection_%ld.meshbin", (long) getpid());
-    if (n0 < 0 || (size_t) n0 >= sizeof(input_mesh) ||
-        n1 < 0 || (size_t) n1 >= sizeof(output_mesh) ||
-        n2 < 0 || (size_t) n2 >= sizeof(projection_mesh)) {
+    if (!trellis_make_temp_path(input_mesh, sizeof(input_mesh), "trellis2_vkmesh_in", ".meshbin") ||
+        !trellis_make_temp_path(output_mesh, sizeof(output_mesh), "trellis2_vkmesh_out", ".meshbin") ||
+        !trellis_make_temp_path(projection_mesh, sizeof(projection_mesh), "trellis2_vkmesh_projection", ".meshbin")) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     trellis_status status = trellis_pipeline_write_meshbin(input_mesh, mesh);
@@ -1257,12 +1189,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
 
     const char * sparse_structure_image_path = options->image_path;
     if (path_has_ext(options->image_path, "webp")) {
-        int n = snprintf(
+        if (!trellis_make_temp_path(
             temp_image,
             sizeof(temp_image),
-            "/tmp/trellis2_image_to_gltf_%ld.png",
-            (long) getpid());
-        if (n < 0 || (size_t) n >= sizeof(temp_image)) {
+            "trellis2_image_to_gltf",
+            ".png")) {
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
         TRELLIS_INFO("image prep: converting WebP -> PNG via ffmpeg: %s", temp_image);
@@ -1274,12 +1205,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         sparse_structure_image_path = temp_image;
     }
     if (options->birefnet_path != NULL && options->birefnet_path[0] != '\0') {
-        int n = snprintf(
+        if (!trellis_make_temp_path(
             temp_birefnet_image,
             sizeof(temp_birefnet_image),
-            "/tmp/trellis2_birefnet_%ld.png",
-            (long) getpid());
-        if (n < 0 || (size_t) n >= sizeof(temp_birefnet_image)) {
+            "trellis2_birefnet",
+            ".png")) {
             unlink_if_set(temp_image);
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download TRELLIS.2 weights from Hugging Face or ModelScope."""
+"""Download TRELLIS.2, DINOv3, and background-removal weights."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT.parent / "TRELLIS.2"
 
 DEFAULT_TRELLIS_REPO = "microsoft/TRELLIS.2-4B"
 DEFAULT_DINO_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+DEFAULT_BIREFNET_REPO = "Acly/BiRefNet-GGUF"
 
 TRELLIS_MINIMAL_PATTERNS = [
     "README*",
@@ -33,6 +34,12 @@ DINO_MINIMAL_PATTERNS = [
     "*.json",
     "*.txt",
     "model.safetensors",
+]
+
+BIREFNET_MINIMAL_PATTERNS = [
+    "README*",
+    "LICENSE*",
+    "BiRefNet-F16.gguf",
 ]
 
 
@@ -154,7 +161,7 @@ def download_from_modelscope(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download TRELLIS.2 and DINOv3 weights from Hugging Face or ModelScope.",
+        description="Download TRELLIS.2, DINOv3, and background-removal weights from Hugging Face or ModelScope.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -169,13 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="directory that will contain TRELLIS.2-4B/ and dinov3-vitl16-pretrain-lvd1689m/",
+        help="directory that will contain TRELLIS.2-4B/, dinov3-vitl16-pretrain-lvd1689m/, and BiRefNet/",
     )
     parser.add_argument(
         "--only",
-        choices=("all", "trellis", "dino"),
+        choices=("all", "trellis", "dino", "birefnet", "background"),
         default="all",
-        help="download both repos or just one of them",
+        help="download all weights or just one group",
     )
     parser.add_argument(
         "--trellis-repo",
@@ -186,6 +193,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dino-repo",
         default=DEFAULT_DINO_REPO,
         help="DINOv3 repo id on the selected source",
+    )
+    parser.add_argument(
+        "--birefnet-repo",
+        default=DEFAULT_BIREFNET_REPO,
+        help="BiRefNet background-removal repo id on the selected source",
+    )
+    parser.add_argument(
+        "--birefnet-source",
+        type=normalize_source,
+        default="huggingface",
+        help="download source for BiRefNet; defaults to Hugging Face even when --source is ModelScope",
     )
     parser.add_argument("--revision", help="branch, tag, or commit to download")
     parser.add_argument(
@@ -245,12 +263,20 @@ def selected_specs(args: argparse.Namespace) -> list[RepoSpec]:
             local_name="dinov3-vitl16-pretrain-lvd1689m",
             minimal_patterns=DINO_MINIMAL_PATTERNS,
         ),
+        RepoSpec(
+            label="BiRefNet",
+            repo_id=args.birefnet_repo,
+            local_name="BiRefNet",
+            minimal_patterns=BIREFNET_MINIMAL_PATTERNS,
+        ),
     ]
 
     if args.only == "trellis":
         return [specs[0]]
     if args.only == "dino":
         return [specs[1]]
+    if args.only in ("birefnet", "background"):
+        return [specs[2]]
     return specs
 
 
@@ -263,18 +289,15 @@ def main() -> int:
     ignore_patterns = split_patterns(args.ignore)
     specs = selected_specs(args)
 
-    if args.source == "huggingface":
-        downloader = download_from_huggingface
-    else:
-        downloader = download_from_modelscope
-
     for spec in specs:
         local_dir = output_dir / spec.local_name
         allow_patterns = include_patterns
         if allow_patterns is None and not args.full:
             allow_patterns = spec.minimal_patterns
+        source = args.birefnet_source if spec.local_name == "BiRefNet" else args.source
+        downloader = download_from_huggingface if source == "huggingface" else download_from_modelscope
 
-        print(f"[{args.source}] {spec.label}: {spec.repo_id}")
+        print(f"[{source}] {spec.label}: {spec.repo_id}")
         print(f"  -> {local_dir}")
         if allow_patterns:
             print(f"  include: {', '.join(allow_patterns)}")
@@ -304,6 +327,8 @@ def main() -> int:
         print(f"Run with --model {output_dir / 'TRELLIS.2-4B'}")
     if "dinov3-vitl16-pretrain-lvd1689m" in downloaded_names:
         print(f"Run with --dino  {output_dir / 'dinov3-vitl16-pretrain-lvd1689m'}")
+    if "BiRefNet" in downloaded_names:
+        print(f"Run with --birefnet {output_dir / 'BiRefNet' / 'BiRefNet-F16.gguf'}")
     return 0
 
 

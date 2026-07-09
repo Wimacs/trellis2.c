@@ -1,13 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_tool_live.h"
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
 #include "external/glad.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -16,7 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dirent.h>
 #include <unistd.h>
+#endif
 
 typedef struct loaded_mesh {
     Mesh * meshes;
@@ -123,6 +126,11 @@ static int env_is_empty(const char * name) {
 }
 
 static void detect_local_x11_display(char * dst, size_t dst_size) {
+#ifdef _WIN32
+    if (dst != NULL && dst_size > 0) {
+        dst[0] = '\0';
+    }
+#else
     int best = -1;
     DIR * dir = opendir("/tmp/.X11-unix");
     if (dir != NULL) {
@@ -142,9 +150,15 @@ static void detect_local_x11_display(char * dst, size_t dst_size) {
         closedir(dir);
     }
     snprintf(dst, dst_size, ":%d", best >= 0 ? best : 0);
+#endif
 }
 
 static int detect_xauthority(char * dst, size_t dst_size) {
+#ifdef _WIN32
+    (void) dst;
+    (void) dst_size;
+    return 0;
+#else
     const char * home = getenv("HOME");
     if (home != NULL && home[0] != '\0') {
         char home_auth[PATH_MAX];
@@ -161,25 +175,31 @@ static int detect_xauthority(char * dst, size_t dst_size) {
         return 1;
     }
     return 0;
+#endif
 }
 
 static void configure_display_env(const char * display, const char * xauthority) {
+#ifdef _WIN32
+    (void) display;
+    (void) xauthority;
+#else
     if (display != NULL && display[0] != '\0') {
-        setenv("DISPLAY", display, 1);
+        trellis_setenv("DISPLAY", display, 1);
     } else if (env_is_empty("DISPLAY")) {
         char detected[32];
         detect_local_x11_display(detected, sizeof(detected));
-        setenv("DISPLAY", detected, 1);
+        trellis_setenv("DISPLAY", detected, 1);
     }
 
     if (xauthority != NULL && xauthority[0] != '\0') {
-        setenv("XAUTHORITY", xauthority, 1);
+        trellis_setenv("XAUTHORITY", xauthority, 1);
     } else if (env_is_empty("XAUTHORITY")) {
         char detected[PATH_MAX];
         if (detect_xauthority(detected, sizeof(detected))) {
-            setenv("XAUTHORITY", detected, 1);
+            trellis_setenv("XAUTHORITY", detected, 1);
         }
     }
+#endif
 }
 
 static int file_size_bytes(const char * path, size_t * size_out) {

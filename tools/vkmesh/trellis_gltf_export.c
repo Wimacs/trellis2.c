@@ -2,6 +2,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "../../src/pipeline/trellis_pipeline_internal.h"
 
 #include "cgltf_write.h"
@@ -29,7 +30,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 typedef struct trellis_gltf_mesh {
     float * positions;
@@ -61,24 +61,7 @@ typedef struct trellis_gltf_chart_input {
 } trellis_gltf_chart_input;
 
 static int mkdir_p_export(const char * path) {
-    if (path == NULL || path[0] == '\0') {
-        return 1;
-    }
-    char tmp[4096];
-    int n = snprintf(tmp, sizeof(tmp), "%s", path);
-    if (n < 0 || (size_t) n >= sizeof(tmp)) {
-        return 0;
-    }
-    for (char * p = tmp + 1; *p != '\0'; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-                return 0;
-            }
-            *p = '/';
-        }
-    }
-    return mkdir(tmp, 0775) == 0 || errno == EEXIST;
+    return trellis_mkdir_p(path);
 }
 
 static int split_output_paths(
@@ -90,7 +73,7 @@ static int split_output_paths(
     if (gltf_path == NULL || dir == NULL || stem == NULL || dir_size == 0 || stem_size == 0) {
         return 0;
     }
-    const char * slash = strrchr(gltf_path, '/');
+    const char * slash = trellis_path_last_sep_const(gltf_path);
     const char * base = slash != NULL ? slash + 1 : gltf_path;
     if (slash != NULL) {
         size_t n = (size_t) (slash - gltf_path);

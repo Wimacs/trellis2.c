@@ -27,6 +27,7 @@ Testing/
 
 # Runtime dumps and generated outputs
 benchmark_outputs/
+viewer_outputs/
 out/
 outputs/
 artifacts/

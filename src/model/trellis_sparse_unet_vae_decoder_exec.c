@@ -1,9 +1,10 @@
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "sparse/trellis_sparse_backend.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 
 static int sparse_profile_enabled(void) {
     const char * env = getenv("TRELLIS_SPARSE_PROFILE");
@@ -16,9 +17,7 @@ static int sparse_env_disabled(const char * name) {
 }
 
 static int64_t sparse_profile_now_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t) tv.tv_sec * 1000000ll + (int64_t) tv.tv_usec;
+    return trellis_now_us();
 }
 
 static void sparse_profile_log(

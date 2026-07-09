@@ -1,4 +1,5 @@
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_checkpoint_validate.h"
 #include "trellis_cuda_kernels.h"
 #include "trellis_sparse_reference.h"
@@ -8,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 static int g_failures = 0;
 static trellis_cuda_context g_cuda;
@@ -69,10 +69,8 @@ static float silu_ref(float x) {
 }
 
 static void test_safetensors(void) {
-    char path[] = "/tmp/trellis2_c_safetensors_XXXXXX";
-    int fd = mkstemp(path);
-    CHECK_TRUE(fd >= 0);
-    FILE * f = fdopen(fd, "wb");
+    char path[PATH_MAX];
+    FILE * f = trellis_open_temp_file(path, sizeof(path), "trellis2_c_safetensors", NULL);
     CHECK_TRUE(f != NULL);
 
     const char * header =
@@ -116,14 +114,12 @@ static void test_safetensors(void) {
     CHECK_TRUE(trellis_safetensors_read_f32(&st, mc, out, 1) == TRELLIS_STATUS_OK);
     CHECK_CLOSE(out[0], 5.5f, 1e-3f);
     trellis_safetensors_close(&st);
-    unlink(path);
+    trellis_unlink(path);
 }
 
 static void test_tensor_store_loader_cuda(void) {
-    char path[] = "/tmp/trellis2_c_weights_XXXXXX";
-    int fd = mkstemp(path);
-    CHECK_TRUE(fd >= 0);
-    FILE * f = fdopen(fd, "wb");
+    char path[PATH_MAX];
+    FILE * f = trellis_open_temp_file(path, sizeof(path), "trellis2_c_weights", NULL);
     CHECK_TRUE(f != NULL);
 
     const char * header =
@@ -181,17 +177,15 @@ static void test_tensor_store_loader_cuda(void) {
     }
 
     trellis_tensor_store_free(&store);
-    unlink(path);
+    trellis_unlink(path);
 }
 
 static void test_tensor_store_loader_preserves_f16_cpu(void) {
     trellis_backend_context cpu;
     CHECK_TRUE(trellis_backend_init(&cpu, TRELLIS_BACKEND_CPU, 0) == TRELLIS_STATUS_OK);
 
-    char path[] = "/tmp/trellis2_c_weights_f16_XXXXXX";
-    int fd = mkstemp(path);
-    CHECK_TRUE(fd >= 0);
-    FILE * f = fdopen(fd, "wb");
+    char path[PATH_MAX];
+    FILE * f = trellis_open_temp_file(path, sizeof(path), "trellis2_c_weights_f16", NULL);
     CHECK_TRUE(f != NULL);
 
     const char * header =
@@ -268,7 +262,7 @@ static void test_tensor_store_loader_preserves_f16_cpu(void) {
         CHECK_CLOSE(got_b[i], b_ref[i], 1e-2f);
     }
     trellis_tensor_store_free(&store);
-    unlink(path);
+    trellis_unlink(path);
     trellis_backend_free(&cpu);
 }
 
@@ -1241,18 +1235,18 @@ static void test_custom_cuda_kernels(void) {
         sparse_subm_conv3d_ref(coords, feats, weight, bias, exp, N, IC, OC, KD, KH, KW, 1, 1, 1);
 
         const char * saved_backend = getenv("TRELLIS_SPARSE_CONV_BACKEND");
-        char * saved_backend_copy = saved_backend == NULL ? NULL : strdup(saved_backend);
-        unsetenv("TRELLIS_SPARSE_CONV_BACKEND");
+        char * saved_backend_copy = saved_backend == NULL ? NULL : trellis_strdup(saved_backend);
+        trellis_unsetenv("TRELLIS_SPARSE_CONV_BACKEND");
         CHECK_TRUE(trellis_cuda_sparse_subm_conv3d_f32_host(
             coords, feats, weight, bias, got_map, 0, N, IC, OC, KD, KH, KW, 1, 1, 1) == TRELLIS_STATUS_OK);
-        CHECK_TRUE(setenv("TRELLIS_SPARSE_CONV_BACKEND", "scalar", 1) == 0);
+        CHECK_TRUE(trellis_setenv("TRELLIS_SPARSE_CONV_BACKEND", "scalar", 1) == 0);
         CHECK_TRUE(trellis_cuda_sparse_subm_conv3d_f32_host(
             coords, feats, weight, bias, got_scalar, 0, N, IC, OC, KD, KH, KW, 1, 1, 1) == TRELLIS_STATUS_OK);
         if (saved_backend_copy != NULL) {
-            CHECK_TRUE(setenv("TRELLIS_SPARSE_CONV_BACKEND", saved_backend_copy, 1) == 0);
+            CHECK_TRUE(trellis_setenv("TRELLIS_SPARSE_CONV_BACKEND", saved_backend_copy, 1) == 0);
             free(saved_backend_copy);
         } else {
-            unsetenv("TRELLIS_SPARSE_CONV_BACKEND");
+            trellis_unsetenv("TRELLIS_SPARSE_CONV_BACKEND");
         }
 
         for (int i = 0; i < N * OC; ++i) {
@@ -1416,7 +1410,7 @@ static void test_stage1_sampler_math(void) {
 }
 
 static int file_exists(const char * path) {
-    return access(path, R_OK) == 0;
+    return trellis_access_read(path);
 }
 
 static const char * first_existing_path(const char ** paths, int n_paths) {

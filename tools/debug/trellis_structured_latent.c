@@ -1,4 +1,5 @@
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_checkpoint_validate.h"
 
 #include <errno.h>
@@ -9,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 static void usage(const char * argv0) {
     fprintf(stderr,
@@ -83,27 +83,7 @@ static void print_report(const char * label, trellis_status status, const trelli
 }
 
 static int mkdir_p(const char * path) {
-    if (path == NULL || path[0] == '\0') {
-        return 0;
-    }
-    char tmp[4096];
-    int n = snprintf(tmp, sizeof(tmp), "%s", path);
-    if (n < 0 || (size_t) n >= sizeof(tmp)) {
-        return 0;
-    }
-    for (char * p = tmp + 1; *p != '\0'; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-                return 0;
-            }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-        return 0;
-    }
-    return 1;
+    return trellis_mkdir_p(path);
 }
 
 static int make_join_path(const char * dir, const char * name, char * dst, size_t dst_size) {

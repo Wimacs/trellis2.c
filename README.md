@@ -1,149 +1,104 @@
 # trellis2.c
 
-`trellis2.c` is a native C + ggml + CUDA inference project for TRELLIS.2 image-to-3D generation.
-
-The goal is to run the TRELLIS.2 pipeline without Python or PyTorch:
-
-- encode an input image with DINOv3
-- run sparse-structure flow denoising
-- decode sparse-structure voxel snapshots for debug/inspection
-- run structured-latent shape flow denoising
-- decode mesh snapshots for structured-latent debug/inspection
-
-The main inference entry point is `trellis-image-to-gltf`, a thin terminal CLI
-over the pipeline in `src/`. It reports model loading and sampler step
-progress without opening a GUI. Raylib viewers are optional replay/live debug
-tools.
-
-## Status
-
-Implemented:
-
-- CUDA-backed ggml runtime setup
-- safetensors loading with terminal progress
-- DINOv3 image conditioning
-- sparse-structure flow and decoder
-- structured-latent shape flow
-- shape decoder with FlexiDualGrid mesh extraction
-- one-shot image-to-GLB/glTF pipeline
-- texture/PBR GLB output
-- CLI sparse-structure image-to-voxel debug inference
-- optional raylib voxel and mesh visualization
-- custom CUDA kernels for the parts not covered by ggml
-
-Still in progress:
-
-- Python parity tuning
-- performance optimization for sparse convolution and decode
-- full end-to-end model quality validation
-
-## Dependencies
-
-- CMake
-- CUDA Toolkit
-- a CUDA GPU
-- Git submodules
-
-`ggml` is included as a submodule from:
-
-```sh
-https://github.com/Wimacs/ggml.git
-```
-
-`raylib` is included as a submodule for visualization.
-
-Clone with submodules:
-
-```sh
-git clone --recursive git@github.com:Wimacs/trellis2.c.git
-```
+Native TRELLIS.2 image-to-3D inference tool with CUDA and Vulkan support. The main command is `trellis-image-to-gltf`.
 
 ## Build
 
+Clone submodules first:
+
 ```sh
-cmake -S . -B build -DGGML_CUDA=ON
+git submodule update --init --recursive
+```
+
+CUDA:
+
+```sh
+cmake -S . -B build -DTRELLIS2_C_BACKEND=cuda
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-## Run
+Vulkan:
 
-Download the TRELLIS.2 and DINOv3 checkpoints next to the project:
+```sh
+cmake -S . -B build-vulkan -DTRELLIS2_C_BACKEND=vulkan
+cmake --build build-vulkan -j
+```
+
+Windows CUDA:
+
+```powershell
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 -DTRELLIS2_C_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-win --config Release
+ctest --test-dir build-win -C Release --output-on-failure
+```
+
+Windows Vulkan:
+
+Install the Vulkan SDK first.
+
+```powershell
+cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 -DTRELLIS2_C_BACKEND=vulkan
+cmake --build build-win-vulkan --config Release
+ctest --test-dir build-win-vulkan -C Release --output-on-failure
+```
+
+## Download Weights
+
+Hugging Face:
 
 ```sh
 python3 tools/download_weights.py --source huggingface
 ```
 
-For ModelScope:
+ModelScope:
 
 ```sh
 python3 tools/download_weights.py --source modelscope
 ```
 
-Both commands write the default layout expected by the tools:
+This downloads TRELLIS.2, DINOv3, and the BiRefNet background-removal model:
 
 ```text
 ../TRELLIS.2/
 |-- TRELLIS.2-4B/
-`-- dinov3-vitl16-pretrain-lvd1689m/
+|-- dinov3-vitl16-pretrain-lvd1689m/
+`-- BiRefNet/
+    `-- BiRefNet-F16.gguf
 ```
 
-Then run one-shot GLB inference:
+## Run
+
+Linux:
 
 ```sh
 ./build/trellis-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --image ../assets/example_image/T.png \
-  --gltf benchmark_outputs/output.glb
+  --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
+  --image example_image/T.png \
+  --gltf output.glb
 ```
 
-`trellis-image-to-gltf` runs sparse-structure flow, structured-latent shape flow,
-shape decode, texture decode, and GLB/glTF export in one terminal command. It
-does not open a GUI, and sparse coords plus DINO condition data are passed
-directly in memory. The default output is `output.glb` when no explicit output
-path is passed; WebP inputs are converted to a temporary PNG because the
-current stb_image loader does not decode WebP directly.
+Windows:
 
-## Useful Tools
-
-- `trellis-infer`: terminal sparse-structure image-to-voxel debug inference
-- `trellis-image-to-gltf`: one-shot terminal image-to-GLB/glTF executable
-- `trellis-live`: optional image-to-3D live viewer
-- `trellis-info`: inspect checkpoint coverage
-- `trellis-sparse-structure`: sparse-structure validation helpers
-- `trellis-structured-latent`: structured-latent tensor and decoder helpers
-- `trellis-voxel-viewer`: replay voxel snapshots
-- `trellis-mesh-viewer`: replay mesh snapshots
-
-## Layout
-
-```text
-include/       public C API
-src/           C runtime implementation
-src/model      network definitions, weight binding, and model CUDA forward paths
-src/pipeline   image-to-GLB/glTF orchestration and in-memory pipeline steps
-src/runtime    CUDA backend setup, logging/progress, model path/load helpers
-src/io         safetensors parser and ggml tensor-store loading
-src/mesh       FlexiDualGrid mesh extraction
-src/model      ggml network definitions plus CUDA sparse-conv model forward paths
-src/pipeline   samplers and end-to-end CLI orchestration
-tools/         thin CLIs, inspect/debug tools, and optional raylib viewers
-tests/         unit tests
-docs/          implementation notes
-3rd/           ggml and raylib submodules
+```powershell
+.\build-win\Release\trellis-image-to-gltf.exe `
+  --model ..\TRELLIS.2\TRELLIS.2-4B `
+  --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
+  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
+  --image example_image\T.png `
+  --gltf output.glb
 ```
 
-Primary pipeline files:
+For a Windows Vulkan build, use:
 
-- `src/runtime/trellis_runtime.c`: CUDA backend setup, logging/progress, model path/load helpers
-- `src/model/trellis_dino.c`: DINOv3 image encoder weight binding and graph definition
-- `src/model/trellis_cuda_forward.cu`: CUDA forward paths for sparse 3D decoder networks
-- `src/model/trellis_slat_flow_model.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition
-- `src/model/trellis_sparse_structure_decoder.c`: sparse-structure VAE decoder weight binding
-- `src/model/trellis_sparse_unet_vae_decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders
-- `src/pipeline/trellis_sparse_structure_pipeline.c`: image -> sparse coords + DINO condition
-- `src/pipeline/trellis_structured_latent_pipeline.c`: sparse coords + condition -> denormalized shape/texture SLat
-- `src/pipeline/trellis_pipeline.c`: image -> textured GLB/glTF orchestration
-- `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests
-- `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug
+```powershell
+.\build-win-vulkan\Release\trellis-image-to-gltf.exe `
+  --backend vulkan `
+  --model ..\TRELLIS.2\TRELLIS.2-4B `
+  --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
+  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
+  --image example_image\T.png `
+  --gltf output.glb
+```

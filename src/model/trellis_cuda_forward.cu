@@ -1,4 +1,5 @@
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_cuda_kernels.h"
 
 #include <cuda_runtime.h>
@@ -7,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /*
  * Network execution lives here; CUDA kernels and reusable op wrappers live in
@@ -27,9 +27,7 @@ static int trellis_profile_enabled(void) {
 }
 
 static double trellis_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1000000.0;
+    return (double) trellis_now_us() / 1000.0;
 }
 
 static void trellis_profile_cuda_log(const char * label, double start_ms) {

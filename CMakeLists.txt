@@ -33,6 +33,10 @@ if (TRELLIS2_C_BACKEND STREQUAL "cuda")
 endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if (MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib snapshot viewers" ON)
@@ -634,22 +638,28 @@ if (TRELLIS2_C_BUILD_TOOLS)
             target_link_libraries(trellis-live PRIVATE m)
         endif()
 
-        add_executable(trellis-viewer tools/trellis_viewer.c)
-        target_include_directories(trellis-viewer PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
-            "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
-        target_link_libraries(trellis-viewer PRIVATE trellis2_c ggml raylib)
-        if (UNIX)
-            target_link_libraries(trellis-viewer PRIVATE m pthread)
+        if (NOT WIN32)
+            add_executable(trellis-viewer tools/trellis_viewer.c)
+            target_include_directories(trellis-viewer PRIVATE
+                "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
+                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
+            target_link_libraries(trellis-viewer PRIVATE trellis2_c ggml raylib)
+            if (UNIX)
+                target_link_libraries(trellis-viewer PRIVATE m pthread)
+            endif()
+        else()
+            message(STATUS "Skipping trellis-viewer on Windows; use trellis-live or the terminal tools")
         endif()
 
         add_executable(trellis-voxel-viewer tools/viewers/trellis_voxel_viewer.c)
+        target_include_directories(trellis-voxel-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
         target_link_libraries(trellis-voxel-viewer PRIVATE raylib)
         if (UNIX)
             target_link_libraries(trellis-voxel-viewer PRIVATE m)
         endif()
 
         add_executable(trellis-mesh-viewer tools/viewers/trellis_mesh_viewer.c)
+        target_include_directories(trellis-mesh-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
         target_link_libraries(trellis-mesh-viewer PRIVATE raylib)
         if (UNIX)
             target_link_libraries(trellis-mesh-viewer PRIVATE m)

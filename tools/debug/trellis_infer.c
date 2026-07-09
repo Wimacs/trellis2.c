@@ -1,4 +1,5 @@
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_tool_cli.h"
 #include "trellis_tool_live.h"
 #include "trellis_tool_model.h"
@@ -10,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../3rd/raylib/src/external/stb_image.h"
@@ -469,25 +469,7 @@ static int load_dino_store(
 }
 
 static int mkdir_p(const char * path) {
-    if (path == NULL || path[0] == '\0') {
-        return 0;
-    }
-    char tmp[4096];
-    size_t n = strlen(path);
-    if (n >= sizeof(tmp)) {
-        return 0;
-    }
-    memcpy(tmp, path, n + 1);
-    for (size_t i = 1; i < n; ++i) {
-        if (tmp[i] == '/') {
-            tmp[i] = '\0';
-            if (tmp[0] != '\0' && mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-                return 0;
-            }
-            tmp[i] = '/';
-        }
-    }
-    return mkdir(tmp, 0775) == 0 || errno == EEXIST;
+    return trellis_mkdir_p(path);
 }
 
 static int write_voxel_frame(
