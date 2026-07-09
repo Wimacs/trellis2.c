@@ -693,6 +693,7 @@ static void viewer_autodetect_weights_dir(viewer_options * options) {
     }
     slash[1] = '\0';
     const char * app_candidates[] = {
+        "TRELLIS.2",
         "../TRELLIS.2",
         "../../TRELLIS.2",
         "../../../TRELLIS.2",
