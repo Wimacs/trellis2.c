@@ -309,18 +309,33 @@ static int text_is_empty(const char * text) {
 }
 
 static int viewer_path_exists(const char * path) {
+#ifdef _WIN32
+    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES;
+#else
     struct stat st;
     return path != NULL && path[0] != '\0' && stat(path, &st) == 0;
+#endif
 }
 
 static int viewer_dir_exists(const char * path) {
+#ifdef _WIN32
+    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
     struct stat st;
     return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && (st.st_mode & S_IFDIR) != 0;
+#endif
 }
 
 static int viewer_file_exists(const char * path) {
+#ifdef _WIN32
+    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
     struct stat st;
     return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && (st.st_mode & S_IFREG) != 0;
+#endif
 }
 
 static int viewer_join_path(const char * base, const char * child, char * dst, size_t dst_size) {
@@ -692,6 +707,19 @@ static void viewer_autodetect_weights_dir(viewer_options * options) {
     if (options == NULL || !text_is_empty(options->weights_dir)) {
         return;
     }
+    char exe_path[VIEWER_MAX_PATH];
+    if (trellis_current_executable_path(exe_path, sizeof(exe_path))) {
+        char * slash = trellis_path_last_sep(exe_path);
+        if (slash != NULL) {
+            slash[1] = '\0';
+            char packaged[VIEWER_MAX_PATH];
+            if (viewer_join_path(exe_path, "TRELLIS.2", packaged, sizeof(packaged)) &&
+                viewer_weights_root_looks_valid(packaged)) {
+                viewer_apply_weights_dir(options, packaged);
+                return;
+            }
+        }
+    }
     const char * env_candidates[] = {
         getenv("TRELLIS2_WEIGHTS_DIR"),
         getenv("TRELLIS_WEIGHTS_DIR"),
@@ -716,7 +744,6 @@ static void viewer_autodetect_weights_dir(viewer_options * options) {
             return;
         }
     }
-    char exe_path[VIEWER_MAX_PATH];
     if (!trellis_current_executable_path(exe_path, sizeof(exe_path))) {
         return;
     }
