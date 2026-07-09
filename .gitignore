@@ -39,6 +39,13 @@ viewer_outputs/
 out/
 outputs/
 artifacts/
+dist/
+release/
+releases/
+bg_removed*.png
+*_removed.png
+*_check.png
+*-check.png
 *.ckpt
 *.safetensors
 *.ply
