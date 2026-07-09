@@ -153,8 +153,9 @@ Write-Host "You can now launch trellis2 local."
 }
 
 function Copy-ExampleImage($DestinationDir) {
-    $ExampleSource = Join-Path $RepoRoot "example_image\T.png"
+    $ExampleSource = Join-Path $RepoRoot "example_image\images.jpg"
     if (Test-Path -LiteralPath $ExampleSource) {
+        Copy-Item -LiteralPath $ExampleSource -Destination (Join-Path $DestinationDir "images.jpg") -Force
         $ExampleDir = Join-Path $DestinationDir "example_image"
         Ensure-Dir $ExampleDir
         Copy-Item -LiteralPath $ExampleSource -Destination $ExampleDir -Force
@@ -188,7 +189,7 @@ Included:
   - vkmesh.exe for mesh postprocess
   - runtime DLLs for this backend
   - download_weights.py plus Windows wrapper scripts
-  - example_image\T.png for a first preview image
+  - images.jpg for the first preview image
 
 Notes:
   - GUI title: trellis2 local

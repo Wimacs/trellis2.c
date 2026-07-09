@@ -876,6 +876,14 @@ static void viewer_autodetect_image_path(viewer_options * options) {
         return;
     }
     const char * relative_candidates[] = {
+        "images.jpg",
+        "example_image/images.jpg",
+        "../images.jpg",
+        "../example_image/images.jpg",
+        "../../images.jpg",
+        "../../example_image/images.jpg",
+        "../../../images.jpg",
+        "../../../example_image/images.jpg",
         "example_image/T.png",
         "../example_image/T.png",
         "../../example_image/T.png",
@@ -1067,7 +1075,7 @@ static int command_available(const char * name);
 
 static void viewer_options_defaults(viewer_options * options) {
     memset(options, 0, sizeof(*options));
-    copy_text(options->image_path, sizeof(options->image_path), "example_image/T.png");
+    copy_text(options->image_path, sizeof(options->image_path), "images.jpg");
     copy_text(options->out_dir, sizeof(options->out_dir), "viewer_outputs");
     copy_text(options->backend, sizeof(options->backend), TRELLIS_DEFAULT_BACKEND);
     copy_text(options->pipeline_type, sizeof(options->pipeline_type), "512");
