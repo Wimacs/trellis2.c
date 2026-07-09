@@ -12,9 +12,18 @@ Or download the same layout from ModelScope:
 python3 tools/download_weights.py --source modelscope
 ```
 
-The downloader writes to `../TRELLIS.2/` by default. Use `--output-dir`,
-`--only trellis|dino`, `--revision`, `--include`, or `--full` when you need a
-custom layout or a non-default set of files.
+The downloader writes to `../TRELLIS.2/` by default. The GUI reads the same
+folder layout: `TRELLIS.2-4B/`, `dinov3-vitl16-pretrain-lvd1689m/`, and
+`BiRefNet/`. Use `--output-dir`, `--only trellis|dino|birefnet`, `--revision`,
+`--include`, or `--full` when you need a custom layout or a non-default set of
+files.
+
+`trellis-gui` is the default local GUI. It opens without arguments; choose the
+weights folder in the window, or pass it up front:
+
+```sh
+../build/trellis-gui --weights ../TRELLIS.2
+```
 
 `trellis-image-to-gltf` is the default terminal inference app:
 
@@ -113,31 +122,16 @@ Pipeline code lives under `src/`:
 - `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests.
 - `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug.
 
-Debug/live helpers:
+Debug helpers:
 
 - `trellis_tool_cli.h`: terminal logging and diffusion.cpp-style progress output.
 - `trellis_tool_model.h`: shared safetensors-to-CUDA tensor-store loading helper.
-- `trellis_tool_live.h`: in-memory sparse-structure and structured-latent live interfaces.
 - `trellis_image_to_gltf.c`: one-shot image-to-GLB/glTF CLI entry point.
 - `debug/trellis_infer.c`: legacy/debug sparse-structure image/DINO/flow/voxel decode CLI.
-- `viewers/trellis_structured_latent_mesh_live_viewer.c`: structured-latent shape flow, per-step mesh decode,
-  and raylib mesh upload. It also builds as the standalone
-  `trellis-structured-latent-mesh-live-viewer` debug CLI.
-
-Raylib live viewer:
-
-```sh
-../build/trellis-live --display :1
-```
-
-It is now an optional visualization path rather than the default inference
-entry point.
 
 Standalone debug tools:
 
 - `trellis_info.c`: inspect checkpoint manifests.
 - `debug/trellis_sparse_structure.c`: sparse-structure checkpoint and schedule validation.
 - `debug/trellis_structured_latent.c`: structured-latent tensor sampler/decode debug CLI.
-- `viewers/trellis_voxel_viewer.c`: replay written voxel snapshots.
-- `viewers/trellis_mesh_viewer.c`: replay written mesh snapshots.
 - `debug/trellis_verify.c`: small numeric/file verification helper.

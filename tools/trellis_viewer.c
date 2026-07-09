@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trellis.h"
+#include "trellis_platform.h"
 #include "trellis_pipeline_internal.h"
 #include "trellis_sparse_backend.h"
 #include "raylib.h"
@@ -10,17 +11,98 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#ifndef _WIN32
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION pthread_mutex_t;
+typedef HANDLE pthread_t;
+
+typedef struct viewer_thread_start {
+    void * (*fn)(void *);
+    void * arg;
+} viewer_thread_start;
+
+static DWORD WINAPI viewer_thread_trampoline(LPVOID user_data) {
+    viewer_thread_start * start = (viewer_thread_start *) user_data;
+    if (start != NULL && start->fn != NULL) {
+        start->fn(start->arg);
+    }
+    free(start);
+    return 0;
+}
+
+static int pthread_mutex_init(pthread_mutex_t * mutex, void * attr) {
+    (void) attr;
+    InitializeCriticalSection(mutex);
+    return 0;
+}
+
+static int pthread_mutex_lock(pthread_mutex_t * mutex) {
+    EnterCriticalSection(mutex);
+    return 0;
+}
+
+static int pthread_mutex_unlock(pthread_mutex_t * mutex) {
+    LeaveCriticalSection(mutex);
+    return 0;
+}
+
+static int pthread_mutex_destroy(pthread_mutex_t * mutex) {
+    DeleteCriticalSection(mutex);
+    return 0;
+}
+
+static int pthread_create(pthread_t * thread, void * attr, void * (*fn)(void *), void * arg) {
+    (void) attr;
+    if (thread == NULL || fn == NULL) {
+        return EINVAL;
+    }
+    viewer_thread_start * start = (viewer_thread_start *) calloc(1, sizeof(*start));
+    if (start == NULL) {
+        return ENOMEM;
+    }
+    start->fn = fn;
+    start->arg = arg;
+    HANDLE handle = CreateThread(NULL, 0, viewer_thread_trampoline, start, 0, NULL);
+    if (handle == NULL) {
+        free(start);
+        return (int) GetLastError();
+    }
+    *thread = handle;
+    return 0;
+}
+
+static int pthread_join(pthread_t thread, void ** retval) {
+    (void) retval;
+    if (thread == NULL) {
+        return EINVAL;
+    }
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return 0;
+}
+
+static int pthread_detach(pthread_t thread) {
+    if (thread == NULL) {
+        return EINVAL;
+    }
+    CloseHandle(thread);
+    return 0;
+}
 #endif
 
 extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
@@ -40,6 +122,11 @@ typedef enum viewer_job_type {
     VIEWER_JOB_POSTPROCESS,
 } viewer_job_type;
 
+typedef enum viewer_picker_kind {
+    VIEWER_PICKER_IMAGE = 0,
+    VIEWER_PICKER_WEIGHTS,
+} viewer_picker_kind;
+
 typedef enum viewer_snapshot_kind {
     VIEWER_SNAPSHOT_NONE = 0,
     VIEWER_SNAPSHOT_VOXELS,
@@ -47,6 +134,7 @@ typedef enum viewer_snapshot_kind {
 } viewer_snapshot_kind;
 
 typedef struct viewer_options {
+    char weights_dir[VIEWER_MAX_PATH];
     char model_dir[VIEWER_MAX_PATH];
     char dino_dir[VIEWER_MAX_PATH];
     char birefnet_path[VIEWER_MAX_PATH];
@@ -125,6 +213,7 @@ typedef struct viewer_shared {
     int worker_done_token;
     int file_picker_running;
     int selected_image_pending;
+    int selected_weights_pending;
     int close_requested;
     int bg_ready;
     int mesh_ready;
@@ -133,6 +222,7 @@ typedef struct viewer_shared {
     char current_image_path[VIEWER_MAX_PATH];
     char processed_image_path[VIEWER_MAX_PATH];
     char selected_image_path[VIEWER_MAX_PATH];
+    char selected_weights_dir[VIEWER_MAX_PATH];
     char stage[128];
     char detail[384];
     char error[512];
@@ -156,6 +246,11 @@ typedef struct viewer_worker_args {
     viewer_job_type job;
     char image_path[VIEWER_MAX_PATH];
 } viewer_worker_args;
+
+typedef struct viewer_file_picker_args {
+    viewer_shared * shared;
+    viewer_picker_kind kind;
+} viewer_file_picker_args;
 
 typedef struct display_mesh {
     float * vertices;
@@ -215,6 +310,172 @@ static int text_is_empty(const char * text) {
     return text == NULL || text[0] == '\0';
 }
 
+static int viewer_path_exists(const char * path) {
+    struct stat st;
+    return path != NULL && path[0] != '\0' && stat(path, &st) == 0;
+}
+
+static int viewer_dir_exists(const char * path) {
+    struct stat st;
+    return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && (st.st_mode & S_IFDIR) != 0;
+}
+
+static int viewer_file_exists(const char * path) {
+    struct stat st;
+    return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && (st.st_mode & S_IFREG) != 0;
+}
+
+static int viewer_join_path(const char * base, const char * child, char * dst, size_t dst_size) {
+    if (text_is_empty(base) || text_is_empty(child) || dst == NULL || dst_size == 0) {
+        return 0;
+    }
+    size_t base_len = strlen(base);
+    int needs_sep = base_len > 0 && !trellis_path_is_sep(base[base_len - 1u]);
+    int n = snprintf(
+        dst,
+        dst_size,
+        "%s%s%s",
+        base,
+        needs_sep ? (TRELLIS_PATH_SEP == '\\' ? "\\" : "/") : "",
+        child);
+    return n >= 0 && (size_t) n < dst_size;
+}
+
+static int viewer_join_path2(const char * base, const char * mid, const char * child, char * dst, size_t dst_size) {
+    char tmp[VIEWER_MAX_PATH];
+    return viewer_join_path(base, mid, tmp, sizeof(tmp)) && viewer_join_path(tmp, child, dst, dst_size);
+}
+
+static void viewer_apply_weights_dir(viewer_options * options, const char * dir) {
+    if (options == NULL || text_is_empty(dir)) {
+        return;
+    }
+    copy_text(options->weights_dir, sizeof(options->weights_dir), dir);
+    viewer_join_path(dir, "TRELLIS.2-4B", options->model_dir, sizeof(options->model_dir));
+    viewer_join_path(dir, "dinov3-vitl16-pretrain-lvd1689m", options->dino_dir, sizeof(options->dino_dir));
+    viewer_join_path2(dir, "BiRefNet", "BiRefNet-F16.gguf", options->birefnet_path, sizeof(options->birefnet_path));
+}
+
+static int viewer_weights_root_looks_valid(const char * dir) {
+    char path[VIEWER_MAX_PATH];
+    return viewer_join_path2(dir, "TRELLIS.2-4B", "pipeline.json", path, sizeof(path)) &&
+        viewer_file_exists(path) &&
+        viewer_join_path2(dir, "dinov3-vitl16-pretrain-lvd1689m", "model.safetensors", path, sizeof(path)) &&
+        viewer_file_exists(path);
+}
+
+static int viewer_weights_ready(const viewer_options * options, int require_birefnet, char * issue, size_t issue_size) {
+    char path[VIEWER_MAX_PATH];
+    if (issue != NULL && issue_size > 0) {
+        issue[0] = '\0';
+    }
+    if (options == NULL || text_is_empty(options->model_dir) || text_is_empty(options->dino_dir)) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "select a TRELLIS.2 weights folder");
+        return 0;
+    }
+    if (!viewer_dir_exists(options->model_dir)) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS.2-4B folder");
+        return 0;
+    }
+    if (!viewer_join_path(options->model_dir, "pipeline.json", path, sizeof(path)) || !viewer_file_exists(path)) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS.2-4B/pipeline.json");
+        return 0;
+    }
+    if (!viewer_join_path2(options->model_dir, "ckpts", "ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path)) ||
+        !viewer_file_exists(path)) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing TRELLIS sparse-structure weights");
+        return 0;
+    }
+    if (!viewer_join_path(options->dino_dir, "model.safetensors", path, sizeof(path)) || !viewer_file_exists(path)) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing DINOv3/model.safetensors");
+        return 0;
+    }
+    if (require_birefnet && (text_is_empty(options->birefnet_path) || !viewer_file_exists(options->birefnet_path))) {
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "missing BiRefNet/BiRefNet-F16.gguf");
+        return 0;
+    }
+    return 1;
+}
+
+static void viewer_autodetect_weights_dir(viewer_options * options) {
+    if (options == NULL || !text_is_empty(options->weights_dir)) {
+        return;
+    }
+    const char * relative_candidates[] = {
+        "../TRELLIS.2",
+        "../../TRELLIS.2",
+        "../../../TRELLIS.2",
+        "TRELLIS.2",
+        NULL,
+    };
+    for (int i = 0; relative_candidates[i] != NULL; ++i) {
+        if (viewer_weights_root_looks_valid(relative_candidates[i])) {
+            viewer_apply_weights_dir(options, relative_candidates[i]);
+            return;
+        }
+    }
+    char exe_path[VIEWER_MAX_PATH];
+    if (!trellis_current_executable_path(exe_path, sizeof(exe_path))) {
+        return;
+    }
+    char * slash = trellis_path_last_sep(exe_path);
+    if (slash == NULL) {
+        return;
+    }
+    slash[1] = '\0';
+    const char * app_candidates[] = {
+        "../TRELLIS.2",
+        "../../TRELLIS.2",
+        "../../../TRELLIS.2",
+        "../../../../TRELLIS.2",
+        NULL,
+    };
+    for (int i = 0; app_candidates[i] != NULL; ++i) {
+        char candidate[VIEWER_MAX_PATH];
+        if (viewer_join_path(exe_path, app_candidates[i], candidate, sizeof(candidate)) &&
+            viewer_weights_root_looks_valid(candidate)) {
+            viewer_apply_weights_dir(options, candidate);
+            return;
+        }
+    }
+}
+
+static void viewer_autodetect_image_path(viewer_options * options) {
+    if (options == NULL || viewer_file_exists(options->image_path)) {
+        return;
+    }
+    const char * relative_candidates[] = {
+        "assets/example_image/T.png",
+        "../assets/example_image/T.png",
+        "../../assets/example_image/T.png",
+        "../../../assets/example_image/T.png",
+        NULL,
+    };
+    for (int i = 0; relative_candidates[i] != NULL; ++i) {
+        if (viewer_file_exists(relative_candidates[i])) {
+            copy_text(options->image_path, sizeof(options->image_path), relative_candidates[i]);
+            return;
+        }
+    }
+    char exe_path[VIEWER_MAX_PATH];
+    if (!trellis_current_executable_path(exe_path, sizeof(exe_path))) {
+        return;
+    }
+    char * slash = trellis_path_last_sep(exe_path);
+    if (slash == NULL) {
+        return;
+    }
+    slash[1] = '\0';
+    for (int i = 0; relative_candidates[i] != NULL; ++i) {
+        char candidate[VIEWER_MAX_PATH];
+        if (viewer_join_path(exe_path, relative_candidates[i], candidate, sizeof(candidate)) &&
+            viewer_file_exists(candidate)) {
+            copy_text(options->image_path, sizeof(options->image_path), candidate);
+            return;
+        }
+    }
+}
+
 static int path_has_ext_ci(const char * path, const char * ext) {
     if (path == NULL || ext == NULL) {
         return 0;
@@ -244,28 +505,7 @@ static int is_supported_image_path(const char * path) {
 }
 
 static int mkdir_p_simple(const char * path) {
-    if (text_is_empty(path)) {
-        return 0;
-    }
-    char tmp[VIEWER_MAX_PATH];
-    copy_text(tmp, sizeof(tmp), path);
-    size_t len = strlen(tmp);
-    while (len > 1 && tmp[len - 1] == '/') {
-        tmp[--len] = '\0';
-    }
-    for (char * p = tmp + 1; *p != '\0'; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-                return 0;
-            }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0775) != 0 && errno != EEXIST) {
-        return 0;
-    }
-    return 1;
+    return !text_is_empty(path) && trellis_mkdir_p(path);
 }
 
 static int split_dir_stem(const char * path, char * dir, size_t dir_size, char * stem, size_t stem_size) {
@@ -394,7 +634,7 @@ static void viewer_options_defaults(viewer_options * options) {
     memset(options, 0, sizeof(*options));
     copy_text(options->model_dir, sizeof(options->model_dir), "TRELLIS.2-4B");
     copy_text(options->dino_dir, sizeof(options->dino_dir), "dinov3-vitl16-pretrain-lvd1689m");
-    copy_text(options->image_path, sizeof(options->image_path), "example_image/T.png");
+    copy_text(options->image_path, sizeof(options->image_path), "assets/example_image/T.png");
     copy_text(options->out_dir, sizeof(options->out_dir), "viewer_outputs");
     copy_text(options->backend, sizeof(options->backend), TRELLIS_DEFAULT_BACKEND);
     copy_text(options->pipeline_type, sizeof(options->pipeline_type), "512");
@@ -420,16 +660,19 @@ static void viewer_options_defaults(viewer_options * options) {
     options->use_ggml_flash_attn = 1;
     options->width = 1440;
     options->height = 900;
+    viewer_autodetect_image_path(options);
+    viewer_autodetect_weights_dir(options);
 }
 
 static void usage(FILE * out, const char * argv0) {
     fprintf(out,
         "Usage:\n"
-        "  %s --model DIR --dino DIR --image FILE [options]\n"
+        "  %s [--weights DIR] [--image FILE] [options]\n"
         "\n"
-        "Local raylib image-to-3D viewer. GUI work stays on the main thread; TRELLIS inference runs in a worker thread.\n"
+        "Local raylib image-to-3D GUI. Launch without arguments, then choose a weights folder and image in the window.\n"
         "\n"
         "Core options mirror trellis-image-to-gltf:\n"
+        "  --weights DIR            Folder containing TRELLIS.2-4B/, dinov3-vitl16-pretrain-lvd1689m/, and BiRefNet/\n"
         "  --model DIR, --dino DIR, --birefnet FILE, --image FILE\n"
         "  --out-dir DIR, --gltf FILE, --backend NAME, --device N\n"
         "  --pipeline 512|1024       GUI stage mode, default 512\n"
@@ -447,7 +690,11 @@ static void usage(FILE * out, const char * argv0) {
 static int parse_options(int argc, char ** argv, viewer_options * options) {
     viewer_options_defaults(options);
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--model") == 0) {
+        if (strcmp(argv[i], "--weights") == 0 || strcmp(argv[i], "--weights-dir") == 0) {
+            const char * dir = arg_value(argc, argv, &i);
+            if (text_is_empty(dir)) return 0;
+            viewer_apply_weights_dir(options, dir);
+        } else if (strcmp(argv[i], "--model") == 0) {
             copy_text(options->model_dir, sizeof(options->model_dir), arg_value(argc, argv, &i));
         } else if (strcmp(argv[i], "--dino") == 0) {
             copy_text(options->dino_dir, sizeof(options->dino_dir), arg_value(argc, argv, &i));
@@ -556,7 +803,7 @@ static int parse_options(int argc, char ** argv, viewer_options * options) {
         fprintf(stderr, "trellis-viewer: GUI stage mode currently supports --pipeline 512 or 1024\n");
         return 0;
     }
-    return !text_is_empty(options->model_dir) && !text_is_empty(options->dino_dir) && !text_is_empty(options->image_path);
+    return !text_is_empty(options->image_path);
 }
 
 static void viewer_snapshot_free(viewer_snapshot * snapshot) {
@@ -651,7 +898,7 @@ static void viewer_env_override_begin(viewer_env_override * env, const char * na
     if (old_value != NULL) {
         copy_text(env->old_value, sizeof(env->old_value), old_value);
     }
-    setenv(name, value, 1);
+    trellis_setenv(name, value, 1);
 }
 
 static void viewer_env_override_end(const viewer_env_override * env) {
@@ -659,9 +906,9 @@ static void viewer_env_override_end(const viewer_env_override * env) {
         return;
     }
     if (env->had_old) {
-        setenv(env->name, env->old_value, 1);
+        trellis_setenv(env->name, env->old_value, 1);
     } else {
-        unsetenv(env->name);
+        trellis_unsetenv(env->name);
     }
 }
 
@@ -1014,19 +1261,12 @@ static trellis_status sparse_kind_from_backend(trellis_backend_kind graph_kind, 
 }
 
 static int run_process(char * const argv[]) {
-    pid_t pid = fork();
-    if (pid < 0) {
+    if (argv == NULL || argv[0] == NULL) {
         return 0;
     }
-    if (pid == 0) {
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return 0;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return trellis_path_has_sep(argv[0]) ?
+        trellis_run_process_exact(argv) :
+        trellis_run_process_search_path(argv);
 }
 
 static int convert_webp_to_png(const char * input, const char * output) {
@@ -1055,8 +1295,7 @@ static int prepare_image_for_pipeline(
     if (!mkdir_p_simple(options->out_dir)) {
         return 0;
     }
-    int n = snprintf(prepared, prepared_size, "%s/trellis_viewer_input_%ld.png", options->out_dir, (long) getpid());
-    if (n < 0 || (size_t) n >= prepared_size) {
+    if (!trellis_make_temp_path(prepared, prepared_size, "trellis_viewer_input", ".png")) {
         return 0;
     }
     return convert_webp_to_png(input, prepared);
@@ -1067,7 +1306,7 @@ static trellis_status remove_background_to_png(
     const char * input_path,
     char * out_path,
     size_t out_path_size) {
-    if (text_is_empty(options->birefnet_path)) {
+    if (text_is_empty(options->birefnet_path) || !viewer_file_exists(options->birefnet_path)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (!mkdir_p_simple(options->out_dir)) {
@@ -1111,7 +1350,7 @@ static trellis_status remove_background_to_png(
                     (unsigned char) (((unsigned int) rgba[i * 4u + 3u] * (unsigned int) mask[i] + 127u) / 255u);
             }
         }
-        int n = snprintf(out_path, out_path_size, "%s/trellis_viewer_bg_removed_%ld.png", options->out_dir, (long) getpid());
+        int n = snprintf(out_path, out_path_size, "%s/trellis_viewer_bg_removed_%ld.png", options->out_dir, trellis_getpid());
         if (n < 0 || (size_t) n >= out_path_size) {
             status = TRELLIS_STATUS_INVALID_ARGUMENT;
         } else if (!stbi_write_png(out_path, width, height, 4, rgba, width * 4)) {
@@ -1207,16 +1446,16 @@ static trellis_status read_meshbin(const char * path, trellis_mesh_host * mesh_o
 
 static int find_vkmesh_executable(char * out, size_t out_size) {
     char candidate[VIEWER_MAX_PATH];
-    ssize_t self_len = readlink("/proc/self/exe", candidate, sizeof(candidate) - 1u);
-    if (self_len > 0) {
-        candidate[self_len] = '\0';
-        char * slash = strrchr(candidate, '/');
+    if (trellis_current_executable_path(candidate, sizeof(candidate))) {
+        char * slash = trellis_path_last_sep(candidate);
         if (slash != NULL) {
             slash[1] = '\0';
             size_t len = strlen(candidate);
-            if (len + strlen("vkmesh") + 1u < sizeof(candidate)) {
-                memcpy(candidate + len, "vkmesh", sizeof("vkmesh"));
-                if (access(candidate, X_OK) == 0) {
+            const char * exe_name = "vkmesh" TRELLIS_EXE_SUFFIX;
+            size_t exe_len = strlen(exe_name);
+            if (len + exe_len + 1u < sizeof(candidate)) {
+                memcpy(candidate + len, exe_name, exe_len + 1u);
+                if (trellis_access_executable(candidate)) {
                     copy_text(out, out_size, candidate);
                     return 1;
                 }
@@ -1224,13 +1463,14 @@ static int find_vkmesh_executable(char * out, size_t out_size) {
         }
     }
     const char * local_candidates[] = {
-        "build-vulkan/vkmesh",
-        "build-cuda/vkmesh",
-        "vkmesh",
+        "build-vulkan/vkmesh" TRELLIS_EXE_SUFFIX,
+        "build-cuda/vkmesh" TRELLIS_EXE_SUFFIX,
+        "build-win/Release/vkmesh" TRELLIS_EXE_SUFFIX,
+        "vkmesh" TRELLIS_EXE_SUFFIX,
         NULL,
     };
     for (int i = 0; local_candidates[i] != NULL; ++i) {
-        if (access(local_candidates[i], X_OK) == 0) {
+        if (trellis_access_executable(local_candidates[i])) {
             copy_text(out, out_size, local_candidates[i]);
             return 1;
         }
@@ -1255,9 +1495,11 @@ static int run_vkmesh_external(
     char input_mesh[VIEWER_MAX_PATH];
     char output_mesh[VIEWER_MAX_PATH];
     char projection_mesh[VIEWER_MAX_PATH];
-    snprintf(input_mesh, sizeof(input_mesh), "/tmp/trellis_viewer_vkmesh_in_%ld.meshbin", (long) getpid());
-    snprintf(output_mesh, sizeof(output_mesh), "/tmp/trellis_viewer_vkmesh_out_%ld.meshbin", (long) getpid());
-    snprintf(projection_mesh, sizeof(projection_mesh), "/tmp/trellis_viewer_vkmesh_projection_%ld.meshbin", (long) getpid());
+    if (!trellis_make_temp_path(input_mesh, sizeof(input_mesh), "trellis_viewer_vkmesh_in", ".meshbin") ||
+        !trellis_make_temp_path(output_mesh, sizeof(output_mesh), "trellis_viewer_vkmesh_out", ".meshbin") ||
+        !trellis_make_temp_path(projection_mesh, sizeof(projection_mesh), "trellis_viewer_vkmesh_projection", ".meshbin")) {
+        return 0;
+    }
     if (!write_meshbin(input_mesh, mesh)) {
         return 0;
     }
@@ -1290,9 +1532,9 @@ static int run_vkmesh_external(
             }
         }
     }
-    unlink(input_mesh);
-    unlink(output_mesh);
-    unlink(projection_mesh);
+    trellis_unlink(input_mesh);
+    trellis_unlink(output_mesh);
+    trellis_unlink(projection_mesh);
     return ok ? 1 : 0;
 }
 
@@ -1419,6 +1661,12 @@ static trellis_status run_mesh_job(viewer_worker_args * args) {
     viewer_shared * shared = args->shared;
     const viewer_options * options = &args->options;
     char prepared_image[VIEWER_MAX_PATH];
+    char issue[256];
+
+    if (!viewer_weights_ready(options, 0, issue, sizeof(issue))) {
+        shared_set_error(shared, "Weights incomplete", issue);
+        return TRELLIS_STATUS_NOT_FOUND;
+    }
 
     shared_set_stage(shared, "Image prep", "preparing input for pipeline", 0.03f, 1);
     if (!prepare_image_for_pipeline(options, args->image_path, prepared_image, sizeof(prepared_image))) {
@@ -1573,6 +1821,12 @@ done:
 static trellis_status run_texture_job(viewer_worker_args * args) {
     viewer_shared * shared = args->shared;
     const viewer_options * options = &args->options;
+    char issue[256];
+
+    if (!viewer_weights_ready(options, 0, issue, sizeof(issue))) {
+        shared_set_error(shared, "Weights incomplete", issue);
+        return TRELLIS_STATUS_NOT_FOUND;
+    }
 
     trellis_backend_context graph_backend;
     trellis_cuda_context cuda;
@@ -1768,11 +2022,19 @@ static void * worker_main(void * user_data) {
     }
 
     if (status != TRELLIS_STATUS_OK) {
+        int has_error = 0;
+        pthread_mutex_lock(&shared->mutex);
+        has_error = shared->error[0] != '\0';
+        pthread_mutex_unlock(&shared->mutex);
+        if (has_error) {
+            goto finish;
+        }
         char message[512];
         snprintf(message, sizeof(message), "%s", trellis_status_string(status));
         shared_set_error(shared, "Error", message);
     }
 
+finish:
     trellis_set_progress_step_callback(NULL, NULL);
     pthread_mutex_lock(&shared->mutex);
     shared->worker_running = 0;
@@ -1818,17 +2080,15 @@ static int start_worker(viewer_shared * shared, const viewer_options * options, 
 }
 
 static int command_available(const char * name) {
-    char cmd[128];
-    int n = snprintf(cmd, sizeof(cmd), "command -v %s >/dev/null 2>&1", name);
-    if (n < 0 || (size_t) n >= sizeof(cmd)) {
-        return 0;
-    }
-    int rc = system(cmd);
-    return rc == 0;
+    return trellis_command_available(name);
 }
 
 static int read_first_line_from_command(const char * cmd, char * out, size_t out_size) {
+#ifdef _WIN32
+    FILE * f = _popen(cmd, "r");
+#else
     FILE * f = popen(cmd, "r");
+#endif
     if (f == NULL) {
         return 0;
     }
@@ -1840,7 +2100,11 @@ static int read_first_line_from_command(const char * cmd, char * out, size_t out
         }
         ok = out[0] != '\0';
     }
+#ifdef _WIN32
+    _pclose(f);
+#else
     pclose(f);
+#endif
     return ok;
 }
 
@@ -1848,6 +2112,19 @@ static int open_image_file_dialog(char * out, size_t out_size, int * dialog_avai
     if (dialog_available != NULL) {
         *dialog_available = 0;
     }
+#ifdef _WIN32
+    if (command_available("powershell")) {
+        if (dialog_available != NULL) {
+            *dialog_available = 1;
+        }
+        if (read_first_line_from_command(
+                "powershell -NoProfile -ExecutionPolicy Bypass -STA -Command \"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Select input image'; $d.Filter = 'Images|*.png;*.jpg;*.jpeg;*.webp;*.bmp'; if ($d.ShowDialog() -eq 'OK') { [Console]::WriteLine($d.FileName) }\"",
+                out,
+                out_size)) {
+            return 1;
+        }
+    }
+#else
     if (command_available("zenity")) {
         if (dialog_available != NULL) {
             *dialog_available = 1;
@@ -1870,46 +2147,121 @@ static int open_image_file_dialog(char * out, size_t out_size, int * dialog_avai
             return 1;
         }
     }
+#endif
+    return 0;
+}
+
+static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_available) {
+    if (dialog_available != NULL) {
+        *dialog_available = 0;
+    }
+#ifdef _WIN32
+    if (command_available("powershell")) {
+        if (dialog_available != NULL) {
+            *dialog_available = 1;
+        }
+        if (read_first_line_from_command(
+                "powershell -NoProfile -ExecutionPolicy Bypass -STA -Command \"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Select TRELLIS.2 weights folder'; $d.ShowNewFolderButton = $false; if ($d.ShowDialog() -eq 'OK') { [Console]::WriteLine($d.SelectedPath) }\"",
+                out,
+                out_size)) {
+            return 1;
+        }
+    }
+#else
+    if (command_available("zenity")) {
+        if (dialog_available != NULL) {
+            *dialog_available = 1;
+        }
+        if (read_first_line_from_command(
+                "zenity --file-selection --directory --title='Select TRELLIS.2 weights folder' 2>/dev/null",
+                out,
+                out_size)) {
+            return 1;
+        }
+    }
+    if (command_available("kdialog")) {
+        if (dialog_available != NULL) {
+            *dialog_available = 1;
+        }
+        if (read_first_line_from_command(
+                "kdialog --getexistingdirectory \"$HOME\" 'Select TRELLIS.2 weights folder' 2>/dev/null",
+                out,
+                out_size)) {
+            return 1;
+        }
+    }
+#endif
     return 0;
 }
 
 static void * file_picker_main(void * user_data) {
-    viewer_shared * shared = (viewer_shared *) user_data;
+    viewer_file_picker_args * args = (viewer_file_picker_args *) user_data;
+    viewer_shared * shared = args == NULL ? NULL : args->shared;
+    viewer_picker_kind kind = args == NULL ? VIEWER_PICKER_IMAGE : args->kind;
+    free(args);
+    if (shared == NULL) {
+        return NULL;
+    }
     char path[VIEWER_MAX_PATH];
     path[0] = '\0';
     int dialog_available = 0;
-    int selected = open_image_file_dialog(path, sizeof(path), &dialog_available);
-    int unsupported = selected && (!FileExists(path) || !is_supported_image_path(path));
+    int selected = kind == VIEWER_PICKER_WEIGHTS ?
+        open_weights_folder_dialog(path, sizeof(path), &dialog_available) :
+        open_image_file_dialog(path, sizeof(path), &dialog_available);
+    int unsupported = 0;
+    if (selected) {
+        unsupported = kind == VIEWER_PICKER_WEIGHTS ?
+            !viewer_dir_exists(path) :
+            (!FileExists(path) || !is_supported_image_path(path));
+    }
 
     pthread_mutex_lock(&shared->mutex);
-    if (selected && !unsupported) {
+    if (selected && !unsupported && kind == VIEWER_PICKER_IMAGE) {
         copy_text(shared->selected_image_path, sizeof(shared->selected_image_path), path);
         shared->selected_image_pending = 1;
+    } else if (selected && !unsupported && kind == VIEWER_PICKER_WEIGHTS) {
+        copy_text(shared->selected_weights_dir, sizeof(shared->selected_weights_dir), path);
+        shared->selected_weights_pending = 1;
     } else if (!dialog_available) {
-        copy_text(shared->stage, sizeof(shared->stage), "File picker unavailable");
-        copy_text(shared->detail, sizeof(shared->detail), "install zenity/kdialog or drag an image into the candidate box");
+        copy_text(shared->stage, sizeof(shared->stage), "Picker unavailable");
+        copy_text(shared->detail, sizeof(shared->detail), kind == VIEWER_PICKER_WEIGHTS ?
+            "dragging folders is supported, or pass --weights DIR" :
+            "drag an image into the candidate box");
     } else if (unsupported) {
-        copy_text(shared->stage, sizeof(shared->stage), "Unsupported image");
-        copy_text(shared->detail, sizeof(shared->detail), "use png, jpg, jpeg, webp, or bmp");
+        copy_text(shared->stage, sizeof(shared->stage), kind == VIEWER_PICKER_WEIGHTS ? "Unsupported weights folder" : "Unsupported image");
+        copy_text(shared->detail, sizeof(shared->detail), kind == VIEWER_PICKER_WEIGHTS ?
+            "choose the folder that contains TRELLIS.2-4B and dinov3-vitl16-pretrain-lvd1689m" :
+            "use png, jpg, jpeg, webp, or bmp");
     }
     shared->file_picker_running = 0;
     pthread_mutex_unlock(&shared->mutex);
     return NULL;
 }
 
-static int start_file_picker(viewer_shared * shared) {
+static int start_file_picker(viewer_shared * shared, viewer_picker_kind kind) {
     pthread_mutex_lock(&shared->mutex);
     if (shared->worker_running || shared->file_picker_running) {
         pthread_mutex_unlock(&shared->mutex);
         return 0;
     }
     shared->file_picker_running = 1;
-    copy_text(shared->stage, sizeof(shared->stage), "Select image");
-    copy_text(shared->detail, sizeof(shared->detail), "opening file picker");
+    copy_text(shared->stage, sizeof(shared->stage), kind == VIEWER_PICKER_WEIGHTS ? "Select weights" : "Select image");
+    copy_text(shared->detail, sizeof(shared->detail), "opening picker");
     pthread_mutex_unlock(&shared->mutex);
 
+    viewer_file_picker_args * args = (viewer_file_picker_args *) calloc(1, sizeof(*args));
+    if (args == NULL) {
+        pthread_mutex_lock(&shared->mutex);
+        shared->file_picker_running = 0;
+        pthread_mutex_unlock(&shared->mutex);
+        return 0;
+    }
+    args->shared = shared;
+    args->kind = kind;
+
     pthread_t thread;
-    if (pthread_create(&thread, NULL, file_picker_main, shared) != 0) {
+    if (pthread_create(&thread, NULL, file_picker_main, args) != 0) {
+        free(args);
         pthread_mutex_lock(&shared->mutex);
         shared->file_picker_running = 0;
         pthread_mutex_unlock(&shared->mutex);
@@ -1964,6 +2316,42 @@ static void set_candidate_image(
     shared->snapshot.version += 1;
     copy_text(shared->stage, sizeof(shared->stage), "Image loaded");
     copy_text(shared->detail, sizeof(shared->detail), path);
+    pthread_mutex_unlock(&shared->mutex);
+    display_mesh_free(mesh_display);
+    display_voxels_free(voxel_display);
+}
+
+static void set_weights_dir(
+    viewer_options * options,
+    viewer_shared * shared,
+    const char * path,
+    display_mesh * mesh_display,
+    display_voxels * voxel_display) {
+    if (text_is_empty(path) || !viewer_dir_exists(path)) {
+        pthread_mutex_lock(&shared->mutex);
+        copy_text(shared->stage, sizeof(shared->stage), "Unsupported weights folder");
+        copy_text(shared->detail, sizeof(shared->detail), "choose the folder created by tools/download_weights.py");
+        pthread_mutex_unlock(&shared->mutex);
+        return;
+    }
+
+    viewer_apply_weights_dir(options, path);
+    char issue[256];
+    int ready = viewer_weights_ready(options, 1, issue, sizeof(issue));
+    pthread_mutex_lock(&shared->mutex);
+    shared->bg_ready = 0;
+    shared->mesh_ready = 0;
+    shared->texture_ready = 0;
+    shared->postprocess_ready = 0;
+    shared->uv_texture_path[0] = '\0';
+    shared->gltf_output_path[0] = '\0';
+    shared->uv_version += 1;
+    viewer_artifacts_free(&shared->artifacts);
+    viewer_snapshot_free(&shared->snapshot);
+    shared->snapshot.version += 1;
+    copy_text(shared->stage, sizeof(shared->stage), ready ? "Weights ready" : "Weights incomplete");
+    copy_text(shared->detail, sizeof(shared->detail), ready ? path : issue);
+    shared->error[0] = '\0';
     pthread_mutex_unlock(&shared->mutex);
     display_mesh_free(mesh_display);
     display_voxels_free(voxel_display);
@@ -2455,20 +2843,13 @@ static void draw_left_panel(
     DrawRectangleRec(panel, (Color) {17, 20, 25, 255});
     DrawRectangle((int) (panel.x + panel.width - 1.0f), 0, 1, GetScreenHeight(), (Color) {44, 51, 60, 255});
     DrawText("TRELLIS Local", (int) panel.x + 18, 18, 24, RAYWHITE);
-    DrawText("click or drop image", (int) panel.x + 20, 48, 13, (Color) {144, 154, 164, 255});
+    DrawText("image-to-3D workspace", (int) panel.x + 20, 48, 13, (Color) {144, 154, 164, 255});
 
     if (CheckCollisionPointRec(GetMousePosition(), panel)) {
         ui->panel_scroll -= GetMouseWheelMove() * 38.0f;
         if (ui->panel_scroll < 0.0f) ui->panel_scroll = 0.0f;
-        if (ui->panel_scroll > 390.0f) ui->panel_scroll = 390.0f;
+        if (ui->panel_scroll > 500.0f) ui->panel_scroll = 500.0f;
     }
-
-    BeginScissorMode((int) panel.x, 66, (int) panel.width, GetScreenHeight() - 102);
-
-    Rectangle image_box = {panel.x + 18.0f, panel.y + 76.0f - ui->panel_scroll, panel.width - 36.0f, 168.0f};
-    DrawRectangleRounded(image_box, 0.05f, 8, (Color) {24, 28, 34, 255});
-    DrawRectangleRoundedLines(image_box, 0.05f, 8, (Color) {70, 80, 90, 255});
-    draw_texture_fit(image_tex, (Rectangle) {image_box.x + 8.0f, image_box.y + 8.0f, image_box.width - 16.0f, image_box.height - 16.0f}, WHITE);
 
     int worker_running = 0;
     int file_picker_running = 0;
@@ -2488,17 +2869,42 @@ static void draw_left_panel(
     pthread_mutex_unlock(&shared->mutex);
     worker_running = worker_running || file_picker_running;
 
-    float y = image_box.y + image_box.height + 18.0f;
+    char weights_issue[256];
+    int core_weights_ready = viewer_weights_ready(options, 0, weights_issue, sizeof(weights_issue));
+    int full_weights_ready = viewer_weights_ready(options, 1, NULL, 0);
+
+    BeginScissorMode((int) panel.x, 66, (int) panel.width, GetScreenHeight() - 102);
+
     float bw = panel.width - 36.0f;
-    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Remove Background", !worker_running && !text_is_empty(options->birefnet_path))) {
+    float y = panel.y + 76.0f - ui->panel_scroll;
+    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 38.0f}, "Weights Folder", !worker_running)) {
+        start_file_picker(shared, VIEWER_PICKER_WEIGHTS);
+    }
+    y += 44.0f;
+    draw_text_elided(
+        core_weights_ready ? (text_is_empty(options->weights_dir) ? options->model_dir : options->weights_dir) : weights_issue,
+        (int) panel.x + 20,
+        (int) y,
+        13,
+        (int) bw - 4,
+        core_weights_ready ? (Color) {139, 210, 190, 255} : (Color) {245, 151, 128, 255});
+    y += 25.0f;
+
+    Rectangle image_box = {panel.x + 18.0f, y, panel.width - 36.0f, 168.0f};
+    DrawRectangleRounded(image_box, 0.05f, 8, (Color) {24, 28, 34, 255});
+    DrawRectangleRoundedLines(image_box, 0.05f, 8, (Color) {70, 80, 90, 255});
+    draw_texture_fit(image_tex, (Rectangle) {image_box.x + 8.0f, image_box.y + 8.0f, image_box.width - 16.0f, image_box.height - 16.0f}, WHITE);
+
+    y = image_box.y + image_box.height + 18.0f;
+    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Remove Background", !worker_running && full_weights_ready && !text_is_empty(current_image))) {
         if (start_worker(shared, options, VIEWER_JOB_REMOVE_BG, current_image, worker_thread) && thread_active != NULL) *thread_active = 1;
     }
     y += 50.0f;
-    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Generate Mesh", !worker_running && !text_is_empty(current_image))) {
+    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Generate Mesh", !worker_running && core_weights_ready && !text_is_empty(current_image))) {
         if (start_worker(shared, options, VIEWER_JOB_MESH, current_image, worker_thread) && thread_active != NULL) *thread_active = 1;
     }
     y += 50.0f;
-    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Generate Texture", !worker_running && mesh_ready)) {
+    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Generate Texture", !worker_running && core_weights_ready && mesh_ready)) {
         if (start_worker(shared, options, VIEWER_JOB_TEXTURE, current_image, worker_thread) && thread_active != NULL) *thread_active = 1;
     }
     y += 50.0f;
@@ -2563,11 +2969,16 @@ static void draw_left_panel(
     EndScissorMode();
 
     char status[128];
-    snprintf(status, sizeof(status), "BG %s  Mesh %s  Tex %s  Post %s", bg_ready ? "ok" : "-", mesh_ready ? "ok" : "-", texture_ready ? "ok" : "-", post_ready ? "ok" : "-");
+    snprintf(status, sizeof(status), "Weights %s  BG %s  Mesh %s  Tex %s  Post %s",
+        core_weights_ready ? "ok" : "-",
+        bg_ready ? "ok" : "-",
+        mesh_ready ? "ok" : "-",
+        texture_ready ? "ok" : "-",
+        post_ready ? "ok" : "-");
     if (ui->panel_scroll > 1.0f) {
         DrawRectangleRounded((Rectangle) {panel.x + panel.width - 8.0f, 70.0f, 4.0f, GetScreenHeight() - 110.0f}, 0.5f, 4, (Color) {42, 49, 58, 180});
         float thumb_h = fmaxf(54.0f, (GetScreenHeight() - 110.0f) * 0.62f);
-        float thumb_y = 70.0f + (GetScreenHeight() - 110.0f - thumb_h) * (ui->panel_scroll / 390.0f);
+        float thumb_y = 70.0f + (GetScreenHeight() - 110.0f - thumb_h) * (ui->panel_scroll / 500.0f);
         DrawRectangleRounded((Rectangle) {panel.x + panel.width - 8.0f, thumb_y, 4.0f, thumb_h}, 0.5f, 4, (Color) {101, 205, 196, 210});
     }
     DrawText(status, (int) panel.x + 18, GetScreenHeight() - 28, 13, (Color) {139, 149, 158, 255});
@@ -2587,8 +2998,8 @@ static Texture2D reload_texture_if_changed(Texture2D current, char * loaded_path
         copy_text(preview_path, sizeof(preview_path), desired_path);
         if (path_has_ext_ci(desired_path, ".webp")) {
             char tmp[VIEWER_MAX_PATH];
-            int n = snprintf(tmp, sizeof(tmp), "/tmp/trellis_viewer_preview_%ld.png", (long) getpid());
-            if (n >= 0 && (size_t) n < sizeof(tmp) && convert_webp_to_png(desired_path, tmp)) {
+            if (trellis_make_temp_path(tmp, sizeof(tmp), "trellis_viewer_preview", ".png") &&
+                convert_webp_to_png(desired_path, tmp)) {
                 copy_text(preview_path, sizeof(preview_path), tmp);
             }
         }
@@ -2614,11 +3025,17 @@ int main(int argc, char ** argv) {
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.mutex, NULL);
     copy_text(shared.current_image_path, sizeof(shared.current_image_path), options.image_path);
-    copy_text(shared.stage, sizeof(shared.stage), "Ready");
-    copy_text(shared.detail, sizeof(shared.detail), "drop an image or start a stage");
+    char initial_issue[256];
+    if (viewer_weights_ready(&options, 1, initial_issue, sizeof(initial_issue))) {
+        copy_text(shared.stage, sizeof(shared.stage), "Ready");
+        copy_text(shared.detail, sizeof(shared.detail), text_is_empty(options.weights_dir) ? options.model_dir : options.weights_dir);
+    } else {
+        copy_text(shared.stage, sizeof(shared.stage), "Weights incomplete");
+        copy_text(shared.detail, sizeof(shared.detail), initial_issue);
+    }
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
-    InitWindow(options.width, options.height, "trellis-viewer");
+    InitWindow(options.width, options.height, "TRELLIS Local");
     SetTargetFPS(60);
 
     viewer_ui_state ui;
@@ -2667,32 +3084,46 @@ int main(int argc, char ** argv) {
         if (panel_w > 430.0f) panel_w = 430.0f;
         Rectangle panel = {0.0f, 0.0f, panel_w, (float) screen_h};
         Rectangle viewport = {panel_w, 0.0f, (float) screen_w - panel_w, (float) screen_h};
-        Rectangle image_drop_box = {panel.x + 18.0f, panel.y + 76.0f - ui.panel_scroll, panel.width - 36.0f, 168.0f};
+        Rectangle image_drop_box = {panel.x + 18.0f, panel.y + 145.0f - ui.panel_scroll, panel.width - 36.0f, 168.0f};
         int image_box_hot = CheckCollisionPointRec(GetMousePosition(), image_drop_box);
 
         char selected_path[VIEWER_MAX_PATH];
+        char selected_weights[VIEWER_MAX_PATH];
         selected_path[0] = '\0';
+        selected_weights[0] = '\0';
         pthread_mutex_lock(&shared.mutex);
         if (shared.selected_image_pending) {
             copy_text(selected_path, sizeof(selected_path), shared.selected_image_path);
             shared.selected_image_path[0] = '\0';
             shared.selected_image_pending = 0;
         }
+        if (shared.selected_weights_pending) {
+            copy_text(selected_weights, sizeof(selected_weights), shared.selected_weights_dir);
+            shared.selected_weights_dir[0] = '\0';
+            shared.selected_weights_pending = 0;
+        }
         pthread_mutex_unlock(&shared.mutex);
         if (!text_is_empty(selected_path) && !running) {
             set_candidate_image(&options, &shared, selected_path, &mesh_display, &voxel_display);
             copy_text(desired_image, sizeof(desired_image), selected_path);
         }
+        if (!text_is_empty(selected_weights) && !running) {
+            set_weights_dir(&options, &shared, selected_weights, &mesh_display, &voxel_display);
+        }
 
         if (!input_busy && image_box_hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            start_file_picker(&shared);
+            start_file_picker(&shared, VIEWER_PICKER_IMAGE);
         }
 
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
-            if (!input_busy && image_box_hot && dropped.count > 0 && dropped.paths[0] != NULL) {
-                set_candidate_image(&options, &shared, dropped.paths[0], &mesh_display, &voxel_display);
-                copy_text(desired_image, sizeof(desired_image), dropped.paths[0]);
+            if (!input_busy && dropped.count > 0 && dropped.paths[0] != NULL) {
+                if (viewer_dir_exists(dropped.paths[0])) {
+                    set_weights_dir(&options, &shared, dropped.paths[0], &mesh_display, &voxel_display);
+                } else if (image_box_hot) {
+                    set_candidate_image(&options, &shared, dropped.paths[0], &mesh_display, &voxel_display);
+                    copy_text(desired_image, sizeof(desired_image), dropped.paths[0]);
+                }
             }
             UnloadDroppedFiles(dropped);
         }

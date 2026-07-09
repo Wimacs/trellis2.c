@@ -387,6 +387,7 @@ def main() -> int:
         print(f"Run with --dino  {output_dir / 'dinov3-vitl16-pretrain-lvd1689m'}")
     if "BiRefNet" in downloaded_names:
         print(f"Run with --birefnet {output_dir / 'BiRefNet' / 'BiRefNet-F16.gguf'}")
+    print(f"GUI weights folder: {output_dir}")
     return 0
 
 

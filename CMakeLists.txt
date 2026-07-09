@@ -39,7 +39,7 @@ endif()
 
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
-option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib snapshot viewers" ON)
+option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib GUI" ON)
 option(TRELLIS2_C_ENABLE_TENSOR_CORES "Prefer tensor-core capable kernels when 16-bit data and hardware support are available" ON)
 option(TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE "Build Vulkan glTF texture baking independent of the inference backend" ON)
 
@@ -629,63 +629,23 @@ if (TRELLIS2_C_BUILD_TOOLS)
     endif()
 
     if (TARGET raylib)
-        add_executable(trellis-live
-            tools/viewers/trellis_live.c
-            tools/debug/trellis_infer.c
-            tools/viewers/trellis_structured_latent_mesh_live_viewer.c
-            ${TRELLIS_TOOL_COMMON_SOURCES}
-        )
-        target_compile_definitions(trellis-live PRIVATE TRELLIS_TOOL_LIBRARY)
+        add_executable(trellis-gui tools/trellis_viewer.c)
+        target_include_directories(trellis-gui PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
+            "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
+        target_link_libraries(trellis-gui PRIVATE trellis2_c ggml raylib)
         if (WIN32)
-            target_compile_definitions(trellis-live PRIVATE NOGDI NOUSER)
+            target_compile_definitions(trellis-gui PRIVATE NOGDI NOUSER)
+            set_target_properties(trellis-gui PROPERTIES WIN32_EXECUTABLE TRUE)
+            target_link_options(trellis-gui PRIVATE /ENTRY:mainCRTStartup)
+            add_custom_command(TARGET trellis-gui POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:trellis-gui>
+                    $<TARGET_FILE_DIR:trellis-gui>
+                COMMAND_EXPAND_LISTS)
         endif()
-        target_include_directories(trellis-live PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
-        target_link_libraries(trellis-live PRIVATE trellis2_c ggml raylib)
         if (UNIX)
-            target_link_libraries(trellis-live PRIVATE m)
-        endif()
-
-        if (NOT WIN32)
-            add_executable(trellis-viewer tools/trellis_viewer.c)
-            target_include_directories(trellis-viewer PRIVATE
-                "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
-                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
-            target_link_libraries(trellis-viewer PRIVATE trellis2_c ggml raylib)
-            if (UNIX)
-                target_link_libraries(trellis-viewer PRIVATE m pthread)
-            endif()
-        else()
-            message(STATUS "Skipping trellis-viewer on Windows; use trellis-live or the terminal tools")
-        endif()
-
-        add_executable(trellis-voxel-viewer tools/viewers/trellis_voxel_viewer.c)
-        if (WIN32)
-            target_compile_definitions(trellis-voxel-viewer PRIVATE NOGDI NOUSER)
-        endif()
-        target_include_directories(trellis-voxel-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-        target_link_libraries(trellis-voxel-viewer PRIVATE raylib)
-        if (UNIX)
-            target_link_libraries(trellis-voxel-viewer PRIVATE m)
-        endif()
-
-        add_executable(trellis-mesh-viewer tools/viewers/trellis_mesh_viewer.c)
-        if (WIN32)
-            target_compile_definitions(trellis-mesh-viewer PRIVATE NOGDI NOUSER)
-        endif()
-        target_include_directories(trellis-mesh-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-        target_link_libraries(trellis-mesh-viewer PRIVATE raylib)
-        if (UNIX)
-            target_link_libraries(trellis-mesh-viewer PRIVATE m)
-        endif()
-
-        add_executable(trellis-structured-latent-mesh-live-viewer tools/viewers/trellis_structured_latent_mesh_live_viewer.c)
-        if (WIN32)
-            target_compile_definitions(trellis-structured-latent-mesh-live-viewer PRIVATE NOGDI NOUSER)
-        endif()
-        target_include_directories(trellis-structured-latent-mesh-live-viewer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
-        target_link_libraries(trellis-structured-latent-mesh-live-viewer PRIVATE trellis2_c ggml raylib)
-        if (UNIX)
-            target_link_libraries(trellis-structured-latent-mesh-live-viewer PRIVATE m)
+            target_link_libraries(trellis-gui PRIVATE m pthread)
         endif()
     endif()
 endif()
