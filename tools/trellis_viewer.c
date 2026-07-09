@@ -30,6 +30,7 @@ extern int stbi_write_png(char const * filename, int w, int h, int comp, const v
 #define VIEWER_MAX_PATH 4096
 #define VIEWER_MESH_CHUNK_FACES 120000
 #define VIEWER_MAX_PREVIEW_VOXELS 18000
+#define VIEWER_PREVIEW_AABB_SIZE 2.15f
 
 typedef enum viewer_job_type {
     VIEWER_JOB_NONE = 0,
@@ -137,6 +138,11 @@ typedef struct viewer_shared {
     char error[512];
     float progress;
     int indeterminate;
+    char progress_label[128];
+    char progress_detail[384];
+    int progress_step;
+    int progress_steps;
+    int64_t progress_step_us;
     viewer_snapshot snapshot;
     viewer_artifacts artifacts;
     char uv_texture_path[VIEWER_MAX_PATH];
@@ -578,6 +584,14 @@ static void viewer_artifacts_free(viewer_artifacts * artifacts) {
     memset(artifacts, 0, sizeof(*artifacts));
 }
 
+static void shared_reset_step_progress_locked(viewer_shared * shared) {
+    shared->progress_label[0] = '\0';
+    shared->progress_detail[0] = '\0';
+    shared->progress_step = 0;
+    shared->progress_steps = 0;
+    shared->progress_step_us = 0;
+}
+
 static void shared_set_stage(
     viewer_shared * shared,
     const char * stage,
@@ -589,6 +603,23 @@ static void shared_set_stage(
     copy_text(shared->detail, sizeof(shared->detail), detail);
     shared->progress = progress;
     shared->indeterminate = indeterminate;
+    shared_reset_step_progress_locked(shared);
+    pthread_mutex_unlock(&shared->mutex);
+}
+
+static void shared_set_step_plan(
+    viewer_shared * shared,
+    const char * label,
+    int steps,
+    const char * detail) {
+    pthread_mutex_lock(&shared->mutex);
+    copy_text(shared->progress_label, sizeof(shared->progress_label), label);
+    copy_text(shared->progress_detail, sizeof(shared->progress_detail), detail);
+    shared->progress_step = 0;
+    shared->progress_steps = steps > 0 ? steps : 0;
+    shared->progress_step_us = 0;
+    shared->progress = 0.0f;
+    shared->indeterminate = 0;
     pthread_mutex_unlock(&shared->mutex);
 }
 
@@ -599,6 +630,7 @@ static void shared_set_error(viewer_shared * shared, const char * stage, const c
     copy_text(shared->error, sizeof(shared->error), message);
     shared->progress = 0.0f;
     shared->indeterminate = 0;
+    shared_reset_step_progress_locked(shared);
     pthread_mutex_unlock(&shared->mutex);
 }
 
@@ -631,6 +663,24 @@ static void viewer_env_override_end(const viewer_env_override * env) {
     } else {
         unsetenv(env->name);
     }
+}
+
+static void viewer_progress_step_callback(const trellis_progress_step_event * event, void * user_data) {
+    viewer_shared * shared = (viewer_shared *) user_data;
+    if (shared == NULL || event == NULL || event->steps <= 0) {
+        return;
+    }
+    pthread_mutex_lock(&shared->mutex);
+    copy_text(shared->progress_label, sizeof(shared->progress_label), event->label);
+    copy_text(shared->progress_detail, sizeof(shared->progress_detail), event->detail);
+    shared->progress_step = event->step;
+    shared->progress_steps = event->steps;
+    shared->progress_step_us = event->step_us;
+    shared->progress = (float) event->step / (float) event->steps;
+    if (shared->progress < 0.0f) shared->progress = 0.0f;
+    if (shared->progress > 1.0f) shared->progress = 1.0f;
+    shared->indeterminate = 0;
+    pthread_mutex_unlock(&shared->mutex);
 }
 
 static int sampled_index_i64(int64_t i, int64_t count, int max_count) {
@@ -863,7 +913,7 @@ static void publish_mesh_snapshot(
         (minv[2] + maxv[2]) * 0.5f,
     };
     float extent = fmaxf(fmaxf(maxv[0] - minv[0], maxv[1] - minv[1]), maxv[2] - minv[2]);
-    float scale = extent > 1e-6f ? 2.15f / extent : 1.0f;
+    float scale = extent > 1e-6f ? VIEWER_PREVIEW_AABB_SIZE / extent : 1.0f;
 
     if (mesh->n_faces > (int64_t) INT_MAX / 3) {
         shared_set_error(shared, "Mesh too large", "mesh has too many faces for the current raylib preview buffer");
@@ -1397,14 +1447,16 @@ static trellis_status run_mesh_job(viewer_worker_args * args) {
     memset(&next, 0, sizeof(next));
     next.pipeline_resolution = options->resolution;
 
+    const int sparse_steps = options->sparse_structure_steps > 0 ? options->sparse_structure_steps : 12;
     shared_set_stage(shared, "Sparse structure", "image -> sparse voxels", 0.10f, 1);
+    shared_set_step_plan(shared, "sparse structure", sparse_steps, "waiting for first denoise step");
     trellis_sparse_structure_options sparse_options;
     memset(&sparse_options, 0, sizeof(sparse_options));
     sparse_options.model_dir = options->model_dir;
     sparse_options.dino_dir = options->dino_dir;
     sparse_options.image_path = prepared_image;
     sparse_options.latent_size = options->latent_size > 0 ? options->latent_size : 16;
-    sparse_options.steps = options->sparse_structure_steps > 0 ? options->sparse_structure_steps : 12;
+    sparse_options.steps = sparse_steps;
     sparse_options.cond_resolution = options->cond_resolution;
     sparse_options.sparse_resolution = options->sparse_resolution;
     sparse_options.seed = options->seed == 0 ? 1u : options->seed;
@@ -1423,7 +1475,9 @@ static trellis_status run_mesh_job(viewer_worker_args * args) {
     trellis_pipeline_model_cache_unpin_all(cache_initialized ? &cache : NULL);
     publish_voxel_snapshot(shared, next.sparse.coords_bxyz, next.sparse.n_coords, next.sparse.resolution, "Sparse voxel intermediate");
 
+    const int shape_steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
     shared_set_stage(shared, "Shape denoise", "sparse voxels -> shape latent", 0.38f, 1);
+    shared_set_step_plan(shared, "structured latent shape", shape_steps, "waiting for first denoise step");
     trellis_structured_latent_options shape_options;
     memset(&shape_options, 0, sizeof(shape_options));
     shape_options.model_dir = options->model_dir;
@@ -1437,7 +1491,7 @@ static trellis_status run_mesh_job(viewer_worker_args * args) {
     shape_options.cond_tokens = next.sparse.cond_tokens;
     shape_options.noise_seed = options->noise_seed == 0 ? 18u : options->noise_seed;
     shape_options.resolution = options->resolution;
-    shape_options.steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
+    shape_options.steps = shape_steps;
     shape_options.rescale_t = options->rescale_t > 0.0f ? options->rescale_t : 3.0f;
     shape_options.guidance_strength = options->guidance_strength;
     shape_options.guidance_rescale = options->guidance_rescale;
@@ -1543,7 +1597,9 @@ static trellis_status run_texture_job(viewer_worker_args * args) {
     memset(&texture_latent, 0, sizeof(texture_latent));
     memset(&pbr_voxels, 0, sizeof(pbr_voxels));
 
+    const int texture_steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
     shared_set_stage(shared, "Texture denoise", "image + shape -> texture latent", 0.20f, 1);
+    shared_set_step_plan(shared, "structured latent texture", texture_steps, "waiting for first denoise step");
     pthread_mutex_lock(&shared->mutex);
     viewer_artifacts * artifacts = &shared->artifacts;
     int ready = shared->mesh_ready && artifacts->has_mesh && artifacts->has_shape && artifacts->has_sparse;
@@ -1567,7 +1623,7 @@ static trellis_status run_texture_job(viewer_worker_args * args) {
     texture_options.concat_channels = artifacts->shape_latent.channels;
     texture_options.noise_seed = options->noise_seed == 0 ? 19u : options->noise_seed + 1u;
     texture_options.resolution = artifacts->shape_latent.resolution;
-    texture_options.steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
+    texture_options.steps = texture_steps;
     texture_options.rescale_t = 3.0f;
     texture_options.guidance_strength = 1.0f;
     texture_options.guidance_rescale = 0.0f;
@@ -1676,6 +1732,7 @@ static void * worker_main(void * user_data) {
     viewer_worker_args * args = (viewer_worker_args *) user_data;
     viewer_shared * shared = args->shared;
     shared_clear_error(shared);
+    trellis_set_progress_step_callback(viewer_progress_step_callback, shared);
     trellis_status status = TRELLIS_STATUS_OK;
 
     if (args->job == VIEWER_JOB_REMOVE_BG) {
@@ -1716,6 +1773,7 @@ static void * worker_main(void * user_data) {
         shared_set_error(shared, "Error", message);
     }
 
+    trellis_set_progress_step_callback(NULL, NULL);
     pthread_mutex_lock(&shared->mutex);
     shared->worker_running = 0;
     shared->worker_done_token += 1;
@@ -1734,6 +1792,7 @@ static int start_worker(viewer_shared * shared, const viewer_options * options, 
     shared->progress = 0.0f;
     shared->indeterminate = 1;
     shared->error[0] = '\0';
+    shared_reset_step_progress_locked(shared);
     pthread_mutex_unlock(&shared->mutex);
 
     viewer_worker_args * args = (viewer_worker_args *) calloc(1, sizeof(*args));
@@ -2135,6 +2194,14 @@ static void draw_voxels(const display_voxels * voxels) {
     }
 }
 
+static void draw_ground_grid(void) {
+    const float floor_y = -VIEWER_PREVIEW_AABB_SIZE * 0.5f;
+    rlPushMatrix();
+    rlTranslatef(0.0f, floor_y, 0.0f);
+    DrawGrid(18, 0.25f);
+    rlPopMatrix();
+}
+
 static Camera3D make_arcball_camera(const viewer_ui_state * ui) {
     float radius_xz = cosf(ui->pitch) * ui->distance;
     Camera3D camera = {0};
@@ -2169,39 +2236,201 @@ static void update_arcball(viewer_ui_state * ui, Rectangle viewport) {
     }
 }
 
+static void format_step_speed(char * dst, size_t dst_size, int64_t step_us) {
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    double seconds = step_us <= 0 ? 0.0 : (double) step_us / 1000000.0;
+    if (seconds > 0.0 && seconds < 1.0) {
+        snprintf(dst, dst_size, "%.2fit/s", 1.0 / seconds);
+    } else if (seconds > 0.0) {
+        snprintf(dst, dst_size, "%.2fs/it", seconds);
+    } else {
+        copy_text(dst, dst_size, "--");
+    }
+}
+
+static void draw_text_elided(const char * text, int x, int y, int font_size, int max_width, Color color) {
+    if (text_is_empty(text) || max_width <= 0) {
+        return;
+    }
+    char buf[512];
+    copy_text(buf, sizeof(buf), text);
+    if (MeasureText(buf, font_size) <= max_width) {
+        DrawText(buf, x, y, font_size, color);
+        return;
+    }
+    const char * ellipsis = "...";
+    const int ellipsis_w = MeasureText(ellipsis, font_size);
+    size_t n = strlen(buf);
+    while (n > 0 && MeasureText(buf, font_size) + ellipsis_w > max_width) {
+        buf[--n] = '\0';
+    }
+    if (n == 0) {
+        return;
+    }
+    strncat(buf, ellipsis, sizeof(buf) - strlen(buf) - 1u);
+    DrawText(buf, x, y, font_size, color);
+}
+
+static void draw_square_progress_bar(
+    Rectangle r,
+    float progress,
+    int indeterminate,
+    int running,
+    int step,
+    int steps,
+    float time_s,
+    int error_state) {
+    const float gap = 3.0f;
+    float block = 10.0f;
+    int count = (int) floorf((r.width + gap) / (block + gap));
+    if (count < 8) {
+        count = 8;
+        block = floorf((r.width - gap * (float) (count - 1)) / (float) count);
+    }
+    if (block < 3.0f) {
+        return;
+    }
+    float total_w = (float) count * block + (float) (count - 1) * gap;
+    float x0 = r.x + floorf((r.width - total_w) * 0.5f);
+    float y0 = r.y + floorf((r.height - block) * 0.5f);
+
+    int head = -1;
+    int filled = 0;
+    if (steps > 0) {
+        if (step < 0) step = 0;
+        if (step > steps) step = steps;
+        filled = (int) floorf((float) step * (float) count / (float) steps);
+        if (filled < 0) filled = 0;
+        if (filled > count) filled = count;
+        if (step > 0 && step < steps) {
+            head = (int) ceilf((float) step * (float) count / (float) steps) - 1;
+            if (head < 0) head = 0;
+            if (head >= count) head = count - 1;
+        }
+    } else if (indeterminate && running) {
+        head = (int) floorf(fmodf(time_s * 14.0f, (float) count));
+    } else {
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 1.0f) progress = 1.0f;
+        filled = (int) floorf(progress * (float) count + 0.5f);
+        if (filled < 0) filled = 0;
+        if (filled > count) filled = count;
+    }
+
+    Color empty = {35, 42, 51, 235};
+    Color done = error_state ? (Color) {255, 128, 112, 245} : (Color) {92, 185, 177, 245};
+    Color bright = error_state ? (Color) {255, 176, 160, 255} : (Color) {145, 242, 225, 255};
+    for (int i = 0; i < count; ++i) {
+        Color c = empty;
+        if (steps > 0 || !(indeterminate && running)) {
+            if (i < filled) {
+                c = done;
+            }
+            if (i == head) {
+                c = bright;
+            }
+        } else {
+            int d = head - i;
+            if (d < 0) d += count;
+            if (i == head) {
+                c = bright;
+            } else if (d > 0 && d <= 5) {
+                unsigned char fade = (unsigned char) (220 - d * 24);
+                c = error_state ? (Color) {255, 128, 112, fade} : (Color) {92, 185, 177, fade};
+            }
+        }
+        Rectangle cell = {x0 + (float) i * (block + gap), y0, block, block};
+        DrawRectangleRounded(cell, 0.18f, 4, c);
+    }
+}
+
 static void draw_stage_overlay(Rectangle viewport, viewer_shared * shared, float time_s) {
     char stage[128];
     char detail[384];
     char error[512];
+    char progress_label[128];
+    char progress_detail[384];
     float progress;
     int indeterminate;
     int running;
+    int progress_step;
+    int progress_steps;
+    int64_t progress_step_us;
     pthread_mutex_lock(&shared->mutex);
     copy_text(stage, sizeof(stage), shared->stage);
     copy_text(detail, sizeof(detail), shared->detail);
     copy_text(error, sizeof(error), shared->error);
+    copy_text(progress_label, sizeof(progress_label), shared->progress_label);
+    copy_text(progress_detail, sizeof(progress_detail), shared->progress_detail);
     progress = shared->progress;
     indeterminate = shared->indeterminate;
     running = shared->worker_running;
+    progress_step = shared->progress_step;
+    progress_steps = shared->progress_steps;
+    progress_step_us = shared->progress_step_us;
     pthread_mutex_unlock(&shared->mutex);
 
-    Rectangle panel = {viewport.x + viewport.width - 370.0f, viewport.y + 18.0f, 350.0f, 92.0f};
+    const int has_step = running && progress_steps > 0;
+    float panel_w = viewport.width < 460.0f ? viewport.width - 36.0f : 430.0f;
+    if (panel_w < 320.0f) panel_w = 320.0f;
+    Rectangle panel = {viewport.x + viewport.width - panel_w - 20.0f, viewport.y + 18.0f, panel_w, 126.0f};
     DrawRectangleRounded(panel, 0.08f, 8, (Color) {15, 18, 23, 228});
     DrawRectangleRoundedLines(panel, 0.08f, 8, (Color) {72, 86, 96, 220});
-    DrawText(text_is_empty(stage) ? "Ready" : stage, (int) panel.x + 16, (int) panel.y + 13, 20, RAYWHITE);
-    DrawText(text_is_empty(error) ? detail : error, (int) panel.x + 16, (int) panel.y + 40, 14, text_is_empty(error) ? (Color) {183, 193, 202, 255} : (Color) {255, 128, 112, 255});
-    Rectangle bar = {panel.x + 16.0f, panel.y + 66.0f, panel.width - 32.0f, 10.0f};
-    DrawRectangleRounded(bar, 0.5f, 8, (Color) {36, 43, 51, 255});
-    float fill = progress;
-    if (indeterminate && running) {
-        fill = 0.22f + 0.12f * sinf(time_s * 3.1f);
-        float x = bar.x + fmodf(time_s * 130.0f, bar.width + 80.0f) - 80.0f;
-        DrawRectangleRounded((Rectangle) {x, bar.y, 80.0f, bar.height}, 0.5f, 8, (Color) {101, 205, 196, 235});
+
+    char badge[64];
+    if (has_step) {
+        snprintf(badge, sizeof(badge), "%02d/%02d", progress_step, progress_steps);
+    } else if (running) {
+        copy_text(badge, sizeof(badge), "working");
     } else {
-        if (fill < 0.0f) fill = 0.0f;
-        if (fill > 1.0f) fill = 1.0f;
-        DrawRectangleRounded((Rectangle) {bar.x, bar.y, bar.width * fill, bar.height}, 0.5f, 8, (Color) {101, 205, 196, 235});
+        snprintf(badge, sizeof(badge), "%3d%%", (int) lrintf(fmaxf(0.0f, fminf(1.0f, progress)) * 100.0f));
     }
+    int badge_w = MeasureText(badge, 18);
+    DrawText(badge, (int) (panel.x + panel.width - 16.0f - (float) badge_w), (int) panel.y + 16, 18, (Color) {116, 221, 211, 255});
+    draw_text_elided(
+        text_is_empty(stage) ? "Ready" : stage,
+        (int) panel.x + 16,
+        (int) panel.y + 13,
+        20,
+        (int) panel.width - 44 - badge_w,
+        RAYWHITE);
+
+    const char * line = text_is_empty(error) ? (has_step && !text_is_empty(progress_label) ? progress_label : detail) : error;
+    draw_text_elided(
+        line,
+        (int) panel.x + 16,
+        (int) panel.y + 43,
+        14,
+        (int) panel.width - 32,
+        text_is_empty(error) ? (Color) {183, 193, 202, 255} : (Color) {255, 128, 112, 255});
+
+    draw_square_progress_bar(
+        (Rectangle) {panel.x + 16.0f, panel.y + 68.0f, panel.width - 32.0f, 15.0f},
+        progress,
+        indeterminate,
+        running,
+        has_step ? progress_step : 0,
+        has_step ? progress_steps : 0,
+        time_s,
+        !text_is_empty(error));
+
+    char subline[512];
+    if (has_step) {
+        char speed[64];
+        format_step_speed(speed, sizeof(speed), progress_step_us);
+        snprintf(
+            subline,
+            sizeof(subline),
+            "%s%s%s",
+            speed,
+            text_is_empty(progress_detail) ? "" : "  ",
+            text_is_empty(progress_detail) ? "" : progress_detail);
+    } else {
+        copy_text(subline, sizeof(subline), text_is_empty(error) ? detail : error);
+    }
+    draw_text_elided(subline, (int) panel.x + 16, (int) panel.y + 99, 13, (int) panel.width - 32, (Color) {138, 151, 163, 255});
 }
 
 static void draw_view_options(Rectangle viewport, viewer_ui_state * ui) {
@@ -2481,9 +2710,12 @@ int main(int argc, char ** argv) {
         Camera3D camera = make_arcball_camera(&ui);
         BeginMode3D(camera);
         if (ui.grid) {
-            DrawGrid(18, 0.25f);
+            draw_ground_grid();
         }
-        DrawCubeWiresV((Vector3) {0, 0, 0}, (Vector3) {2.15f, 2.15f, 2.15f}, (Color) {83, 94, 106, 135});
+        DrawCubeWiresV(
+            (Vector3) {0, 0, 0},
+            (Vector3) {VIEWER_PREVIEW_AABB_SIZE, VIEWER_PREVIEW_AABB_SIZE, VIEWER_PREVIEW_AABB_SIZE},
+            (Color) {83, 94, 106, 135});
         if (voxel_display.xyz != NULL) {
             draw_voxels(&voxel_display);
         }

@@ -225,6 +225,22 @@ void trellis_progress_steps(
     int64_t step_us,
     const char * detail);
 
+typedef struct trellis_progress_step_event {
+    const char * label;
+    int step;
+    int steps;
+    int64_t step_us;
+    const char * detail;
+} trellis_progress_step_event;
+
+typedef void (*trellis_progress_step_callback)(
+    const trellis_progress_step_event * event,
+    void * user_data);
+
+void trellis_set_progress_step_callback(
+    trellis_progress_step_callback callback,
+    void * user_data);
+
 int trellis_load_tensor_store_f32(
     const trellis_backend_context * backend,
     const char * label,

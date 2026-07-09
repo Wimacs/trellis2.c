@@ -231,6 +231,16 @@ static double bytes_to_mib(uint64_t bytes) {
     return (double) bytes / (1024.0 * 1024.0);
 }
 
+static trellis_progress_step_callback g_progress_step_callback = NULL;
+static void * g_progress_step_user_data = NULL;
+
+void trellis_set_progress_step_callback(
+    trellis_progress_step_callback callback,
+    void * user_data) {
+    g_progress_step_callback = callback;
+    g_progress_step_user_data = user_data;
+}
+
 static void print_progress_line(
     const char * label,
     int step,
@@ -295,6 +305,16 @@ void trellis_progress_steps(
     int steps,
     int64_t step_us,
     const char * detail) {
+    if (g_progress_step_callback != NULL) {
+        trellis_progress_step_event event;
+        event.label = label;
+        event.step = step;
+        event.steps = steps;
+        event.step_us = step_us;
+        event.detail = detail;
+        g_progress_step_callback(&event, g_progress_step_user_data);
+    }
+
     char speed_text[96];
     double seconds = step_us <= 0 ? 0.0 : (double) step_us / 1000000.0;
     if (seconds > 0.0 && seconds < 1.0) {
