@@ -29,10 +29,6 @@
 #endif
 
 #ifdef _WIN32
-int trellis_win32_select_folder(char * out, size_t out_size, const wchar_t * title);
-#endif
-
-#ifdef _WIN32
 typedef CRITICAL_SECTION pthread_mutex_t;
 typedef HANDLE pthread_t;
 
@@ -129,7 +125,6 @@ typedef enum viewer_job_type {
 
 typedef enum viewer_picker_kind {
     VIEWER_PICKER_IMAGE = 0,
-    VIEWER_PICKER_WEIGHTS,
 } viewer_picker_kind;
 
 typedef enum viewer_snapshot_kind {
@@ -218,7 +213,6 @@ typedef struct viewer_shared {
     int worker_done_token;
     int file_picker_running;
     int selected_image_pending;
-    int selected_weights_pending;
     int close_requested;
     int bg_ready;
     int mesh_ready;
@@ -227,7 +221,6 @@ typedef struct viewer_shared {
     char current_image_path[VIEWER_MAX_PATH];
     char processed_image_path[VIEWER_MAX_PATH];
     char selected_image_path[VIEWER_MAX_PATH];
-    char selected_weights_dir[VIEWER_MAX_PATH];
     char stage[128];
     char detail[384];
     char error[512];
@@ -420,20 +413,6 @@ static int viewer_file_contains_text(const char * path, const char * needle) {
     return strstr(buf, needle) != NULL;
 }
 
-static int viewer_file_has_magic(const char * path, const unsigned char * magic, size_t magic_size) {
-    if (text_is_empty(path) || magic == NULL || magic_size == 0 || magic_size > 32u) {
-        return 0;
-    }
-    unsigned char buf[32];
-    FILE * f = fopen(path, "rb");
-    if (f == NULL) {
-        return 0;
-    }
-    size_t n = fread(buf, 1, magic_size, f);
-    fclose(f);
-    return n == magic_size && memcmp(buf, magic, magic_size) == 0;
-}
-
 static int viewer_trellis_model_dir_valid(const char * dir) {
     char path[VIEWER_MAX_PATH];
     if (!viewer_join_path(dir, "pipeline.json", path, sizeof(path)) ||
@@ -483,12 +462,10 @@ static void viewer_weight_scan_visit_dir(viewer_weight_scan * scan, const char *
 }
 
 static void viewer_weight_scan_visit_file(viewer_weight_scan * scan, const char * path) {
-    static const unsigned char gguf_magic[4] = { 'G', 'G', 'U', 'F' };
     if (scan == NULL || text_is_empty(path) || scan->has_birefnet) {
         return;
     }
-    if ((path_has_ext_ci(path, ".gguf") || viewer_file_has_magic(path, gguf_magic, sizeof(gguf_magic))) &&
-        viewer_file_has_magic(path, gguf_magic, sizeof(gguf_magic))) {
+    if (path_has_ext_ci(path, ".gguf")) {
         copy_text(scan->birefnet_path, sizeof(scan->birefnet_path), path);
         scan->has_birefnet = 1;
     }
@@ -506,8 +483,13 @@ static void viewer_scan_weights_recursive(viewer_weight_scan * scan, const char 
         return;
     }
     scan->visited_dirs += 1;
+    int had_model = scan->has_model;
+    int had_dino = scan->has_dino;
     viewer_weight_scan_visit_dir(scan, dir);
     if (viewer_weight_scan_done(scan)) {
+        return;
+    }
+    if ((!had_model && scan->has_model) || (!had_dino && scan->has_dino)) {
         return;
     }
 
@@ -571,10 +553,17 @@ static int viewer_scan_weights_pool(const char * selected, viewer_weight_scan * 
         return 0;
     }
     memset(out, 0, sizeof(*out));
+    if (!viewer_dir_exists(selected)) {
+        return 0;
+    }
 
     char current[VIEWER_MAX_PATH];
     copy_text(current, sizeof(current), selected);
+    int found_component = 0;
     for (int depth = 0; depth < 6 && !text_is_empty(current); ++depth) {
+        if (!viewer_dir_exists(current)) {
+            break;
+        }
         viewer_weight_scan scan;
         memset(&scan, 0, sizeof(scan));
         copy_text(scan.root_dir, sizeof(scan.root_dir), current);
@@ -582,6 +571,11 @@ static int viewer_scan_weights_pool(const char * selected, viewer_weight_scan * 
         if (scan.has_model && scan.has_dino) {
             *out = scan;
             return 1;
+        }
+        if (scan.has_model || scan.has_dino || scan.has_birefnet) {
+            found_component = 1;
+        } else if (!found_component) {
+            break;
         }
         char parent[VIEWER_MAX_PATH];
         if (!viewer_parent_path(current, parent, sizeof(parent)) || strcmp(parent, current) == 0) {
@@ -634,7 +628,7 @@ static int viewer_weights_ready(const viewer_options * options, int require_bire
         issue[0] = '\0';
     }
     if (options == NULL || text_is_empty(options->model_dir) || text_is_empty(options->dino_dir)) {
-        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "select a TRELLIS.2 weights folder");
+        if (issue != NULL && issue_size > 0) snprintf(issue, issue_size, "warning: place TRELLIS.2 near the app or launch with --weights DIR");
         return 0;
     }
     if (!viewer_dir_exists(options->model_dir)) {
@@ -664,6 +658,17 @@ static int viewer_weights_ready(const viewer_options * options, int require_bire
 static void viewer_autodetect_weights_dir(viewer_options * options) {
     if (options == NULL || !text_is_empty(options->weights_dir)) {
         return;
+    }
+    const char * env_candidates[] = {
+        getenv("TRELLIS2_WEIGHTS_DIR"),
+        getenv("TRELLIS_WEIGHTS_DIR"),
+        NULL,
+    };
+    for (int i = 0; env_candidates[i] != NULL; ++i) {
+        if (viewer_weights_root_looks_valid(env_candidates[i])) {
+            viewer_apply_weights_dir(options, env_candidates[i]);
+            return;
+        }
     }
     const char * relative_candidates[] = {
         "../TRELLIS.2",
@@ -896,8 +901,6 @@ static int command_available(const char * name);
 
 static void viewer_options_defaults(viewer_options * options) {
     memset(options, 0, sizeof(*options));
-    copy_text(options->model_dir, sizeof(options->model_dir), "TRELLIS.2-4B");
-    copy_text(options->dino_dir, sizeof(options->dino_dir), "dinov3-vitl16-pretrain-lvd1689m");
     copy_text(options->image_path, sizeof(options->image_path), "assets/example_image/T.png");
     copy_text(options->out_dir, sizeof(options->out_dir), "viewer_outputs");
     copy_text(options->backend, sizeof(options->backend), TRELLIS_DEFAULT_BACKEND);
@@ -925,7 +928,6 @@ static void viewer_options_defaults(viewer_options * options) {
     options->width = 1440;
     options->height = 900;
     viewer_autodetect_image_path(options);
-    viewer_autodetect_weights_dir(options);
 }
 
 static void usage(FILE * out, const char * argv0) {
@@ -933,7 +935,7 @@ static void usage(FILE * out, const char * argv0) {
         "Usage:\n"
         "  %s [--weights DIR] [--image FILE] [options]\n"
         "\n"
-        "Local raylib image-to-3D GUI. Launch without arguments, then choose a weights folder and image in the window.\n"
+        "Local raylib image-to-3D GUI. Uses auto-detected weights, or pass --weights DIR. Choose an image in the window.\n"
         "\n"
         "Core options mirror trellis-image-to-gltf:\n"
         "  --weights DIR            Folder containing downloaded TRELLIS, DINO, and optional BiRefNet weights\n"
@@ -953,17 +955,22 @@ static void usage(FILE * out, const char * argv0) {
 
 static int parse_options(int argc, char ** argv, viewer_options * options) {
     viewer_options_defaults(options);
+    int explicit_weight_source = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--weights") == 0 || strcmp(argv[i], "--weights-dir") == 0) {
             const char * dir = arg_value(argc, argv, &i);
             if (text_is_empty(dir)) return 0;
             viewer_apply_weights_dir(options, dir);
+            explicit_weight_source = 1;
         } else if (strcmp(argv[i], "--model") == 0) {
             copy_text(options->model_dir, sizeof(options->model_dir), arg_value(argc, argv, &i));
+            explicit_weight_source = 1;
         } else if (strcmp(argv[i], "--dino") == 0) {
             copy_text(options->dino_dir, sizeof(options->dino_dir), arg_value(argc, argv, &i));
+            explicit_weight_source = 1;
         } else if (strcmp(argv[i], "--birefnet") == 0) {
             copy_text(options->birefnet_path, sizeof(options->birefnet_path), arg_value(argc, argv, &i));
+            explicit_weight_source = 1;
         } else if (strcmp(argv[i], "--image") == 0 || strcmp(argv[i], "--input") == 0) {
             copy_text(options->image_path, sizeof(options->image_path), arg_value(argc, argv, &i));
         } else if (strcmp(argv[i], "--out-dir") == 0) {
@@ -1054,6 +1061,9 @@ static int parse_options(int argc, char ** argv, viewer_options * options) {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 0;
         }
+    }
+    if (!explicit_weight_source) {
+        viewer_autodetect_weights_dir(options);
     }
     if (strcmp(options->pipeline_type, "512") == 0) {
         options->resolution = 512;
@@ -2415,48 +2425,9 @@ static int open_image_file_dialog(char * out, size_t out_size, int * dialog_avai
     return 0;
 }
 
-static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_available) {
-    if (dialog_available != NULL) {
-        *dialog_available = 0;
-    }
-#ifdef _WIN32
-    if (dialog_available != NULL) {
-        *dialog_available = 1;
-    }
-    if (trellis_win32_select_folder(out, out_size, L"Select weights folder")) {
-        return 1;
-    }
-#else
-    if (command_available("zenity")) {
-        if (dialog_available != NULL) {
-            *dialog_available = 1;
-        }
-        if (read_first_line_from_command(
-                "zenity --file-selection --directory --title='Select weights folder' 2>/dev/null",
-                out,
-                out_size)) {
-            return 1;
-        }
-    }
-    if (command_available("kdialog")) {
-        if (dialog_available != NULL) {
-            *dialog_available = 1;
-        }
-        if (read_first_line_from_command(
-                "kdialog --getexistingdirectory \"$HOME\" 'Select weights folder' 2>/dev/null",
-                out,
-                out_size)) {
-            return 1;
-        }
-    }
-#endif
-    return 0;
-}
-
 static void * file_picker_main(void * user_data) {
     viewer_file_picker_args * args = (viewer_file_picker_args *) user_data;
     viewer_shared * shared = args == NULL ? NULL : args->shared;
-    viewer_picker_kind kind = args == NULL ? VIEWER_PICKER_IMAGE : args->kind;
     free(args);
     if (shared == NULL) {
         return NULL;
@@ -2464,33 +2435,22 @@ static void * file_picker_main(void * user_data) {
     char path[VIEWER_MAX_PATH];
     path[0] = '\0';
     int dialog_available = 0;
-    int selected = kind == VIEWER_PICKER_WEIGHTS ?
-        open_weights_folder_dialog(path, sizeof(path), &dialog_available) :
-        open_image_file_dialog(path, sizeof(path), &dialog_available);
+    int selected = open_image_file_dialog(path, sizeof(path), &dialog_available);
     int unsupported = 0;
     if (selected) {
-        unsupported = kind == VIEWER_PICKER_WEIGHTS ?
-            !viewer_dir_exists(path) :
-            (!FileExists(path) || !is_supported_image_path(path));
+        unsupported = !FileExists(path) || !is_supported_image_path(path);
     }
 
     pthread_mutex_lock(&shared->mutex);
-    if (selected && !unsupported && kind == VIEWER_PICKER_IMAGE) {
+    if (selected && !unsupported) {
         copy_text(shared->selected_image_path, sizeof(shared->selected_image_path), path);
         shared->selected_image_pending = 1;
-    } else if (selected && !unsupported && kind == VIEWER_PICKER_WEIGHTS) {
-        copy_text(shared->selected_weights_dir, sizeof(shared->selected_weights_dir), path);
-        shared->selected_weights_pending = 1;
     } else if (!dialog_available) {
         copy_text(shared->stage, sizeof(shared->stage), "Picker unavailable");
-        copy_text(shared->detail, sizeof(shared->detail), kind == VIEWER_PICKER_WEIGHTS ?
-            "dragging folders is supported, or pass --weights DIR" :
-            "drag an image into the candidate box");
+        copy_text(shared->detail, sizeof(shared->detail), "drag an image into the candidate box");
     } else if (unsupported) {
-        copy_text(shared->stage, sizeof(shared->stage), kind == VIEWER_PICKER_WEIGHTS ? "Unsupported weights folder" : "Unsupported image");
-        copy_text(shared->detail, sizeof(shared->detail), kind == VIEWER_PICKER_WEIGHTS ?
-            "choose the folder created by the weights download script" :
-            "use png, jpg, jpeg, webp, or bmp");
+        copy_text(shared->stage, sizeof(shared->stage), "Unsupported image");
+        copy_text(shared->detail, sizeof(shared->detail), "use png, jpg, jpeg, webp, or bmp");
     }
     shared->file_picker_running = 0;
     pthread_mutex_unlock(&shared->mutex);
@@ -2504,7 +2464,7 @@ static int start_file_picker(viewer_shared * shared, viewer_picker_kind kind) {
         return 0;
     }
     shared->file_picker_running = 1;
-    copy_text(shared->stage, sizeof(shared->stage), kind == VIEWER_PICKER_WEIGHTS ? "Select weights" : "Select image");
+    copy_text(shared->stage, sizeof(shared->stage), "Select image");
     copy_text(shared->detail, sizeof(shared->detail), "opening picker");
     pthread_mutex_unlock(&shared->mutex);
 
@@ -2575,42 +2535,6 @@ static void set_candidate_image(
     shared->snapshot.version += 1;
     copy_text(shared->stage, sizeof(shared->stage), "Image loaded");
     copy_text(shared->detail, sizeof(shared->detail), path);
-    pthread_mutex_unlock(&shared->mutex);
-    display_mesh_free(mesh_display);
-    display_voxels_free(voxel_display);
-}
-
-static void set_weights_dir(
-    viewer_options * options,
-    viewer_shared * shared,
-    const char * path,
-    display_mesh * mesh_display,
-    display_voxels * voxel_display) {
-    if (text_is_empty(path) || !viewer_dir_exists(path)) {
-        pthread_mutex_lock(&shared->mutex);
-        copy_text(shared->stage, sizeof(shared->stage), "Unsupported weights folder");
-        copy_text(shared->detail, sizeof(shared->detail), "choose the folder created by tools/download_weights.py");
-        pthread_mutex_unlock(&shared->mutex);
-        return;
-    }
-
-    viewer_apply_weights_dir(options, path);
-    char issue[256];
-    int ready = viewer_weights_ready(options, 1, issue, sizeof(issue));
-    pthread_mutex_lock(&shared->mutex);
-    shared->bg_ready = 0;
-    shared->mesh_ready = 0;
-    shared->texture_ready = 0;
-    shared->postprocess_ready = 0;
-    shared->uv_texture_path[0] = '\0';
-    shared->gltf_output_path[0] = '\0';
-    shared->uv_version += 1;
-    viewer_artifacts_free(&shared->artifacts);
-    viewer_snapshot_free(&shared->snapshot);
-    shared->snapshot.version += 1;
-    copy_text(shared->stage, sizeof(shared->stage), ready ? "Weights ready" : "Weights incomplete");
-    copy_text(shared->detail, sizeof(shared->detail), ready ? options->weights_dir : issue);
-    shared->error[0] = '\0';
     pthread_mutex_unlock(&shared->mutex);
     display_mesh_free(mesh_display);
     display_voxels_free(voxel_display);
@@ -3136,10 +3060,8 @@ static void draw_left_panel(
 
     float bw = panel.width - 36.0f;
     float y = panel.y + 76.0f - ui->panel_scroll;
-    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 38.0f}, "Weights Folder", !worker_running)) {
-        start_file_picker(shared, VIEWER_PICKER_WEIGHTS);
-    }
-    y += 44.0f;
+    DrawText("Weights", (int) panel.x + 18, (int) y, 15, (Color) {205, 211, 218, 255});
+    y += 23.0f;
     draw_text_elided(
         core_weights_ready ? (text_is_empty(options->weights_dir) ? options->model_dir : options->weights_dir) : weights_issue,
         (int) panel.x + 20,
@@ -3289,7 +3211,7 @@ int main(int argc, char ** argv) {
         copy_text(shared.stage, sizeof(shared.stage), "Ready");
         copy_text(shared.detail, sizeof(shared.detail), text_is_empty(options.weights_dir) ? options.model_dir : options.weights_dir);
     } else {
-        copy_text(shared.stage, sizeof(shared.stage), "Weights incomplete");
+        copy_text(shared.stage, sizeof(shared.stage), "Weights warning");
         copy_text(shared.detail, sizeof(shared.detail), initial_issue);
     }
 
@@ -3343,31 +3265,21 @@ int main(int argc, char ** argv) {
         if (panel_w > 430.0f) panel_w = 430.0f;
         Rectangle panel = {0.0f, 0.0f, panel_w, (float) screen_h};
         Rectangle viewport = {panel_w, 0.0f, (float) screen_w - panel_w, (float) screen_h};
-        Rectangle image_drop_box = {panel.x + 18.0f, panel.y + 145.0f - ui.panel_scroll, panel.width - 36.0f, 168.0f};
+        Rectangle image_drop_box = {panel.x + 18.0f, panel.y + 124.0f - ui.panel_scroll, panel.width - 36.0f, 168.0f};
         int image_box_hot = CheckCollisionPointRec(GetMousePosition(), image_drop_box);
 
         char selected_path[VIEWER_MAX_PATH];
-        char selected_weights[VIEWER_MAX_PATH];
         selected_path[0] = '\0';
-        selected_weights[0] = '\0';
         pthread_mutex_lock(&shared.mutex);
         if (shared.selected_image_pending) {
             copy_text(selected_path, sizeof(selected_path), shared.selected_image_path);
             shared.selected_image_path[0] = '\0';
             shared.selected_image_pending = 0;
         }
-        if (shared.selected_weights_pending) {
-            copy_text(selected_weights, sizeof(selected_weights), shared.selected_weights_dir);
-            shared.selected_weights_dir[0] = '\0';
-            shared.selected_weights_pending = 0;
-        }
         pthread_mutex_unlock(&shared.mutex);
         if (!text_is_empty(selected_path) && !running) {
             set_candidate_image(&options, &shared, selected_path, &mesh_display, &voxel_display);
             copy_text(desired_image, sizeof(desired_image), selected_path);
-        }
-        if (!text_is_empty(selected_weights) && !running) {
-            set_weights_dir(&options, &shared, selected_weights, &mesh_display, &voxel_display);
         }
 
         if (!input_busy && image_box_hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -3377,9 +3289,7 @@ int main(int argc, char ** argv) {
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
             if (!input_busy && dropped.count > 0 && dropped.paths[0] != NULL) {
-                if (viewer_dir_exists(dropped.paths[0])) {
-                    set_weights_dir(&options, &shared, dropped.paths[0], &mesh_display, &voxel_display);
-                } else if (image_box_hot) {
+                if (!viewer_dir_exists(dropped.paths[0]) && image_box_hot) {
                     set_candidate_image(&options, &shared, dropped.paths[0], &mesh_display, &voxel_display);
                     copy_text(desired_image, sizeof(desired_image), dropped.paths[0]);
                 }
