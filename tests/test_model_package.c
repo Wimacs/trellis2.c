@@ -145,6 +145,24 @@ static void test_repository_templates(void) {
     CHECK_TRUE(flow->execution.emulate_bf16_blocks == 1);
     CHECK_TRUE(trellis_model_package_find_component(&package, "naf_encoder") != NULL);
     trellis_model_package_free(&package);
+
+    CHECK_TRUE(snprintf(root, sizeof(root), "%s/models/tokenskin", TRELLIS_TEST_SOURCE_DIR) > 0);
+    CHECK_TRUE(trellis_model_package_load(root, &package) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(strcmp(package.family, "tokenskin") == 0);
+    CHECK_TRUE(strcmp(package.task, "mesh_rigging") == 0);
+    CHECK_TRUE(strcmp(package.profile, "qwen3-0.6b-fsq") == 0);
+    const trellis_model_component_instance * mesh_encoder =
+        trellis_model_package_find_component(&package, "mesh_encoder");
+    CHECK_TRUE(mesh_encoder != NULL);
+    CHECK_TRUE(strcmp(mesh_encoder->architecture, "tokenskin_michelangelo_encoder") == 0);
+    CHECK_TRUE(mesh_encoder->execution.compute_dtype == TRELLIS_DTYPE_BF16);
+    CHECK_TRUE(mesh_encoder->execution.attention == TRELLIS_ATTENTION_FLASH);
+    CHECK_TRUE(mesh_encoder->execution.flash_kv_dtype == TRELLIS_DTYPE_BF16);
+    CHECK_TRUE(trellis_model_package_find_component(
+        &package, "rig_language_model") != NULL);
+    CHECK_TRUE(trellis_model_package_find_component(
+        &package, "skin_decoder") != NULL);
+    trellis_model_package_free(&package);
 }
 
 static void test_legacy_fallback(int pixal) {

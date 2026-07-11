@@ -14,7 +14,9 @@
   <img src="img.png" alt="trellis2.c 本地工作区">
 </p>
 
-`trellis2.c` 是 TRELLIS.2 和 Pixal3D 图像转 3D 的原生推理工具，支持 CUDA 和 Vulkan。每个模型使用独立命令：`trellis2-image-to-gltf` 和 `pixal3d-image-to-gltf`。
+`trellis2.c` 支持 TRELLIS.2、Pixal3D 图像转 3D 和 TokenSkin 网格权重绑定的
+原生 CUDA/Vulkan 推理。每个模型使用一个独立可执行文件：
+`trellis2-image-to-gltf`、`pixal3d-image-to-gltf` 和 `tokenskin-rig`。
 
 ## 编译
 
@@ -115,6 +117,40 @@ Pixal3D 模型包。Pixal3D 默认使用 `1024_cascade`，命令为：
 Pixal3D 专用命令提供 `--naf`、`--fov`、`--camera-distance`、
 `--mesh-scale` 和 `--pipeline 1536_cascade`；这些参数不会出现在 TRELLIS.2
 命令中。两个命令共享底层 task、算子、vkmesh 补洞和 remesh 实现。
+
+### TokenSkin 网格权重绑定
+
+TokenSkin 使用独立的 `tokenskin-rig`，不会作为模式混入两个图像转 3D
+命令。先将官方 TokenRig Lightning checkpoint 转换为三个推理权重文件；
+转换脚本需要 Python `torch` 和 `safetensors`：
+
+```sh
+python3 tools/convert_tokenskin_weights.py \
+  /path/to/grpo_1400.ckpt \
+  models/tokenskin/ckpts
+```
+
+CUDA 构建直接运行：
+
+```sh
+./build/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-cuda.glb
+```
+
+Vulkan 构建使用相同参数，不需要额外环境变量或推理选项：
+
+```sh
+./build-vulkan/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-vulkan.glb
+```
+
+输入可以是 GLB 或 glTF，输出是包含骨骼、逆绑定矩阵、关节索引和蒙皮权重的
+自包含 GLB。当前实现会保留展平到世界坐标的网格几何和拓扑，但会重建默认
+PBR 材质；不会保留源材质、UV、纹理、节点结构和动画。
 
 Windows：
 

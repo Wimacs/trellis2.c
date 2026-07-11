@@ -49,6 +49,14 @@ static void test_descriptor_headers_and_lookup(void) {
     CHECK_TRUE(strcmp(
         trellis_registry_find_family("pixal3d")->default_profile,
         "1024_cascade") == 0);
+    CHECK_TRUE(strcmp(
+        trellis_registry_find_family("tokenskin")->default_profile,
+        "qwen3-0.6b-fsq") == 0);
+    const trellis_task_descriptor * rigging =
+        trellis_registry_find_task("mesh_rigging");
+    CHECK_TRUE(rigging != NULL);
+    CHECK_TRUE(strcmp(rigging->input_kind, "mesh") == 0);
+    CHECK_TRUE(strcmp(rigging->output_kind, "rigged_mesh") == 0);
 }
 
 static void test_non_3d_task_fixture(void) {
@@ -80,9 +88,32 @@ static void test_non_3d_task_fixture(void) {
     CHECK_TRUE(trellis_registry_validate_package(&package) == TRELLIS_STATUS_PARSE_ERROR);
 }
 
+static void test_tokenskin_public_options_contract(void) {
+    trellis_tokenskin_rig_options options = TRELLIS_TOKENSKIN_RIG_OPTIONS_INIT;
+    CHECK_TRUE(options.struct_size == sizeof(options));
+    CHECK_TRUE(options.sample_count == 54000);
+    CHECK_TRUE(options.max_length == 2048);
+    CHECK_TRUE(options.num_beams == 10);
+    options.model_dir = "must-not-be-opened";
+    options.input_path = "must-not-be-opened.glb";
+    options.output_path = "must-not-be-written.glb";
+    options.struct_size = TRELLIS_TOKENSKIN_RIG_OPTIONS_V1_SIZE - 1u;
+    CHECK_TRUE(trellis_pipeline_tokenskin_rig(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.struct_size = TRELLIS_TOKENSKIN_RIG_OPTIONS_V1_SIZE;
+    options.num_beams = TRELLIS_TOKENSKIN_MAX_BEAMS + 1;
+    CHECK_TRUE(trellis_pipeline_tokenskin_rig(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.num_beams = 1;
+    options.sample_count = 2047;
+    CHECK_TRUE(trellis_pipeline_tokenskin_rig(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+}
+
 int main(void) {
     test_descriptor_headers_and_lookup();
     test_non_3d_task_fixture();
+    test_tokenskin_public_options_contract();
     if (g_failures != 0) {
         fprintf(stderr, "%d model registry test(s) failed\n", g_failures);
         return 1;

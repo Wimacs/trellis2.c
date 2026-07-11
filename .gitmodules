@@ -4,3 +4,6 @@
 [submodule "3rd/raylib"]
 	path = 3rd/raylib
 	url = https://github.com/raysan5/raylib.git
+[submodule "3rd/meshoptimizer"]
+	path = 3rd/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
