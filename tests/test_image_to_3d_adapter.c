@@ -37,6 +37,8 @@ static void test_descriptor_registry(void) {
     CHECK_TRUE(!trellis->requires_transparent_foreground);
     CHECK_TRUE(trellis->cascade_quantization ==
         TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_FLOOR);
+    CHECK_TRUE(trellis->gltf_coordinate_transform ==
+        TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_TRELLIS);
 
     const trellis_image_to_3d_adapter_descriptor * pixal =
         trellis_image_to_3d_adapter_find("pixal3d");
@@ -47,8 +49,10 @@ static void test_descriptor_registry(void) {
     CHECK_TRUE(pixal->cascade_quantization ==
         TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_ROUND);
     CHECK_CLOSE(pixal->default_camera_angle_x, 0.8575560450553894f, 1e-7f);
-    CHECK_CLOSE(pixal->default_camera_distance, 2.0f, 1e-7f);
+    CHECK_CLOSE(pixal->default_camera_distance, 1.0937500142266299f, 1e-7f);
     CHECK_CLOSE(pixal->default_mesh_scale, 1.0f, 1e-7f);
+    CHECK_TRUE(pixal->gltf_coordinate_transform ==
+        TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D);
 }
 
 static void test_trellis_repository_package(void) {

@@ -65,9 +65,9 @@ static void usage(FILE * out, const char * argv0) {
         "  --resolution N          Legacy shape resolution override, 512 or 1024; --pipeline controls normal runs\n"
         "  --cond-resolution N     DINO input square edge, default 512\n"
         "  --sparse-resolution N   Sparse-structure output edge, default 32\n"
-        "  --fov X                 Pixal3D horizontal camera FOV in radians, default 0.857556\n"
-        "  --camera-distance X     Pixal3D projection camera distance, default 2\n"
-        "  --mesh-scale X          Pixal3D projection-space mesh scale, default 1\n"
+        "  --fov X                 Pixal3D horizontal camera FOV in radians, default 0.857556; updates auto distance\n"
+        "  --camera-distance X     Pixal3D projection distance; 0/default derives 1/(2*mesh_scale*tan(fov/2))\n"
+        "  --mesh-scale X          Pixal3D projection-space mesh scale, default 1; updates auto distance\n"
         "  --flow PATH             Override shape SLat flow safetensors path\n"
         "  --decoder PATH          Override FlexiDualGridVaeDecoder safetensors path\n"
         "  --rescale-t X           Shape SLat timestep rescale factor, default 3.0\n"
@@ -193,7 +193,7 @@ int main(int argc, char ** argv) {
        explicit SDPA until the shared flash path has BF16-safe K/V support. */
     options.use_ggml_flash_attn = 0;
     pixal_options.camera_angle_x = 0.8575560450553894f;
-    pixal_options.camera_distance = 2.0f;
+    pixal_options.camera_distance = 0.0f;
     pixal_options.mesh_scale = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
@@ -334,6 +334,12 @@ int main(int argc, char ** argv) {
         options.gltf_path = "output.glb";
     }
 
+    if (pixal_options.camera_distance < 0.0f) {
+        TRELLIS_ERROR(
+            "--camera-distance must be 0 for automatic FOV/mesh-scale fitting or greater than 0 for an explicit distance");
+        goto bad_args;
+    }
+
     if (options.model_dir == NULL || options.dino_dir == NULL ||
         options.image_path == NULL ||
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
@@ -346,7 +352,7 @@ int main(int argc, char ** argv) {
         options.mesh_remesh_project < 0.0f ||
         pixal_options.camera_angle_x <= 0.0f ||
         pixal_options.camera_angle_x >= 3.14159265358979323846f ||
-        pixal_options.camera_distance <= 0.0f || pixal_options.mesh_scale <= 0.0f ||
+        pixal_options.mesh_scale <= 0.0f ||
         options.vkmesh_gpu_workspace_budget_mib < 0 ||
         options.model_cache_budget_mib < 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {

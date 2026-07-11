@@ -22,6 +22,7 @@ static const trellis_image_to_3d_adapter_descriptor g_trellis2_adapter = {
     0.0f,
     0.0f,
     0.0f,
+    TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_TRELLIS,
     g_trellis2_components,
     sizeof(g_trellis2_components) / sizeof(g_trellis2_components[0]),
 };

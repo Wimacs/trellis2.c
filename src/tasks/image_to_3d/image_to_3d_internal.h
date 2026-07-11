@@ -3,6 +3,7 @@
 
 #include "trellis.h"
 #include "trellis_ggml_layers.h"
+#include "gltf_axes.h"
 #include "../../architectures/dit_flow/projected_dit_flow.h"
 
 typedef enum trellis_pipeline_cache_entry_kind {
@@ -310,6 +311,15 @@ trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
     const trellis_pbr_voxels * voxels,
     trellis_mesh_host * mesh);
 
+/* Applies the selected rigid output-axis transform to parallel xyz arrays.
+ * Normals receive exactly the same rotation as positions; neither transform
+ * changes handedness, so triangle winding must remain unchanged. */
+trellis_status trellis_pipeline_transform_gltf_vectors(
+    trellis_pipeline_gltf_coordinate_transform transform,
+    float * positions_xyz,
+    float * normals_xyz,
+    size_t vector_count);
+
 trellis_status trellis_pipeline_write_gltf(
     const char * path,
     const trellis_mesh_host * mesh,
@@ -317,5 +327,14 @@ trellis_status trellis_pipeline_write_gltf(
     const trellis_pbr_voxels * voxels,
     int texture_size,
     int device);
+
+trellis_status trellis_pipeline_write_gltf_ex(
+    const char * path,
+    const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
+    const trellis_pbr_voxels * voxels,
+    int texture_size,
+    int device,
+    trellis_pipeline_gltf_coordinate_transform coordinate_transform);
 
 #endif

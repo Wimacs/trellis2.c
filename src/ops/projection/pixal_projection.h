@@ -9,6 +9,14 @@ typedef struct trellis_pixal_camera {
     float mesh_scale;
 } trellis_pixal_camera;
 
+/* A non-positive distance selects the Pixal3D reference camera fit.
+ * Positive distances are preserved verbatim. */
+trellis_status trellis_pixal_resolve_camera_distance(
+    float camera_angle_x,
+    float mesh_scale,
+    float requested_distance,
+    float * resolved_distance);
+
 /*
  * Projects an x-major R^3 grid into a row-major image feature map and samples
  * it with PyTorch grid_sample(..., align_corners=false, padding_mode=border)

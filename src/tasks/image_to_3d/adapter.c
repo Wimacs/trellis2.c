@@ -27,6 +27,10 @@ static int descriptor_is_valid(
              TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_FLOOR &&
          adapter->cascade_quantization !=
              TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_ROUND) ||
+        (adapter->gltf_coordinate_transform !=
+             TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_TRELLIS &&
+         adapter->gltf_coordinate_transform !=
+             TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D) ||
         adapter->required_components == NULL ||
         adapter->required_component_count == 0) {
         return 0;

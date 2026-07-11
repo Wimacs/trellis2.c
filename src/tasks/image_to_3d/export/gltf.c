@@ -2189,17 +2189,63 @@ static trellis_status unwrap_mesh_xatlas(
     return unwrap_mesh_xatlas_direct(mesh, texture_size, out);
 }
 
-static void transform_mesh_to_viewer_axes(trellis_gltf_mesh * mesh) {
-    for (uint32_t i = 0; i < mesh->vertex_count; ++i) {
-        float * p = mesh->positions + (size_t) i * 3u;
-        float y = p[1];
-        p[1] = p[2];
-        p[2] = -y;
-        float * n = mesh->normals + (size_t) i * 3u;
-        y = n[1];
-        n[1] = n[2];
-        n[2] = -y;
+static int gltf_coordinate_transform_is_valid(
+    trellis_pipeline_gltf_coordinate_transform transform) {
+    return transform == TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_TRELLIS ||
+        transform == TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D;
+}
+
+trellis_status trellis_pipeline_transform_gltf_vectors(
+    trellis_pipeline_gltf_coordinate_transform transform,
+    float * positions_xyz,
+    float * normals_xyz,
+    size_t vector_count) {
+    if (!gltf_coordinate_transform_is_valid(transform) ||
+        (vector_count != 0 && (positions_xyz == NULL || normals_xyz == NULL))) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    for (size_t i = 0; i < vector_count; ++i) {
+        float * p = positions_xyz + i * 3u;
+        float * n = normals_xyz + i * 3u;
+        const float px = p[0];
+        const float py = p[1];
+        const float pz = p[2];
+        const float nx = n[0];
+        const float ny = n[1];
+        const float nz = n[2];
+        if (transform == TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D) {
+            /* Pixal3D applies B after o-voxel's A.  The composition B*A is a
+             * 180-degree Y rotation in raw decoder coordinates. */
+            p[0] = -px;
+            p[1] = py;
+            p[2] = -pz;
+            n[0] = -nx;
+            n[1] = ny;
+            n[2] = -nz;
+        } else {
+            /* Generic o-voxel/TRELLIS conversion A. */
+            p[0] = px;
+            p[1] = pz;
+            p[2] = -py;
+            n[0] = nx;
+            n[1] = nz;
+            n[2] = -ny;
+        }
+    }
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status transform_mesh_to_export_axes(
+    trellis_gltf_mesh * mesh,
+    trellis_pipeline_gltf_coordinate_transform transform) {
+    if (mesh == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    return trellis_pipeline_transform_gltf_vectors(
+        transform,
+        mesh->positions,
+        mesh->normals,
+        mesh->vertex_count);
 }
 
 static size_t align4(size_t n) {
@@ -2510,16 +2556,18 @@ static trellis_status write_gltf_json(
     return result == cgltf_result_success ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
 }
 
-trellis_status trellis_pipeline_write_gltf(
+trellis_status trellis_pipeline_write_gltf_ex(
     const char * path,
     const trellis_mesh_host * mesh,
     const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
     int texture_size,
-    int device) {
+    int device,
+    trellis_pipeline_gltf_coordinate_transform coordinate_transform) {
     if (path == NULL || mesh == NULL || voxels == NULL || mesh->vertices == NULL ||
         mesh->faces == NULL || mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
-        voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->n_coords <= 0 || device < 0) {
+        voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->n_coords <= 0 || device < 0 ||
+        !gltf_coordinate_transform_is_valid(coordinate_transform)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (texture_size <= 0) {
@@ -2585,8 +2633,8 @@ trellis_status trellis_pipeline_write_gltf(
     size_t sizes[6] = {0, 0, 0, 0, 0, 0};
     size_t buffer_size = 0;
     if (status == TRELLIS_STATUS_OK) {
-        transform_mesh_to_viewer_axes(&gltf_mesh);
-        if (write_glb) {
+        status = transform_mesh_to_export_axes(&gltf_mesh, coordinate_transform);
+        if (status == TRELLIS_STATUS_OK && write_glb) {
             status = build_glb_binary_buffer(
                 &gltf_mesh,
                 base_png,
@@ -2597,7 +2645,7 @@ trellis_status trellis_pipeline_write_gltf(
                 sizes,
                 &buffer_size,
                 &glb_bin);
-        } else {
+        } else if (status == TRELLIS_STATUS_OK) {
             status = write_binary_buffer(bin_path, &gltf_mesh, offsets, sizes, &buffer_size);
         }
     }
@@ -2633,4 +2681,21 @@ trellis_status trellis_pipeline_write_gltf(
     free(mr);
     gltf_mesh_free(&gltf_mesh);
     return status;
+}
+
+trellis_status trellis_pipeline_write_gltf(
+    const char * path,
+    const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
+    const trellis_pbr_voxels * voxels,
+    int texture_size,
+    int device) {
+    return trellis_pipeline_write_gltf_ex(
+        path,
+        mesh,
+        sample_mesh,
+        voxels,
+        texture_size,
+        device,
+        TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_TRELLIS);
 }

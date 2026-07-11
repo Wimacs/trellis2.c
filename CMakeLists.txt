@@ -504,6 +504,14 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_image_to_3d_adapter_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_image_to_3d_adapter_tests COMMAND trellis2_c_image_to_3d_adapter_tests)
 
+    add_executable(trellis2_c_gltf_axes_tests
+        tests/test_gltf_axes.c
+    )
+    target_include_directories(trellis2_c_gltf_axes_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_gltf_axes_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_gltf_axes_tests COMMAND trellis2_c_gltf_axes_tests)
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests
             tests/test_trellis.c
@@ -758,7 +766,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
             target_include_directories(trellis2_c_vkmesh_tests PRIVATE
                 "${CMAKE_CURRENT_LIST_DIR}/src/ops"
                 "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
-                "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow")
+                "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf")
             target_link_libraries(trellis2_c_vkmesh_tests PRIVATE
                 trellis2_c ggml Vulkan::Vulkan Threads::Threads)
             add_dependencies(trellis2_c_vkmesh_tests vkmesh)

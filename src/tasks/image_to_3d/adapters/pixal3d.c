@@ -20,8 +20,9 @@ static const trellis_image_to_3d_adapter_descriptor g_pixal3d_adapter = {
     1,
     TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_ROUND,
     0.8575560450553894f,
-    2.0f,
+    1.0937500142266299f,
     1.0f,
+    TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D,
     g_pixal3d_components,
     sizeof(g_pixal3d_components) / sizeof(g_pixal3d_components[0]),
 };

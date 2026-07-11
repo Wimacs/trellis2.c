@@ -12,6 +12,32 @@ static int checked_mul_size(size_t a, size_t b, size_t * out) {
     return 1;
 }
 
+trellis_status trellis_pixal_resolve_camera_distance(
+    float camera_angle_x,
+    float mesh_scale,
+    float requested_distance,
+    float * resolved_distance) {
+    static const float pi = 3.14159265358979323846f;
+    if (resolved_distance == NULL || !isfinite(camera_angle_x) ||
+        camera_angle_x <= 0.0f || camera_angle_x >= pi ||
+        !isfinite(mesh_scale) || mesh_scale <= 0.0f ||
+        !isfinite(requested_distance)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (requested_distance > 0.0f) {
+        *resolved_distance = requested_distance;
+        return TRELLIS_STATUS_OK;
+    }
+
+    const float distance =
+        1.0f / (2.0f * mesh_scale * tanf(0.5f * camera_angle_x));
+    if (!isfinite(distance) || distance <= 0.0f) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *resolved_distance = distance;
+    return TRELLIS_STATUS_OK;
+}
+
 static int valid_projection_args(
     const float * patch_features,
     int patch_h,

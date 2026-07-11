@@ -3,6 +3,7 @@
 
 #include "trellis_ggml_layers.h"
 #include "trellis_model_package.h"
+#include "gltf_axes.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -11,7 +12,7 @@
 extern "C" {
 #endif
 
-#define TRELLIS_IMAGE_TO_3D_ADAPTER_ABI_VERSION 1u
+#define TRELLIS_IMAGE_TO_3D_ADAPTER_ABI_VERSION 2u
 #define TRELLIS_IMAGE_TO_3D_TASK_ID "image_to_3d"
 
 typedef enum trellis_image_to_3d_cascade_quantization {
@@ -44,6 +45,9 @@ typedef struct trellis_image_to_3d_adapter_descriptor {
     float default_camera_angle_x;
     float default_camera_distance;
     float default_mesh_scale;
+
+    /* Final coordinate transform selected after texture baking. */
+    trellis_pipeline_gltf_coordinate_transform gltf_coordinate_transform;
 
     const trellis_image_to_3d_component_requirement * required_components;
     size_t required_component_count;

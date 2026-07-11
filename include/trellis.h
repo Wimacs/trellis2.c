@@ -802,7 +802,7 @@ typedef struct trellis_pixal3d_options {
     size_t struct_size;           /* set to sizeof(trellis_pixal3d_options) */
     const char * naf_path;        /* NULL/empty: search model_dir/ckpts automatically */
     float camera_angle_x;         /* horizontal FOV in radians; <=0 uses 0.857556 */
-    float camera_distance;        /* <=0 uses 2 */
+    float camera_distance;        /* <=0 derives from FOV/mesh_scale; >0 is explicit */
     float mesh_scale;             /* <=0 uses 1 */
 } trellis_pixal3d_options;
 

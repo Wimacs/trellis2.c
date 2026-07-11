@@ -27,6 +27,33 @@ static void check_close(float actual, float expected, float tolerance, int line)
 #define CHECK_CLOSE(actual, expected, tolerance) \
     check_close((actual), (expected), (tolerance), __LINE__)
 
+static void test_camera_distance_resolution(void) {
+    float distance = -1.0f;
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.8575560450553894f, 1.0f, 0.0f, &distance) == TRELLIS_STATUS_OK);
+    CHECK_CLOSE(distance, 1.0937500142266299f, 1e-6f);
+
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.2f, 1.0f, 0.0f, &distance) == TRELLIS_STATUS_OK);
+    CHECK_CLOSE(distance, 4.983322211629619f, 1e-6f);
+
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.2f, 2.0f, 0.0f, &distance) == TRELLIS_STATUS_OK);
+    CHECK_CLOSE(distance, 2.4916611058148096f, 1e-6f);
+
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.2f, 2.0f, 3.25f, &distance) == TRELLIS_STATUS_OK);
+    CHECK_CLOSE(distance, 3.25f, 0.0f);
+
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.2f, 1.0f, -1.0f, &distance) == TRELLIS_STATUS_OK);
+    CHECK_CLOSE(distance, 4.983322211629619f, 1e-6f);
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.0f, 1.0f, 0.0f, &distance) == TRELLIS_STATUS_INVALID_ARGUMENT);
+    CHECK_TRUE(trellis_pixal_resolve_camera_distance(
+        0.2f, 0.0f, 0.0f, &distance) == TRELLIS_STATUS_INVALID_ARGUMENT);
+}
+
 static void test_dense_projection_matches_grid_sample_golden(void) {
     /* BHWC/last-channel layout: [[1,2],[3,4]], with a second scaled channel. */
     const float patch_features[] = {
@@ -179,6 +206,7 @@ static void test_pixal_pipeline_rejects_opaque_input_without_birefnet(void) {
 }
 
 int main(void) {
+    test_camera_distance_resolution();
     test_dense_projection_matches_grid_sample_golden();
     test_sparse_projection_preserves_coord_order();
     test_pixal_pipeline_options_versioning();

@@ -807,10 +807,24 @@ static int run_sparse_structure_image(
             goto cleanup;
         }
         memcpy(global_context, context, global_count * sizeof(float));
+        const float resolved_camera_angle_x =
+            camera_angle_x > 0.0f ? camera_angle_x : 0.8575560450553894f;
+        const float resolved_mesh_scale = mesh_scale > 0.0f ? mesh_scale : 1.0f;
+        float resolved_camera_distance = 0.0f;
+        status = trellis_pixal_resolve_camera_distance(
+            resolved_camera_angle_x,
+            resolved_mesh_scale,
+            camera_distance,
+            &resolved_camera_distance);
+        if (status != TRELLIS_STATUS_OK) {
+            free(global_context);
+            TRELLIS_ERROR("sparse structure: invalid Pixal3D camera parameters");
+            goto cleanup;
+        }
         trellis_pixal_camera camera = {
-            .camera_angle_x = camera_angle_x > 0.0f ? camera_angle_x : 0.8575560450553894f,
-            .distance = camera_distance > 0.0f ? camera_distance : 2.0f,
-            .mesh_scale = mesh_scale != 0.0f ? mesh_scale : 1.0f,
+            .camera_angle_x = resolved_camera_angle_x,
+            .distance = resolved_camera_distance,
+            .mesh_scale = resolved_mesh_scale,
         };
         status = trellis_pixal_project_patch_features_dense_f32(
             context + global_count,
@@ -1443,11 +1457,24 @@ trellis_status trellis_pipeline_run_image_condition(
             free(guide);
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
+        const float resolved_camera_angle_x = options->camera_angle_x > 0.0f ?
+            options->camera_angle_x : 0.8575560450553894f;
+        const float resolved_mesh_scale = options->mesh_scale > 0.0f ?
+            options->mesh_scale : 1.0f;
+        float resolved_camera_distance = 0.0f;
+        if (trellis_pixal_resolve_camera_distance(
+                resolved_camera_angle_x,
+                resolved_mesh_scale,
+                options->camera_distance,
+                &resolved_camera_distance) != TRELLIS_STATUS_OK) {
+            free(cond);
+            free(guide);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
         trellis_pixal_camera camera = {
-            .camera_angle_x = options->camera_angle_x > 0.0f ?
-                options->camera_angle_x : 0.8575560450553894f,
-            .distance = options->camera_distance > 0.0f ? options->camera_distance : 2.0f,
-            .mesh_scale = options->mesh_scale > 0.0f ? options->mesh_scale : 1.0f,
+            .camera_angle_x = resolved_camera_angle_x,
+            .distance = resolved_camera_distance,
+            .mesh_scale = resolved_mesh_scale,
         };
         const size_t low_count = (size_t) options->projection_n_coords * 1024u;
         float * global = (float *) malloc((size_t) special_tokens * 1024u * sizeof(float));

@@ -65,17 +65,18 @@ python3 tools/convert_naf_weights.py \
 Pixal3D also supports `1536_cascade`. `--naf` falls back to
 `TRELLIS_NAF_PATH` and then `ckpts/naf_release.safetensors`. Use
 `--no-model-cache` or `--model-cache-budget-mib N` on memory-constrained GPUs.
-The `--fov`, `--camera-distance`, and `--mesh-scale` flags control the explicit
-Pixal3D projection; this path does not estimate the camera automatically. Use a
-transparent RGBA input or pass `--birefnet FILE` for foreground removal and the
-required subject crop.
+The `--fov`, `--camera-distance`, and `--mesh-scale` flags control Pixal3D
+projection. If distance is omitted or zero, it is fitted to FOV and mesh scale
+as `1 / (2 * mesh_scale * tan(fov / 2))`; a positive distance remains explicit.
+This path does not estimate FOV from the image. Use a transparent RGBA input or
+pass `--birefnet FILE` for foreground removal and the required subject crop.
 Opaque Pixal3D inputs require `--birefnet`; a foreground-isolated RGBA image
 with transparency can be passed without it.
 
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
 `trellis_pipeline_image_to_gltf_ex()` from `src/tasks/image_to_3d/image_to_3d.c`.
 The legacy `trellis_pipeline_image_to_gltf()` entry point remains available and
-uses default Pixal3D camera values plus automatic NAF path discovery.
+uses the fitted default Pixal3D camera plus automatic NAF path discovery.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and

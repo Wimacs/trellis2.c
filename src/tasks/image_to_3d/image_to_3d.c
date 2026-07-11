@@ -4,6 +4,7 @@
 
 #include "trellis.h"
 #include "adapter.h"
+#include "pixal_projection.h"
 #include "trellis_platform.h"
 #include "sparse/trellis_sparse_backend.h"
 #include "trellis_model_package.h"
@@ -1346,6 +1347,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     float pixal_camera_angle_x = pixal_options->camera_angle_x;
     float pixal_camera_distance = pixal_options->camera_distance;
     float pixal_mesh_scale = pixal_options->mesh_scale;
+    const int pixal_camera_distance_is_automatic = pixal_camera_distance <= 0.0f;
     const char * output_gltf_path =
         options->gltf_path != NULL && options->gltf_path[0] != '\0' ?
             options->gltf_path :
@@ -1400,11 +1402,26 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     if (pixal_camera_angle_x <= 0.0f) {
         pixal_camera_angle_x = task_adapter->default_camera_angle_x;
     }
-    if (pixal_camera_distance <= 0.0f) {
-        pixal_camera_distance = task_adapter->default_camera_distance;
-    }
     if (pixal_mesh_scale <= 0.0f) {
         pixal_mesh_scale = task_adapter->default_mesh_scale;
+    }
+    if (projected_conditioning) {
+        status = trellis_pixal_resolve_camera_distance(
+            pixal_camera_angle_x,
+            pixal_mesh_scale,
+            pixal_camera_distance,
+            &pixal_camera_distance);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "pipeline: invalid Pixal3D camera fov=%.9g mesh_scale=%.9g distance=%.9g",
+                (double) pixal_camera_angle_x,
+                (double) pixal_mesh_scale,
+                (double) pixal_options->camera_distance);
+            trellis_model_package_free(&model_package);
+            return status;
+        }
+    } else if (pixal_camera_distance_is_automatic) {
+        pixal_camera_distance = task_adapter->default_camera_distance;
     }
     TRELLIS_INFO(
         "model package: id=%s family=%s task=%s profile=%s adapter=%s source=%s",
@@ -1414,6 +1431,15 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         model_package.profile,
         task_adapter->id,
         model_package.source == TRELLIS_MODEL_PACKAGE_SOURCE_MANIFEST ? "manifest" : "legacy");
+    if (projected_conditioning) {
+        TRELLIS_INFO(
+            "Pixal3D camera: fov=%.9g rad mesh_scale=%.9g distance=%.9g (%s)",
+            (double) pixal_camera_angle_x,
+            (double) pixal_mesh_scale,
+            (double) pixal_camera_distance,
+            pixal_camera_distance_is_automatic ?
+                "derived from FOV and mesh scale" : "explicit");
+    }
     if (projected_conditioning && options->model_cache &&
         model_cache_budget_bytes_from_options(options) == 0) {
         TRELLIS_WARN(
@@ -2210,7 +2236,14 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
             &gltf_projection_mesh :
             NULL;
-    status = trellis_pipeline_write_gltf(output_gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size, options->device);
+    status = trellis_pipeline_write_gltf_ex(
+        output_gltf_path,
+        &mesh,
+        sample_mesh,
+        &pbr_voxels,
+        texture_size,
+        options->device,
+        task_adapter->gltf_coordinate_transform);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
         goto cleanup;

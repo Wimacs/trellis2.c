@@ -4,6 +4,9 @@
 
 #include <vulkan/vulkan.h>
 
+#define CGLTF_IMPLEMENTATION
+#include "cgltf.h"
+
 #include <stdint.h>
 #include <limits.h>
 #include <math.h>
@@ -33,6 +36,43 @@ static int g_failures = 0;
         return 0; \
     } \
 } while (0)
+
+static int close_f32(float actual, float expected) {
+    return fabsf(actual - expected) <= 1e-6f;
+}
+
+static int read_gltf_position_bounds(
+    const char * path,
+    float min_out[3],
+    float max_out[3]) {
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_data * data = NULL;
+    if (cgltf_parse_file(&options, path, &data) != cgltf_result_success ||
+        data == NULL || data->meshes_count == 0 ||
+        data->meshes[0].primitives_count == 0) {
+        cgltf_free(data);
+        return 0;
+    }
+    const cgltf_primitive * primitive = &data->meshes[0].primitives[0];
+    int found = 0;
+    for (cgltf_size i = 0; i < primitive->attributes_count; ++i) {
+        const cgltf_attribute * attribute = &primitive->attributes[i];
+        if (attribute->type != cgltf_attribute_type_position ||
+            attribute->data == NULL || !attribute->data->has_min ||
+            !attribute->data->has_max) {
+            continue;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            min_out[axis] = attribute->data->min[axis];
+            max_out[axis] = attribute->data->max[axis];
+        }
+        found = 1;
+        break;
+    }
+    cgltf_free(data);
+    return found;
+}
 
 static void test_mesh_free(test_mesh * mesh) {
     if (mesh == NULL) return;
@@ -382,8 +422,8 @@ static int test_remesh_workspace_chunking(const char * vkmesh_path) {
 
 static int test_gltf_bake(void) {
     float vertices[12] = {
-        -0.25f, -0.25f, -0.25f, 0.25f, -0.25f, -0.25f,
-        -0.25f, 0.25f, -0.25f, -0.25f, -0.25f, 0.25f,
+        -0.40f, -0.10f, -0.20f, 0.30f, -0.10f, -0.20f,
+        -0.40f, 0.25f, -0.20f, -0.40f, -0.10f, 0.45f,
     };
     int32_t faces[12] = {
         0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
@@ -421,17 +461,51 @@ static int test_gltf_bake(void) {
     voxels.n_coords = index;
     voxels.channels = 6;
     voxels.resolution = 4;
-    char output[PATH_MAX];
-    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_bake", ".glb"));
-    trellis_status status = trellis_pipeline_write_gltf(output, &mesh, NULL, &voxels, 64, 0);
-    FILE * f = status == TRELLIS_STATUS_OK ? fopen(output, "rb") : NULL;
+    char trellis_output[PATH_MAX];
+    char pixal_output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(
+        trellis_output, sizeof(trellis_output), "vkmesh_bake_trellis", ".glb"));
+    CHECK_TRUE(trellis_make_temp_path(
+        pixal_output, sizeof(pixal_output), "vkmesh_bake_pixal", ".glb"));
+    trellis_status trellis_write_status = trellis_pipeline_write_gltf(
+        trellis_output, &mesh, NULL, &voxels, 64, 0);
+    trellis_status pixal_status = trellis_pipeline_write_gltf_ex(
+        pixal_output,
+        &mesh,
+        NULL,
+        &voxels,
+        64,
+        0,
+        TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D);
+    FILE * f = trellis_write_status == TRELLIS_STATUS_OK ? fopen(trellis_output, "rb") : NULL;
     char magic[4] = {0, 0, 0, 0};
     int valid = f != NULL && fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
         memcmp(magic, "glTF", 4) == 0;
     if (f != NULL) fclose(f);
-    trellis_unlink(output);
-    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    float trellis_min[3] = {0};
+    float trellis_max[3] = {0};
+    float pixal_min[3] = {0};
+    float pixal_max[3] = {0};
+    const int trellis_bounds_ok = read_gltf_position_bounds(
+        trellis_output, trellis_min, trellis_max);
+    const int pixal_bounds_ok = read_gltf_position_bounds(
+        pixal_output, pixal_min, pixal_max);
+    trellis_unlink(trellis_output);
+    trellis_unlink(pixal_output);
+    CHECK_TRUE(trellis_write_status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(pixal_status == TRELLIS_STATUS_OK);
     CHECK_TRUE(valid);
+    CHECK_TRUE(trellis_bounds_ok && pixal_bounds_ok);
+    const float expected_trellis_min[3] = {-0.40f, -0.20f, -0.25f};
+    const float expected_trellis_max[3] = {0.30f, 0.45f, 0.10f};
+    const float expected_pixal_min[3] = {-0.30f, -0.10f, -0.45f};
+    const float expected_pixal_max[3] = {0.40f, 0.25f, 0.20f};
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK_TRUE(close_f32(trellis_min[axis], expected_trellis_min[axis]));
+        CHECK_TRUE(close_f32(trellis_max[axis], expected_trellis_max[axis]));
+        CHECK_TRUE(close_f32(pixal_min[axis], expected_pixal_min[axis]));
+        CHECK_TRUE(close_f32(pixal_max[axis], expected_pixal_max[axis]));
+    }
     return 1;
 }
 

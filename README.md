@@ -131,16 +131,19 @@ Run the 1024 cascade on CUDA or Vulkan with:
 `ckpts/naf_release.safetensors` exists below the model directory, or when
 `TRELLIS_NAF_PATH` is set. If GPU memory is constrained, use
 `--no-model-cache` or a finite `--model-cache-budget-mib` value. Pixal3D camera
-projection defaults to the reference horizontal FOV `0.857556`, distance `2`,
-and mesh scale `1`; override them with `--fov`, `--camera-distance`, and
-`--mesh-scale`. These are explicit projection parameters, not automatic camera
-estimation. The input must already contain a transparent foreground mask, or
+projection defaults to horizontal FOV `0.857556` and mesh scale `1`; when
+`--camera-distance` is omitted or zero, distance is fitted as
+`1 / (2 * mesh_scale * tan(fov / 2))` (`1.09375` for those defaults). An
+explicit positive `--camera-distance` is preserved. This fits distance to the
+selected FOV but does not estimate FOV from the image. The input must already
+contain a transparent foreground mask, or
 `--birefnet FILE` must be supplied so Pixal3D can apply its subject crop.
 TRELLIS.2 checkpoints ignore the NAF and camera options.
 
-C callers that need explicit Pixal3D overrides can initialize
+C callers that need Pixal3D overrides can initialize
 `trellis_pixal3d_options` with `TRELLIS_PIXAL3D_OPTIONS_INIT` and call
-`trellis_pipeline_image_to_gltf_ex()`; the legacy entry point keeps the default
+`trellis_pipeline_image_to_gltf_ex()`; non-positive `camera_distance` selects
+the same FOV/mesh-scale fit. The legacy entry point uses that fitted default
 camera and automatic NAF lookup.
 
 Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
