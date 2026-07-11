@@ -1,8 +1,11 @@
 #include "trellis.h"
 #include "trellis_platform.h"
-#include "trellis_pipeline_internal.h"
+#include "image_to_3d_internal.h"
 
 #include <vulkan/vulkan.h>
+
+#define CGLTF_IMPLEMENTATION
+#include "cgltf.h"
 
 #include <stdint.h>
 #include <limits.h>
@@ -33,6 +36,43 @@ static int g_failures = 0;
         return 0; \
     } \
 } while (0)
+
+static int close_f32(float actual, float expected) {
+    return fabsf(actual - expected) <= 1e-6f;
+}
+
+static int read_gltf_position_bounds(
+    const char * path,
+    float min_out[3],
+    float max_out[3]) {
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_data * data = NULL;
+    if (cgltf_parse_file(&options, path, &data) != cgltf_result_success ||
+        data == NULL || data->meshes_count == 0 ||
+        data->meshes[0].primitives_count == 0) {
+        cgltf_free(data);
+        return 0;
+    }
+    const cgltf_primitive * primitive = &data->meshes[0].primitives[0];
+    int found = 0;
+    for (cgltf_size i = 0; i < primitive->attributes_count; ++i) {
+        const cgltf_attribute * attribute = &primitive->attributes[i];
+        if (attribute->type != cgltf_attribute_type_position ||
+            attribute->data == NULL || !attribute->data->has_min ||
+            !attribute->data->has_max) {
+            continue;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            min_out[axis] = attribute->data->min[axis];
+            max_out[axis] = attribute->data->max[axis];
+        }
+        found = 1;
+        break;
+    }
+    cgltf_free(data);
+    return found;
+}
 
 static void test_mesh_free(test_mesh * mesh) {
     if (mesh == NULL) return;
@@ -221,10 +261,169 @@ static int test_cli_rejects_nan(const char * vkmesh_path) {
     return 1;
 }
 
+static int write_distance_points(const char * path, int count) {
+    FILE * f = fopen(path, "w");
+    if (f == NULL) return 0;
+    int ok = 1;
+    for (int i = 0; i < count; ++i) {
+        const float x = (float) (i % 97) / 96.0f;
+        const float y = (float) ((i / 97) % 89) / 88.0f;
+        const float z = (float) ((i / (97 * 89)) % 83) / 82.0f;
+        if (fprintf(f, "%.9g %.9g %.9g\n", x, y, z) < 0) {
+            ok = 0;
+            break;
+        }
+    }
+    if (fclose(f) != 0) ok = 0;
+    return ok;
+}
+
+static int read_distance_results(const char * path, int expected_count, float ** distances_out, uint32_t ** faces_out) {
+    *distances_out = NULL;
+    *faces_out = NULL;
+    FILE * f = fopen(path, "r");
+    if (f == NULL) return 0;
+    float * distances = (float *) malloc((size_t) expected_count * sizeof(float));
+    uint32_t * faces = (uint32_t *) malloc((size_t) expected_count * sizeof(uint32_t));
+    if (distances == NULL || faces == NULL) {
+        free(distances);
+        free(faces);
+        fclose(f);
+        return 0;
+    }
+    char header[256];
+    int ok = fgets(header, sizeof(header), f) != NULL;
+    for (int i = 0; i < expected_count && ok; ++i) {
+        float x, y, z;
+        ok = fscanf(f, "%f %f %f %f %u", &x, &y, &z, &distances[i], &faces[i]) == 5;
+    }
+    if (ok) {
+        float extra;
+        ok = fscanf(f, "%f", &extra) != 1;
+    }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        free(distances);
+        free(faces);
+        return 0;
+    }
+    *distances_out = distances;
+    *faces_out = faces;
+    return 1;
+}
+
+static int test_udf_workspace_chunking(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    static const int32_t faces[12] = {
+        0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
+    };
+    enum { point_count = 131072 };
+    char mesh_path[PATH_MAX];
+    char points_path[PATH_MAX];
+    char small_path[PATH_MAX];
+    char large_path[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(mesh_path, sizeof(mesh_path), "vkmesh_udf_mesh", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(points_path, sizeof(points_path), "vkmesh_udf_points", ".txt"));
+    CHECK_TRUE(trellis_make_temp_path(small_path, sizeof(small_path), "vkmesh_udf_small", ".txt"));
+    CHECK_TRUE(trellis_make_temp_path(large_path, sizeof(large_path), "vkmesh_udf_large", ".txt"));
+    CHECK_TRUE(write_meshbin(mesh_path, vertices, 4, faces, 4));
+    CHECK_TRUE(write_distance_points(points_path, point_count));
+
+    char * small_argv[] = {
+        (char *) vkmesh_path, (char *) "--input", mesh_path,
+        (char *) "--unsigned-distance", points_path, (char *) "--distance-output", small_path,
+        (char *) "--gpu-workspace-budget-mib", (char *) "1", (char *) "--device", (char *) "0",
+        (char *) "--no-fill-holes", NULL,
+    };
+    char * large_argv[] = {
+        (char *) vkmesh_path, (char *) "--input", mesh_path,
+        (char *) "--unsigned-distance", points_path, (char *) "--distance-output", large_path,
+        (char *) "--gpu-workspace-budget-mib", (char *) "64", (char *) "--device", (char *) "0",
+        (char *) "--no-fill-holes", NULL,
+    };
+    int ran = trellis_run_process_exact(small_argv) && trellis_run_process_exact(large_argv);
+    float * small_distances = NULL;
+    float * large_distances = NULL;
+    uint32_t * small_faces = NULL;
+    uint32_t * large_faces = NULL;
+    int read_ok = ran &&
+        read_distance_results(small_path, point_count, &small_distances, &small_faces) &&
+        read_distance_results(large_path, point_count, &large_distances, &large_faces);
+    trellis_unlink(mesh_path);
+    trellis_unlink(points_path);
+    trellis_unlink(small_path);
+    trellis_unlink(large_path);
+    CHECK_TRUE(read_ok);
+    for (int i = 0; i < point_count; ++i) {
+        CHECK_TRUE(fabsf(small_distances[i] - large_distances[i]) <= 1e-6f);
+        CHECK_TRUE(small_faces[i] == large_faces[i]);
+    }
+    free(small_distances);
+    free(large_distances);
+    free(small_faces);
+    free(large_faces);
+    return 1;
+}
+
+static int test_remesh_workspace_chunking(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        -0.35f, -0.35f, -0.35f, 0.35f, -0.35f, -0.35f,
+        -0.35f, 0.35f, -0.35f, -0.35f, -0.35f, 0.35f,
+    };
+    static const int32_t faces[12] = {
+        0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
+    };
+    char input[PATH_MAX];
+    char small_path[PATH_MAX];
+    char large_path[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_remesh_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(small_path, sizeof(small_path), "vkmesh_remesh_small", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(large_path, sizeof(large_path), "vkmesh_remesh_large", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 4));
+    char * small_argv[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", small_path,
+        (char *) "--remesh", (char *) "--remesh-resolution", (char *) "128",
+        (char *) "--remesh-band", (char *) "1", (char *) "--gpu-workspace-budget-mib", (char *) "1",
+        (char *) "--no-fill-holes", (char *) "--device", (char *) "0", NULL,
+    };
+    char * large_argv[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", large_path,
+        (char *) "--remesh", (char *) "--remesh-resolution", (char *) "128",
+        (char *) "--remesh-band", (char *) "1", (char *) "--gpu-workspace-budget-mib", (char *) "64",
+        (char *) "--no-fill-holes", (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(small_argv) && trellis_run_process_exact(large_argv);
+    test_mesh small_mesh;
+    test_mesh large_mesh;
+    memset(&small_mesh, 0, sizeof(small_mesh));
+    memset(&large_mesh, 0, sizeof(large_mesh));
+    int read_ok = ran && read_meshbin(small_path, &small_mesh) && read_meshbin(large_path, &large_mesh);
+    trellis_unlink(input);
+    trellis_unlink(small_path);
+    trellis_unlink(large_path);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(small_mesh.n_vertices == large_mesh.n_vertices);
+    CHECK_TRUE(small_mesh.n_faces == large_mesh.n_faces);
+    CHECK_TRUE(memcmp(
+        small_mesh.vertices,
+        large_mesh.vertices,
+        (size_t) small_mesh.n_vertices * 3u * sizeof(float)) == 0);
+    CHECK_TRUE(memcmp(
+        small_mesh.faces,
+        large_mesh.faces,
+        (size_t) small_mesh.n_faces * 3u * sizeof(int32_t)) == 0);
+    test_mesh_free(&small_mesh);
+    test_mesh_free(&large_mesh);
+    return 1;
+}
+
 static int test_gltf_bake(void) {
     float vertices[12] = {
-        -0.25f, -0.25f, -0.25f, 0.25f, -0.25f, -0.25f,
-        -0.25f, 0.25f, -0.25f, -0.25f, -0.25f, 0.25f,
+        -0.40f, -0.10f, -0.20f, 0.30f, -0.10f, -0.20f,
+        -0.40f, 0.25f, -0.20f, -0.40f, -0.10f, 0.45f,
     };
     int32_t faces[12] = {
         0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
@@ -262,17 +461,51 @@ static int test_gltf_bake(void) {
     voxels.n_coords = index;
     voxels.channels = 6;
     voxels.resolution = 4;
-    char output[PATH_MAX];
-    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_bake", ".glb"));
-    trellis_status status = trellis_pipeline_write_gltf(output, &mesh, NULL, &voxels, 64, 0);
-    FILE * f = status == TRELLIS_STATUS_OK ? fopen(output, "rb") : NULL;
+    char trellis_output[PATH_MAX];
+    char pixal_output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(
+        trellis_output, sizeof(trellis_output), "vkmesh_bake_trellis", ".glb"));
+    CHECK_TRUE(trellis_make_temp_path(
+        pixal_output, sizeof(pixal_output), "vkmesh_bake_pixal", ".glb"));
+    trellis_status trellis_write_status = trellis_pipeline_write_gltf(
+        trellis_output, &mesh, NULL, &voxels, 64, 0);
+    trellis_status pixal_status = trellis_pipeline_write_gltf_ex(
+        pixal_output,
+        &mesh,
+        NULL,
+        &voxels,
+        64,
+        0,
+        TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D);
+    FILE * f = trellis_write_status == TRELLIS_STATUS_OK ? fopen(trellis_output, "rb") : NULL;
     char magic[4] = {0, 0, 0, 0};
     int valid = f != NULL && fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
         memcmp(magic, "glTF", 4) == 0;
     if (f != NULL) fclose(f);
-    trellis_unlink(output);
-    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    float trellis_min[3] = {0};
+    float trellis_max[3] = {0};
+    float pixal_min[3] = {0};
+    float pixal_max[3] = {0};
+    const int trellis_bounds_ok = read_gltf_position_bounds(
+        trellis_output, trellis_min, trellis_max);
+    const int pixal_bounds_ok = read_gltf_position_bounds(
+        pixal_output, pixal_min, pixal_max);
+    trellis_unlink(trellis_output);
+    trellis_unlink(pixal_output);
+    CHECK_TRUE(trellis_write_status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(pixal_status == TRELLIS_STATUS_OK);
     CHECK_TRUE(valid);
+    CHECK_TRUE(trellis_bounds_ok && pixal_bounds_ok);
+    const float expected_trellis_min[3] = {-0.40f, -0.20f, -0.25f};
+    const float expected_trellis_max[3] = {0.30f, 0.45f, 0.10f};
+    const float expected_pixal_min[3] = {-0.30f, -0.10f, -0.45f};
+    const float expected_pixal_max[3] = {0.40f, 0.25f, 0.20f};
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK_TRUE(close_f32(trellis_min[axis], expected_trellis_min[axis]));
+        CHECK_TRUE(close_f32(trellis_max[axis], expected_trellis_max[axis]));
+        CHECK_TRUE(close_f32(pixal_min[axis], expected_pixal_min[axis]));
+        CHECK_TRUE(close_f32(pixal_max[axis], expected_pixal_max[axis]));
+    }
     return 1;
 }
 
@@ -373,6 +606,10 @@ static int test_api_validation(void) {
     vertices[0] = NAN;
     CHECK_TRUE(trellis_vkmesh_postprocess(&input, &output, NULL, &options) == TRELLIS_STATUS_INVALID_ARGUMENT);
     CHECK_TRUE(output.vertices == NULL && output.faces == NULL);
+    vertices[0] = 0.0f;
+    options.gpu_workspace_budget_mib = -1;
+    CHECK_TRUE(trellis_vkmesh_postprocess(&input, &output, NULL, &options) == TRELLIS_STATUS_INVALID_ARGUMENT);
+    CHECK_TRUE(output.vertices == NULL && output.faces == NULL);
     return 1;
 }
 
@@ -387,6 +624,8 @@ int main(int argc, char ** argv) {
     }
     (void) test_cli_cleanup(argv[1]);
     (void) test_cli_rejects_nan(argv[1]);
+    (void) test_udf_workspace_chunking(argv[1]);
+    (void) test_remesh_workspace_chunking(argv[1]);
     (void) test_api_concurrent();
     (void) test_api_validation();
     (void) test_gltf_bake();

@@ -14,7 +14,8 @@
   <img src="img.png" alt="trellis2.c local workspace">
 </p>
 
-Native TRELLIS.2 image-to-3D inference tool with CUDA and Vulkan support. The main command is `trellis-image-to-gltf`.
+Native TRELLIS.2 and Pixal3D image-to-3D inference tool with CUDA and Vulkan
+support. The main command is `trellis-image-to-gltf`.
 
 ## Build
 
@@ -30,6 +31,11 @@ If the repository was cloned without `--recursive`, run:
 ```sh
 git submodule update --init --recursive
 ```
+
+Both inference backends build vkmesh and the Vulkan texture baker by default,
+so the Vulkan SDK (headers, loader, and `glslc`) is a build dependency even for
+CUDA. This keeps remesh and texture export available to the normal one-command
+inference path without installing a separate vkmesh executable.
 
 CUDA:
 
@@ -96,10 +102,85 @@ Linux:
 ./build/trellis-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
   --image example_image/T.png \
   --gltf output.glb
 ```
+
+The model adapter selects the standard pipeline automatically: TRELLIS.2 uses
+the 512 pipeline, while Pixal3D uses the 1024 cascade. Both use vkmesh for hole
+filling and remeshing, with simplification disabled by default. For opaque
+input, both also use an auto-discovered BiRefNet model when available; Pixal3D
+requires it, while TRELLIS.2 can still run without it.
+
+### Pixal3D
+
+Pixal3D uses the same executable and is detected from the checkpoint tensor
+layout. Its projected image conditioning also needs the ValeoAI NAF checkpoint,
+converted once from the release `.pth` file to safetensors (this command needs
+Python `torch` and `safetensors`):
+
+```sh
+python3 tools/convert_naf_weights.py \
+  https://github.com/valeoai/NAF/releases/download/model/naf_release.pth \
+  ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors
+```
+
+Run the 1024 cascade on CUDA or Vulkan with:
+
+```sh
+./build/trellis-image-to-gltf \
+  --model ../Pixal3D/Pixal3D \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image example_image/T.png \
+  --gltf pixal3d.glb
+```
+
+`1536_cascade` is also supported. `--naf` may be omitted when
+`ckpts/naf_release.safetensors` exists below the model directory, or when
+`TRELLIS_NAF_PATH` is set. If GPU memory is constrained, use
+`--no-model-cache` or a finite `--model-cache-budget-mib` value. Pixal3D camera
+projection defaults to horizontal FOV `0.857556` and mesh scale `1`; when
+`--camera-distance` is omitted or zero, distance is fitted as
+`1 / (2 * mesh_scale * tan(fov / 2))` (`1.09375` for those defaults). An
+explicit positive `--camera-distance` is preserved. This fits distance to the
+selected FOV but does not estimate FOV from the image. A transparent foreground
+mask is used directly. For opaque input, BiRefNet is discovered from
+`TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
+DINO; `--birefnet FILE` remains an explicit override.
+TRELLIS.2 checkpoints ignore the NAF and camera options.
+
+C callers that need Pixal3D overrides can initialize
+`trellis_pixal3d_options` with `TRELLIS_PIXAL3D_OPTIONS_INIT` and call
+`trellis_pipeline_image_to_gltf_ex()`; non-positive `camera_distance` selects
+the same FOV/mesh-scale fit. The legacy entry point uses that fitted default
+camera and automatic NAF lookup.
+
+Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
+On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
+Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
+tail rows are bounds checked. This avoids the BF16-to-F16 narrowing and F16
+accumulator overflow of ggml's current MMA kernel. TRELLIS.2 keeps the faster
+F16 MMA path for its sparse and 512-resolution flows, while its 1024 shape and
+texture components use strict BF16 Flash because real long-sequence regression
+testing exposes the same F16 accumulator overflow there. `--no-ggml-flash-attn`
+explicitly selects SDPA; that path can require
+quadratic score memory for long sparse sequences. The package-level policies
+are instance scoped, so loading Trellis2 and Pixal3D in one process does not
+change either model's attention mode.
+
+On Vulkan devices that expose F16 KHR cooperative matrices with F32
+accumulators but do not expose native BF16 cooperative-matrix operands, the
+strict BF16 mode continues to use the range-safe scalar-F32 streaming kernel by
+default. `GGML_VK_BF16_F16_MMA=1` enables an NVIDIA-only D128 experiment that
+stages BF16 K/V as F16, uses F32 accumulation for both QK and P×V, and applies
+a power-of-two V scale independently to each 16-channel panel of every KV tile
+before restoring its F32 contribution. This avoids F16 V-staging overflow and
+does not change the ordinary Trellis2 F16 path. It is intentionally opt-in:
+Q/K still have F16 operand range, softmax probabilities are staged as F16, and
+very wide value ranges inside one V panel can underflow its smaller values.
+Consequently, this is not equivalent to native BF16 Tensor Core operands for
+arbitrary inputs and should be revalidated before enabling it for another model
+family.
 
 Windows:
 
@@ -107,7 +188,6 @@ Windows:
 .\build-win\Release\trellis-image-to-gltf.exe `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
   --image example_image\T.png `
   --gltf output.glb
 ```
@@ -119,7 +199,6 @@ For a Windows Vulkan build, use:
   --backend vulkan `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
   --image example_image\T.png `
   --gltf output.glb
 ```

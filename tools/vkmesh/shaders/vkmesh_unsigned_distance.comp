@@ -19,11 +19,11 @@ layout(binding = 1) readonly buffer Vertices {
     float vertices[];
 };
 
-layout(binding = 2) buffer OutData {
-    uint out_data[];
+layout(binding = 2) buffer QueryIO {
+    uint query_io[];
 };
 
-layout(binding = 3) buffer AuxData {
+layout(binding = 3) readonly buffer AuxData {
     uint aux_data[];
 };
 
@@ -93,14 +93,14 @@ void main() {
     if (point_id >= p.n) return;
     uint pbase = point_id * 3u;
     vec3 pnt = vec3(
-        uintBitsToFloat(aux_data[pbase + 0u]),
-        uintBitsToFloat(aux_data[pbase + 1u]),
-        uintBitsToFloat(aux_data[pbase + 2u]));
+        uintBitsToFloat(query_io[pbase + 0u]),
+        uintBitsToFloat(query_io[pbase + 1u]),
+        uintBitsToFloat(query_io[pbase + 2u]));
 
     float best = 3.402823466e+38;
     uint best_face = 0xffffffffu;
-    uint node_offset = p.n * 3u;
-    uint tri_offset = node_offset + p.node_count * 8u;
+    uint node_offset = 0u;
+    uint tri_offset = p.node_count * 8u;
     uint stack[64];
     uint sp = 0u;
     stack[sp++] = 0u;
@@ -147,7 +147,7 @@ void main() {
             }
         }
     }
-    uint obase = point_id * 2u;
-    out_data[obase + 0u] = floatBitsToUint(sqrt(best));
-    out_data[obase + 1u] = best_face;
+    uint obase = p.aux2 + point_id * 2u;
+    query_io[obase + 0u] = floatBitsToUint(sqrt(best));
+    query_io[obase + 1u] = best_face;
 }

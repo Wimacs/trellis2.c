@@ -192,6 +192,154 @@ static int run_forward(
     return 1;
 }
 
+static int run_cpu_trim_noop_test(void) {
+    trellis_sparse_backend * backend = NULL;
+    trellis_status status = trellis_sparse_cpu_backend_create(&backend);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    size_t released_bytes = SIZE_MAX;
+    status = trellis_sparse_backend_trim(
+        backend,
+        TRELLIS_SPARSE_TRIM_FREE_BUFFERS | TRELLIS_SPARSE_TRIM_WEIGHTS,
+        &released_bytes);
+    trellis_sparse_backend_destroy(backend);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(released_bytes == 0);
+    return 1;
+}
+
+static int run_vulkan_trim_preserves_device_guides_test(
+    const tiny_sparse_weights * tw,
+    const int32_t * ref_coords,
+    const float * ref_feats,
+    int64_t ref_n,
+    int ref_channels,
+    const trellis_sparse_c2s_guides * ref_guides) {
+    const int32_t input_coords[] = {
+        0, 0, 0, 0,
+        0, 1, 0, 0,
+    };
+    const float input_feats[] = {
+        0.25f, -0.50f,
+        1.00f, 0.75f,
+    };
+    trellis_sparse_backend * backend = NULL;
+    trellis_sparse_c2s_guides device_guides;
+    int32_t * shape_coords = NULL;
+    float * shape_feats = NULL;
+    int32_t * guide_coords = NULL;
+    int32_t * guide_parent = NULL;
+    int32_t * guide_subidx = NULL;
+    int32_t * guided_coords = NULL;
+    float * guided_feats = NULL;
+    int64_t shape_n = 0;
+    int shape_channels = 0;
+    int64_t guided_n = 0;
+    int guided_channels = 0;
+    memset(&device_guides, 0, sizeof(device_guides));
+
+    trellis_status status = trellis_sparse_vulkan_backend_create(0, &backend);
+    if (status == TRELLIS_STATUS_NOT_IMPLEMENTED || status == TRELLIS_STATUS_CUDA_UNAVAILABLE) {
+        fprintf(stderr, "sparse vulkan backend unavailable: %s\n", trellis_status_string(status));
+        return 77;
+    }
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+
+    trellis_sparse_unet_vae_decoder_forward_options options;
+    memset(&options, 0, sizeof(options));
+    options.backend_kind = TRELLIS_SPARSE_BACKEND_VULKAN;
+    options.device = 0;
+    options.sparse_backend = backend;
+    options.return_subs = &device_guides;
+    status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
+        &tw->w,
+        input_coords,
+        input_feats,
+        2,
+        &options,
+        &shape_coords,
+        &shape_feats,
+        &shape_n,
+        &shape_channels);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(shape_n == ref_n && shape_channels == ref_channels);
+    CHECK_TRUE(device_guides.n_levels == ref_guides->n_levels);
+    CHECK_TRUE(device_guides.levels[0].device_map != NULL);
+    CHECK_TRUE(device_guides.levels[0].coords_bxyz == NULL);
+    for (int64_t i = 0; i < ref_n * 4; ++i) {
+        CHECK_TRUE(shape_coords[i] == ref_coords[i]);
+    }
+    for (int64_t i = 0; i < ref_n * ref_channels; ++i) {
+        CHECK_TRUE(check_close(shape_feats[i], ref_feats[i], 1e-4f, "shared_sparse_shape", (int) i));
+    }
+
+    size_t released_bytes = 0;
+    status = trellis_sparse_backend_trim(
+        backend,
+        TRELLIS_SPARSE_TRIM_FREE_BUFFERS | TRELLIS_SPARSE_TRIM_WEIGHTS,
+        &released_bytes);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(released_bytes > 0);
+
+    const int64_t guide_n = ref_guides->levels[0].n_coords;
+    guide_coords = (int32_t *) malloc((size_t) guide_n * 4u * sizeof(int32_t));
+    guide_parent = (int32_t *) malloc((size_t) guide_n * sizeof(int32_t));
+    guide_subidx = (int32_t *) malloc((size_t) guide_n * sizeof(int32_t));
+    CHECK_TRUE(guide_coords != NULL && guide_parent != NULL && guide_subidx != NULL);
+    status = backend->ops->download_c2s_map(
+        backend,
+        (const trellis_sparse_c2s_device_map *) device_guides.levels[0].device_map,
+        guide_coords,
+        guide_parent,
+        guide_subidx,
+        guide_n);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    for (int64_t i = 0; i < guide_n * 4; ++i) {
+        CHECK_TRUE(guide_coords[i] == ref_guides->levels[0].coords_bxyz[i]);
+    }
+    for (int64_t i = 0; i < guide_n; ++i) {
+        CHECK_TRUE(guide_parent[i] == ref_guides->levels[0].parent[i]);
+        CHECK_TRUE(guide_subidx[i] == ref_guides->levels[0].subidx[i]);
+    }
+
+    trellis_sparse_unet_vae_decoder_weights guided_weights = tw->w;
+    guided_weights.pred_subdiv = false;
+    memset(&options, 0, sizeof(options));
+    options.backend_kind = TRELLIS_SPARSE_BACKEND_VULKAN;
+    options.device = 0;
+    options.sparse_backend = backend;
+    options.guide_subs = &device_guides;
+    status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
+        &guided_weights,
+        input_coords,
+        input_feats,
+        2,
+        &options,
+        &guided_coords,
+        &guided_feats,
+        &guided_n,
+        &guided_channels);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(guided_n == ref_n && guided_channels == ref_channels);
+    for (int64_t i = 0; i < ref_n * 4; ++i) {
+        CHECK_TRUE(guided_coords[i] == ref_coords[i]);
+    }
+    for (int64_t i = 0; i < ref_n * ref_channels; ++i) {
+        CHECK_TRUE(check_close(guided_feats[i], ref_feats[i], 1e-4f, "trimmed_sparse_guide", (int) i));
+    }
+
+    free(guided_feats);
+    free(guided_coords);
+    free(guide_subidx);
+    free(guide_parent);
+    free(guide_coords);
+    free(shape_feats);
+    free(shape_coords);
+    trellis_sparse_c2s_guides_free(&device_guides);
+    trellis_sparse_backend_destroy(backend);
+    printf("sparse vulkan trim/device-guide tests passed\n");
+    return 1;
+}
+
 static float large_feat(int64_t row, int channel) {
     return sinf((float) (row % 997) * 0.013f + (float) channel * 0.17f) +
         0.001f * (float) ((row + channel * 11) % 23);
@@ -462,6 +610,7 @@ int main(int argc, char ** argv) {
     if (ok != 1) {
         return ok;
     }
+    CHECK_TRUE(run_cpu_trim_noop_test() == 1);
     CHECK_TRUE(ref_n == 2);
     CHECK_TRUE(ref_channels == 2);
     CHECK_TRUE(ref_guides.n_levels == 1);
@@ -514,6 +663,22 @@ int main(int argc, char ** argv) {
     }
 
     if (backend == TRELLIS_SPARSE_BACKEND_VULKAN) {
+        int trim_ok = run_vulkan_trim_preserves_device_guides_test(
+            &tw,
+            ref_coords,
+            ref_feats,
+            ref_n,
+            ref_channels,
+            &ref_guides);
+        if (trim_ok != 1) {
+            free(ref_coords);
+            free(ref_feats);
+            free(got_coords);
+            free(got_feats);
+            trellis_sparse_c2s_guides_free(&ref_guides);
+            trellis_sparse_c2s_guides_free(&got_guides);
+            return trim_ok;
+        }
         int large_ok = run_large_vulkan_dispatch_tests();
         if (large_ok != 1) {
             free(ref_coords);

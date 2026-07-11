@@ -1,6 +1,8 @@
 #include "trellis.h"
 #include "trellis_ggml_layers.h"
+#include "trellis_platform.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,10 @@ static int check_close(float got, float exp, float tol, const char * name, int i
     }
     fprintf(stderr, "%s[%d] mismatch: got=%g expected=%g diff=%g tol=%g\n", name, idx, got, exp, diff, tol);
     return 0;
+}
+
+static double wall_clock_ms(void) {
+    return (double) trellis_now_us() / 1000.0;
 }
 
 static int conv_out_size_ref(int input, int kernel, int stride, int pad, int dilation) {
@@ -228,6 +234,200 @@ static int test_pixel_shuffle_3d(trellis_backend_context * backend) {
     return 1;
 }
 
+static int test_project_attention(trellis_backend_context * backend) {
+    enum {
+        CHANNELS = 4,
+        PROJ_IN = 3,
+        GLOBAL_CHANNELS = 3,
+        TOKENS = 3,
+        GLOBAL_TOKENS = 2,
+        HEADS = 2,
+        HEAD_DIM = CHANNELS / HEADS,
+        BATCHES = 2,
+    };
+
+    float x_data[CHANNELS * TOKENS * BATCHES];
+    float global_data[GLOBAL_CHANNELS * GLOBAL_TOKENS * BATCHES];
+    float projected_data[PROJ_IN * TOKENS * BATCHES];
+    float q_w_data[CHANNELS * CHANNELS];
+    float q_b_data[CHANNELS];
+    float kv_w_data[2 * CHANNELS * GLOBAL_CHANNELS];
+    float kv_b_data[2 * CHANNELS];
+    float out_w_data[CHANNELS * CHANNELS];
+    float out_b_data[CHANNELS];
+    float proj_w_data[CHANNELS * PROJ_IN];
+    float proj_b_data[CHANNELS];
+    float got[CHANNELS * TOKENS * BATCHES];
+    float exp[CHANNELS * TOKENS * BATCHES];
+
+    for (int b = 0; b < BATCHES; ++b) {
+        for (int t = 0; t < TOKENS; ++t) {
+            for (int c = 0; c < CHANNELS; ++c) {
+                x_data[(b * TOKENS + t) * CHANNELS + c] =
+                    0.09f * (float) (b + 1) + 0.04f * (float) t - 0.025f * (float) c;
+            }
+            for (int c = 0; c < PROJ_IN; ++c) {
+                projected_data[(b * TOKENS + t) * PROJ_IN + c] =
+                    -0.08f + 0.06f * (float) b + 0.035f * (float) t + 0.02f * (float) c;
+            }
+        }
+        for (int t = 0; t < GLOBAL_TOKENS; ++t) {
+            for (int c = 0; c < GLOBAL_CHANNELS; ++c) {
+                global_data[(b * GLOBAL_TOKENS + t) * GLOBAL_CHANNELS + c] =
+                    0.11f * (float) (t + 1) - 0.045f * (float) b + 0.03f * (float) c;
+            }
+        }
+    }
+    for (int o = 0; o < CHANNELS; ++o) {
+        q_b_data[o] = 0.012f * (float) (o - 1);
+        out_b_data[o] = -0.017f + 0.009f * (float) o;
+        proj_b_data[o] = 0.021f - 0.008f * (float) o;
+        for (int i = 0; i < CHANNELS; ++i) {
+            q_w_data[o * CHANNELS + i] = 0.035f * (float) (o + 1) - 0.012f * (float) i;
+            out_w_data[o * CHANNELS + i] = 0.028f * (float) (i + 1) - 0.01f * (float) o;
+        }
+        for (int i = 0; i < PROJ_IN; ++i) {
+            proj_w_data[o * PROJ_IN + i] = -0.03f + 0.014f * (float) (2 * o + i);
+        }
+    }
+    for (int o = 0; o < 2 * CHANNELS; ++o) {
+        kv_b_data[o] = -0.015f + 0.006f * (float) o;
+        for (int i = 0; i < GLOBAL_CHANNELS; ++i) {
+            kv_w_data[o * GLOBAL_CHANNELS + i] =
+                0.018f * (float) (o + 1) - 0.011f * (float) i;
+        }
+    }
+
+    for (int b = 0; b < BATCHES; ++b) {
+        for (int t = 0; t < TOKENS; ++t) {
+            float q[CHANNELS];
+            float attended[CHANNELS];
+            for (int o = 0; o < CHANNELS; ++o) {
+                q[o] = q_b_data[o];
+                attended[o] = 0.0f;
+                for (int i = 0; i < CHANNELS; ++i) {
+                    q[o] += q_w_data[o * CHANNELS + i] *
+                        x_data[(b * TOKENS + t) * CHANNELS + i];
+                }
+            }
+            for (int h = 0; h < HEADS; ++h) {
+                float logits[GLOBAL_TOKENS];
+                float values[GLOBAL_TOKENS][HEAD_DIM];
+                float max_logit = -1e30f;
+                for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; ++d) {
+                        const int channel = h * HEAD_DIM + d;
+                        float key = kv_b_data[channel];
+                        float value = kv_b_data[CHANNELS + channel];
+                        for (int i = 0; i < GLOBAL_CHANNELS; ++i) {
+                            const float input = global_data[
+                                (b * GLOBAL_TOKENS + kt) * GLOBAL_CHANNELS + i];
+                            key += kv_w_data[channel * GLOBAL_CHANNELS + i] * input;
+                            value += kv_w_data[(CHANNELS + channel) * GLOBAL_CHANNELS + i] * input;
+                        }
+                        dot += q[channel] * key;
+                        values[kt][d] = value;
+                    }
+                    logits[kt] = dot / sqrtf((float) HEAD_DIM);
+                    if (logits[kt] > max_logit) max_logit = logits[kt];
+                }
+                float denom = 0.0f;
+                for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                    logits[kt] = expf(logits[kt] - max_logit);
+                    denom += logits[kt];
+                }
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                        attended[h * HEAD_DIM + d] += logits[kt] / denom * values[kt][d];
+                    }
+                }
+            }
+
+            for (int o = 0; o < CHANNELS; ++o) {
+                float value = out_b_data[o] + proj_b_data[o];
+                for (int i = 0; i < CHANNELS; ++i) {
+                    value += out_w_data[o * CHANNELS + i] * attended[i];
+                }
+                for (int i = 0; i < PROJ_IN; ++i) {
+                    value += proj_w_data[o * PROJ_IN + i] *
+                        projected_data[(b * TOKENS + t) * PROJ_IN + i];
+                }
+                exp[(b * TOKENS + t) * CHANNELS + o] = value;
+            }
+        }
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, CHANNELS, TOKENS, BATCHES);
+    struct ggml_tensor * global = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, GLOBAL_CHANNELS, GLOBAL_TOKENS, BATCHES);
+    struct ggml_tensor * projected = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, PROJ_IN, TOKENS, BATCHES);
+    struct ggml_tensor * q_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, CHANNELS, CHANNELS);
+    struct ggml_tensor * q_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    struct ggml_tensor * kv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, GLOBAL_CHANNELS, 2 * CHANNELS);
+    struct ggml_tensor * kv_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * CHANNELS);
+    struct ggml_tensor * out_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, CHANNELS, CHANNELS);
+    struct ggml_tensor * out_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    struct ggml_tensor * proj_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, PROJ_IN, CHANNELS);
+    struct ggml_tensor * proj_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    CHECK_TRUE(x != NULL && global != NULL && projected != NULL && q_w != NULL && q_b != NULL &&
+        kv_w != NULL && kv_b != NULL && out_w != NULL && out_b != NULL && proj_w != NULL && proj_b != NULL);
+
+    struct ggml_tensor * y = trellis_ggml_project_attention(
+        ctx, x, global, projected, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b);
+    CHECK_TRUE(y != NULL);
+    CHECK_TRUE(y->ne[0] == CHANNELS && y->ne[1] == TOKENS && y->ne[2] == BATCHES);
+
+    struct ggml_tensor * bad_tokens = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, PROJ_IN, TOKENS + 1, BATCHES);
+    struct ggml_tensor * bad_batches = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, PROJ_IN, TOKENS, BATCHES + 1);
+    struct ggml_tensor * bad_proj_w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, PROJ_IN + 1, CHANNELS);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, bad_tokens, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b) == NULL);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, bad_batches, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b) == NULL);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, projected, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, bad_proj_w, proj_b) == NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(x, x_data, 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(global, global_data, 0, ggml_nbytes(global));
+    ggml_backend_tensor_set(projected, projected_data, 0, ggml_nbytes(projected));
+    ggml_backend_tensor_set(q_w, q_w_data, 0, ggml_nbytes(q_w));
+    ggml_backend_tensor_set(q_b, q_b_data, 0, ggml_nbytes(q_b));
+    ggml_backend_tensor_set(kv_w, kv_w_data, 0, ggml_nbytes(kv_w));
+    ggml_backend_tensor_set(kv_b, kv_b_data, 0, ggml_nbytes(kv_b));
+    ggml_backend_tensor_set(out_w, out_w_data, 0, ggml_nbytes(out_w));
+    ggml_backend_tensor_set(out_b, out_b_data, 0, ggml_nbytes(out_b));
+    ggml_backend_tensor_set(proj_w, proj_w_data, 0, ggml_nbytes(proj_w));
+    ggml_backend_tensor_set(proj_b, proj_b_data, 0, ggml_nbytes(proj_b));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, got, 0, ggml_nbytes(y));
+
+    int ok = 1;
+    for (int i = 0; i < CHANNELS * TOKENS * BATCHES; ++i) {
+        if (!check_close(got[i], exp[i], 2e-3f, "project_attention", i)) {
+            ok = 0;
+            break;
+        }
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return ok;
+}
+
 static float attention_input_value(int index, float phase, float scale) {
     return scale * (sinf((float) index * phase) + 0.5f * cosf((float) (index + 17) * (phase * 0.37f)));
 }
@@ -291,8 +491,10 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     float * k_data = (float *) malloc(bytes);
     float * v_data = (float *) malloc(bytes);
     float * explicit_out = (float *) malloc(bytes);
-    float * flash_out = (float *) malloc(bytes);
-    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && explicit_out != NULL && flash_out != NULL);
+    float * flash_f16_out = (float *) malloc(bytes);
+    float * flash_bf16_out = (float *) malloc(bytes);
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL &&
+        explicit_out != NULL && flash_f16_out != NULL && flash_bf16_out != NULL);
 
     for (int64_t i = 0; i < nels; ++i) {
         q_data[i] = attention_input_value((int) i, 0.0137f, 0.125f);
@@ -311,19 +513,28 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     ggml_set_name(v, "v");
 
     const float scale = 1.0f / sqrtf((float) HEAD_DIM);
-    trellis_ggml_set_flash_attn_enabled(0);
-    struct ggml_tensor * explicit_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
+    trellis_ggml_attention_policy explicit_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy flash_f16_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy flash_bf16_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    flash_f16_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    flash_bf16_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+    struct ggml_tensor * explicit_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &explicit_policy);
+    struct ggml_tensor * flash_f16_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &flash_f16_policy);
+    struct ggml_tensor * flash_bf16_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &flash_bf16_policy);
+    CHECK_TRUE(explicit_y != NULL && flash_f16_y != NULL && flash_bf16_y != NULL);
     ggml_set_name(explicit_y, "sdpa_explicit");
-    trellis_ggml_set_flash_attn_enabled(1);
-    struct ggml_tensor * flash_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
-    ggml_set_name(flash_y, "sdpa_flash");
-    trellis_ggml_set_flash_attn_enabled(0);
-    CHECK_TRUE(explicit_y != NULL && flash_y != NULL);
-    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_y));
+    ggml_set_name(flash_f16_y, "sdpa_flash_f16");
+    ggml_set_name(flash_bf16_y, "sdpa_flash_bf16");
+    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_f16_y));
+    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_bf16_y));
 
     struct ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, explicit_y);
-    ggml_build_forward_expand(graph, flash_y);
+    ggml_build_forward_expand(graph, flash_f16_y);
+    ggml_build_forward_expand(graph, flash_bf16_y);
     ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
     CHECK_TRUE(alloc != NULL);
     CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
@@ -332,11 +543,25 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
     CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
     ggml_backend_tensor_get(explicit_y, explicit_out, 0, ggml_nbytes(explicit_y));
-    ggml_backend_tensor_get(flash_y, flash_out, 0, ggml_nbytes(flash_y));
+    ggml_backend_tensor_get(flash_f16_y, flash_f16_out, 0, ggml_nbytes(flash_f16_y));
+    ggml_backend_tensor_get(flash_bf16_y, flash_bf16_out, 0, ggml_nbytes(flash_bf16_y));
 
-    char name[128];
-    snprintf(name, sizeof(name), "sdpa_flash_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
-    const int ok = check_attention_close(flash_out, explicit_out, ggml_nelements(explicit_y), 2e-2f, name);
+    char f16_name[128];
+    char bf16_name[128];
+    snprintf(f16_name, sizeof(f16_name), "sdpa_flash_f16_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
+    snprintf(bf16_name, sizeof(bf16_name), "sdpa_flash_bf16_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
+    int ok = check_attention_close(
+        flash_f16_out,
+        explicit_out,
+        ggml_nelements(explicit_y),
+        2e-2f,
+        f16_name);
+    ok = ok && check_attention_close(
+        flash_bf16_out,
+        explicit_out,
+        ggml_nelements(explicit_y),
+        3e-2f,
+        bf16_name);
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -344,7 +569,194 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     free(k_data);
     free(v_data);
     free(explicit_out);
-    free(flash_out);
+    free(flash_f16_out);
+    free(flash_bf16_out);
+    return ok;
+}
+
+static int test_flash_constant_attention(
+    trellis_backend_context * backend,
+    int query_tokens,
+    int kv_tokens,
+    int batches,
+    float value,
+    int use_bf16,
+    int heads,
+    int repeats) {
+    enum { HEAD_DIM = 128 };
+    const int64_t q_nels = (int64_t) HEAD_DIM * query_tokens * heads * batches;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * kv_tokens * heads * batches;
+    float * q_data = (float *) calloc((size_t) q_nels, sizeof(float));
+    float * k_data = (float *) calloc((size_t) kv_nels, sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * output = (float *) malloc((size_t) q_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && output != NULL);
+    for (int64_t i = 0; i < kv_nels; ++i) {
+        v_data[i] = value;
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, query_tokens, heads, batches);
+    struct ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, heads, batches);
+    struct ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, heads, batches);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    policy.mode = use_bf16 ?
+        TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 :
+        TRELLIS_GGML_ATTENTION_MODE_FLASH_F16;
+    struct ggml_tensor * y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, 1.0f / sqrtf((float) HEAD_DIM), &policy);
+    CHECK_TRUE(y != NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    double best_ms = DBL_MAX;
+    double total_ms = 0.0;
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        const double started_ms = wall_clock_ms();
+        CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+        const double elapsed_ms = wall_clock_ms() - started_ms;
+        best_ms = fmin(best_ms, elapsed_ms);
+        total_ms += elapsed_ms;
+    }
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    const float expected = use_bf16 ?
+        ggml_bf16_to_fp32(ggml_fp32_to_bf16(value)) :
+        ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+    const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
+    int ok = 1;
+    for (int64_t i = 0; i < q_nels; ++i) {
+        if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
+            fprintf(
+                stderr,
+                "%s flash constant q=%d kv=%d heads=%d batch=%d value=%g output[%lld]=%g expected=%g tolerance=%g\n",
+                use_bf16 ? "bf16" : "f16",
+                query_tokens,
+                kv_tokens,
+                heads,
+                batches,
+                value,
+                (long long) i,
+                output[i],
+                expected,
+                tolerance);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        printf(
+            "%s flash constant q=%d kv=%d heads=%d batch=%d value=%g output=%g best_ms=%.3f avg_ms=%.3f repeats=%d\n",
+            use_bf16 ? "bf16" : "f16",
+            query_tokens,
+            kv_tokens,
+            heads,
+            batches,
+            value,
+            output[0],
+            best_ms,
+            total_ms / repeats,
+            repeats);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(q_data);
+    free(k_data);
+    free(v_data);
+    free(output);
+    return ok;
+}
+
+static int test_flash_bf16_mixed_v_panels(trellis_backend_context * backend) {
+    enum { HEAD_DIM = 128, QUERY_TOKENS = 257, KV_TOKENS = 5 };
+    static const float panel_values[HEAD_DIM / 16] = {
+        70000.0f, 3.0f, -5.0f, 0.25f, 1024.0f, -2048.0f, 17.0f, -31.0f,
+    };
+    const int64_t q_nels = (int64_t) HEAD_DIM * QUERY_TOKENS;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * KV_TOKENS;
+    float * q_data = (float *) calloc((size_t) q_nels, sizeof(float));
+    float * k_data = (float *) calloc((size_t) kv_nels, sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * output = (float *) malloc((size_t) q_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && output != NULL);
+
+    for (int64_t i = 0; i < kv_nels; ++i) {
+        const int channel = (int) (i % HEAD_DIM);
+        v_data[i] = panel_values[channel / 16];
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, QUERY_TOKENS, 1, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+    struct ggml_tensor * y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, 1.0f / sqrtf((float) HEAD_DIM), &policy);
+    CHECK_TRUE(y != NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    int ok = 1;
+    for (int64_t i = 0; i < q_nels; ++i) {
+        const int channel = (int) (i % HEAD_DIM);
+        const float expected = ggml_bf16_to_fp32(
+            ggml_fp32_to_bf16(panel_values[channel / 16]));
+        const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
+        if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
+            fprintf(
+                stderr,
+                "bf16 flash mixed V panel output[%lld]=%g expected=%g tolerance=%g\n",
+                (long long) i,
+                output[i],
+                expected,
+                tolerance);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        printf("bf16 flash mixed V panels");
+        for (int panel = 0; panel < HEAD_DIM / 16; ++panel) {
+            printf(" p%d=%g", panel, output[panel * 16]);
+        }
+        printf("\n");
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(q_data);
+    free(k_data);
+    free(v_data);
+    free(output);
     return ok;
 }
 
@@ -366,9 +778,24 @@ int main(int argc, char ** argv) {
 
     int ok = test_conv3d(&backend);
     ok = ok && test_pixel_shuffle_3d(&backend);
+    ok = ok && test_project_attention(&backend);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 1024, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 2);
+    if (kind == TRELLIS_BACKEND_CUDA || kind == TRELLIS_BACKEND_VULKAN) {
+        /* Q=K=0 makes every attention row uniform, so the exact result for a
+         * constant V is that constant.  These sizes/values exercise the
+         * historical F16 VKQ overflow and both aligned and short KV tails. */
+        ok = ok && test_flash_constant_attention(&backend, 4730, 4730, 1, 384.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 8192, 8192, 1, 128.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 16384, 16384, 1, 64.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 257, 257, 2, 70000.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 513, 5, 1, 70000.0f, 1, 1, 1);
+        ok = ok && test_flash_bf16_mixed_v_panels(&backend);
+        if (getenv("TRELLIS_LONG_ATTN_PERF") != NULL) {
+            ok = ok && test_flash_constant_attention(&backend, 21775, 21775, 1, 1.0f, 1, 12, 5);
+        }
+    }
     trellis_backend_free(&backend);
     if (!ok) {
         return 1;

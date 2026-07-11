@@ -1,5 +1,8 @@
 #include "trellis.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,13 +32,14 @@ static void usage(FILE * out, const char * argv0) {
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
-        "  --birefnet FILE         Optional BiRefNet GGUF background-removal model; uses --backend/--device\n"
+        "  --naf FILE              Pixal3D NAF weights converted to safetensors; not used by TRELLIS.2\n"
+        "  --birefnet FILE         Override auto-discovered BiRefNet GGUF for opaque input\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
         "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures, default output.glb\n"
         "  --glb FILE              Alias of --gltf\n"
         "  --output FILE           Alias of --gltf\n"
         "  --texture-size N        glTF texture size, default 1024\n"
-        "  --pipeline NAME         512, 1024, or 1024_cascade, default 1024_cascade\n"
+        "  --pipeline NAME         512, 1024, 1024_cascade, or 1536_cascade; default Trellis=512, Pixal3D=1024_cascade\n"
         "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
         "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
         "  --mesh-postprocess-simplify Run vkmesh simplify after remesh/cleanup, default off\n"
@@ -46,6 +50,7 @@ static void usage(FILE * out, const char * argv0) {
         "  --mesh-remesh-resolution N Override remesh grid resolution\n"
         "  --mesh-remesh-band X    Remesh narrow-band size in voxels, default 1\n"
         "  --mesh-remesh-project X Project remesh vertices back to source, default 0\n"
+        "  --vkmesh-gpu-workspace-budget-mib N vkmesh GPU workspace cap; default auto, max 2048 MiB\n"
         "  --vkmesh FILE           vkmesh executable path; default searches sibling binary then PATH\n"
         "  --no-model-cache        Disable persistent model weight cache\n"
         "  --model-cache-budget-mib N GPU-resident weight cache budget; 0/unset means unlimited\n"
@@ -60,6 +65,9 @@ static void usage(FILE * out, const char * argv0) {
         "  --resolution N          Legacy shape resolution override, 512 or 1024; --pipeline controls normal runs\n"
         "  --cond-resolution N     DINO input square edge, default 512\n"
         "  --sparse-resolution N   Sparse-structure output edge, default 32\n"
+        "  --fov X                 Pixal3D horizontal camera FOV in radians, default 0.857556; updates auto distance\n"
+        "  --camera-distance X     Pixal3D projection distance; 0/default derives 1/(2*mesh_scale*tan(fov/2))\n"
+        "  --mesh-scale X          Pixal3D projection-space mesh scale, default 1; updates auto distance\n"
         "  --flow PATH             Override shape SLat flow safetensors path\n"
         "  --decoder PATH          Override FlexiDualGridVaeDecoder safetensors path\n"
         "  --rescale-t X           Shape SLat timestep rescale factor, default 3.0\n"
@@ -71,8 +79,8 @@ static void usage(FILE * out, const char * argv0) {
         "  --flow-block-parts N    Debug: per-block parts 1=self, 2=self+cross, 3=full\n"
         "  --flow-no-rope          Debug: disable sparse RoPE\n"
         "  --emulate-bf16-blocks   Debug: round structured-latent block activations like reference bf16 flow\n"
-        "  --use-ggml-flash-attn   Use ggml flash attention in DiT flows, default on\n"
-        "  --no-ggml-flash-attn    Debug: disable ggml flash attention and use explicit SDPA\n"
+        "  --use-ggml-flash-attn   Force ggml flash attention (TRELLIS.2 default; Pixal3D debug override)\n"
+        "  --no-ggml-flash-attn    Force explicit SDPA\n"
         "  --decode-max-levels N   Debug: run only first N shape decoder levels, default full\n"
         "  --decode-max-input-tokens N Debug: truncate shape decoder input tokens\n"
         "  --max-num-tokens N      Cascade token budget hint, default 49152\n"
@@ -92,11 +100,13 @@ static int parse_int_arg(const char * text, int * out) {
     if (text == NULL || out == NULL || text[0] == '\0') {
         return 0;
     }
+    errno = 0;
     char * end = NULL;
     long v = strtol(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0' || v < INT_MIN || v > INT_MAX) {
         return 0;
     }
+    errno = 0;
     *out = (int) v;
     return 1;
 }
@@ -105,24 +115,28 @@ static int parse_i64_arg(const char * text, int64_t * out) {
     if (text == NULL || out == NULL || text[0] == '\0') {
         return 0;
     }
+    errno = 0;
     char * end = NULL;
     long long v = strtoll(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0') {
         return 0;
     }
+    errno = 0;
     *out = (int64_t) v;
     return 1;
 }
 
 static int parse_u32_arg(const char * text, uint32_t * out) {
-    if (text == NULL || out == NULL || text[0] == '\0') {
+    if (text == NULL || out == NULL || text[0] == '\0' || text[0] == '-') {
         return 0;
     }
+    errno = 0;
     char * end = NULL;
     unsigned long v = strtoul(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0' || v > UINT32_MAX) {
         return 0;
     }
+    errno = 0;
     *out = (uint32_t) v;
     return 1;
 }
@@ -131,9 +145,10 @@ static int parse_float_arg(const char * text, float * out) {
     if (text == NULL || out == NULL || text[0] == '\0') {
         return 0;
     }
+    errno = 0;
     char * end = NULL;
     float v = strtof(text, &end);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0' || !isfinite(v)) {
         return 0;
     }
     *out = v;
@@ -144,12 +159,13 @@ int main(int argc, char ** argv) {
     print_banner();
 
     trellis_image_to_gltf_options options;
+    trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
     memset(&options, 0, sizeof(options));
     options.device = 0;
     options.sparse_structure_steps = 12;
     options.structured_latent_steps = 12;
     options.latent_size = 16;
-    options.pipeline_type = "1024_cascade";
+    options.pipeline_type = NULL;
     options.resolution = 1024;
     options.cond_resolution = 512;
     options.sparse_resolution = 32;
@@ -173,13 +189,19 @@ int main(int argc, char ** argv) {
     options.max_num_tokens = 49152;
     options.model_cache = 1;
     options.model_cache_budget_mib = 0;
-    options.use_ggml_flash_attn = 1;
+    /* Zero means the model package/adapter selects its FlashAttention policy. */
+    options.use_ggml_flash_attn = 0;
+    pixal_options.camera_angle_x = 0.8575560450553894f;
+    pixal_options.camera_distance = 0.0f;
+    pixal_options.mesh_scale = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0) {
             options.model_dir = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--dino") == 0) {
             options.dino_dir = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--naf") == 0) {
+            pixal_options.naf_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--birefnet") == 0) {
             options.birefnet_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--image") == 0) {
@@ -213,6 +235,8 @@ int main(int argc, char ** argv) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &options.mesh_remesh_band)) goto bad_args;
         } else if (strcmp(argv[i], "--mesh-remesh-project") == 0) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &options.mesh_remesh_project)) goto bad_args;
+        } else if (strcmp(argv[i], "--vkmesh-gpu-workspace-budget-mib") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.vkmesh_gpu_workspace_budget_mib)) goto bad_args;
         } else if (strcmp(argv[i], "--vkmesh") == 0) {
             options.vkmesh_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--model-cache") == 0) {
@@ -256,6 +280,12 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.cond_resolution)) goto bad_args;
         } else if (strcmp(argv[i], "--sparse-resolution") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.sparse_resolution)) goto bad_args;
+        } else if (strcmp(argv[i], "--fov") == 0) {
+            if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.camera_angle_x)) goto bad_args;
+        } else if (strcmp(argv[i], "--camera-distance") == 0) {
+            if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.camera_distance)) goto bad_args;
+        } else if (strcmp(argv[i], "--mesh-scale") == 0) {
+            if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.mesh_scale)) goto bad_args;
         } else if (strcmp(argv[i], "--texture-size") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.texture_size)) goto bad_args;
         } else if (strcmp(argv[i], "--rescale-t") == 0) {
@@ -303,6 +333,12 @@ int main(int argc, char ** argv) {
         options.gltf_path = "output.glb";
     }
 
+    if (pixal_options.camera_distance < 0.0f) {
+        TRELLIS_ERROR(
+            "--camera-distance must be 0 for automatic FOV/mesh-scale fitting or greater than 0 for an explicit distance");
+        goto bad_args;
+    }
+
     if (options.model_dir == NULL || options.dino_dir == NULL ||
         options.image_path == NULL ||
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
@@ -313,12 +349,16 @@ int main(int argc, char ** argv) {
         options.mesh_remesh_resolution < 0 ||
         options.mesh_remesh_band <= 0.0f ||
         options.mesh_remesh_project < 0.0f ||
+        pixal_options.camera_angle_x <= 0.0f ||
+        pixal_options.camera_angle_x >= 3.14159265358979323846f ||
+        pixal_options.mesh_scale <= 0.0f ||
+        options.vkmesh_gpu_workspace_budget_mib < 0 ||
         options.model_cache_budget_mib < 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }
 
-    trellis_status status = trellis_pipeline_image_to_gltf(&options);
+    trellis_status status = trellis_pipeline_image_to_gltf_ex(&options, &pixal_options);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("trellis-image-to-gltf failed: %s", trellis_status_string(status));
         return 1;

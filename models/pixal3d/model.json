@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "id": "pixal3d",
+  "family": "pixal3d",
+  "task": "image_to_3d",
+  "profile": "1024_cascade",
+  "components": [
+    {
+      "role": "sparse_structure_flow",
+      "architecture": "pixal_dit_flow",
+      "weights": "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": true
+      }
+    },
+    {
+      "role": "sparse_structure_decoder",
+      "architecture": "sparse_structure_decoder",
+      "weights": "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+      "execution": {
+        "compute_dtype": "f16",
+        "attention": "none"
+      }
+    },
+    {
+      "role": "shape_flow_512",
+      "architecture": "pixal_dit_flow",
+      "weights": "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": true
+      }
+    },
+    {
+      "role": "shape_flow_1024",
+      "architecture": "pixal_dit_flow",
+      "weights": "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": true
+      }
+    },
+    {
+      "role": "texture_flow_1024",
+      "architecture": "pixal_dit_flow",
+      "weights": "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": true
+      }
+    },
+    {
+      "role": "shape_decoder",
+      "architecture": "sparse_unet_vae_decoder",
+      "weights": "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+      "execution": {
+        "compute_dtype": "f16",
+        "attention": "none"
+      }
+    },
+    {
+      "role": "texture_decoder",
+      "architecture": "sparse_unet_vae_decoder",
+      "weights": "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+      "execution": {
+        "compute_dtype": "f16",
+        "attention": "none"
+      }
+    },
+    {
+      "role": "naf_encoder",
+      "architecture": "pixal_naf",
+      "weights": "ckpts/naf_release.safetensors",
+      "execution": {
+        "compute_dtype": "f32",
+        "attention": "none"
+      }
+    }
+  ]
+}

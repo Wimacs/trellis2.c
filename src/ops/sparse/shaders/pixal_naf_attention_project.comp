@@ -1,0 +1,192 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n_coords;
+    uint batch;
+    uint query_h;
+    uint query_w;
+    uint feature_h;
+    uint feature_w;
+    uint image_resolution;
+    uint grid_resolution;
+} p;
+
+layout(binding = 0) readonly buffer Queries { float queries[]; };
+layout(binding = 1) readonly buffer Keys { float keys[]; };
+layout(binding = 2) readonly buffer Values { float values[]; };
+layout(binding = 3) writeonly buffer Output { float output_values[]; };
+layout(binding = 4) readonly buffer Coords { int coords[]; };
+layout(binding = 5) readonly buffer Cameras { float cameras[]; };
+
+shared float query_vector[64];
+shared float scores[81];
+shared int sample_x[4];
+shared int sample_y[4];
+shared float sample_weight[4];
+
+float grid_coord(int index) {
+    if (p.grid_resolution == 1u) {
+        return 0.0;
+    }
+    return -1.0 + 2.0 * float(index) / float(p.grid_resolution - 1u);
+}
+
+uint query_index(uint batch_index, uint y, uint x, uint channel) {
+    return (((batch_index * p.query_h + y) * p.query_w + x) * 256u) + channel;
+}
+
+uint key_index(uint batch_index, uint y, uint x, uint channel) {
+    return (((batch_index * p.feature_h + y) * p.feature_w + x) * 256u) + channel;
+}
+
+uint value_index(uint batch_index, uint y, uint x, uint channel) {
+    return (((batch_index * p.feature_h + y) * p.feature_w + x) * 1024u) + channel;
+}
+
+void prepare_projection(uint token) {
+    int batch_index = coords[token * 4u + 0u];
+    int gx = coords[token * 4u + 1u];
+    int gy = coords[token * 4u + 2u];
+    int gz = coords[token * 4u + 3u];
+    float camera_angle_x = cameras[uint(batch_index) * 3u + 0u];
+    float distance = cameras[uint(batch_index) * 3u + 1u];
+    float mesh_scale = cameras[uint(batch_index) * 3u + 2u];
+
+    float inv_scale_2 = 0.5 / mesh_scale;
+    float x_world = grid_coord(gx) * inv_scale_2;
+    float y_camera = grid_coord(gy) * inv_scale_2;
+    float depth = distance - grid_coord(gz) * inv_scale_2;
+    float focal_pixels =
+        0.5 * float(p.image_resolution) / tan(0.5 * camera_angle_x);
+    float denom = depth + 1.0e-8;
+    float pixel_x = focal_pixels * x_world / denom + 0.5 * float(p.image_resolution);
+    float pixel_y = -focal_pixels * y_camera / denom + 0.5 * float(p.image_resolution);
+    float sx = (pixel_x + 0.5) * float(p.query_w) / float(p.image_resolution) - 0.5;
+    float sy = (pixel_y + 0.5) * float(p.query_h) / float(p.image_resolution) - 0.5;
+
+    if (isnan(sx) || isinf(sx)) sx = sx < 0.0 ? 0.0 : float(p.query_w - 1u);
+    if (isnan(sy) || isinf(sy)) sy = sy < 0.0 ? 0.0 : float(p.query_h - 1u);
+    sx = clamp(sx, 0.0, float(p.query_w - 1u));
+    sy = clamp(sy, 0.0, float(p.query_h - 1u));
+
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    int x1 = min(x0 + 1, int(p.query_w) - 1);
+    int y1 = min(y0 + 1, int(p.query_h) - 1);
+    float wx = sx - float(x0);
+    float wy = sy - float(y0);
+    sample_x[0] = x0;
+    sample_y[0] = y0;
+    sample_weight[0] = (1.0 - wx) * (1.0 - wy);
+    sample_x[1] = x1;
+    sample_y[1] = y0;
+    sample_weight[1] = wx * (1.0 - wy);
+    sample_x[2] = x0;
+    sample_y[2] = y1;
+    sample_weight[2] = (1.0 - wx) * wy;
+    sample_x[3] = x1;
+    sample_y[3] = y1;
+    sample_weight[3] = wx * wy;
+}
+
+void main() {
+    uint group_index = gl_WorkGroupID.x + gl_NumWorkGroups.x *
+        (gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z);
+    uint total_groups = p.n_coords * 4u;
+    if (group_index >= total_groups) {
+        return;
+    }
+
+    uint token = group_index / 4u;
+    uint head = group_index - token * 4u;
+    uint lane = gl_LocalInvocationID.x;
+    uint batch_index = uint(coords[token * 4u + 0u]);
+    if (lane == 0u) {
+        prepare_projection(token);
+    }
+    barrier();
+
+    float result0 = 0.0;
+    float result1 = 0.0;
+    uint dilation_h = p.query_h / p.feature_h;
+    uint dilation_w = p.query_w / p.feature_w;
+
+    for (uint pixel = 0u; pixel < 4u; ++pixel) {
+        if (sample_weight[pixel] == 0.0) {
+            continue;
+        }
+        uint qy = uint(sample_y[pixel]);
+        uint qx = uint(sample_x[pixel]);
+        if (lane < 64u) {
+            query_vector[lane] = queries[query_index(batch_index, qy, qx, head * 64u + lane)];
+        }
+        barrier();
+
+        if (lane < 81u) {
+            uint ky = lane / 9u;
+            uint kx = lane - ky * 9u;
+            /* With an exact integer resize ratio, nearest-exact maps each
+             * dilated residue-group member back to start + kernel offset. */
+            int center_y = int(qy / dilation_h);
+            int center_x = int(qx / dilation_w);
+            int start_y = clamp(center_y - 4, 0, int(p.feature_h) - 9);
+            int start_x = clamp(center_x - 4, 0, int(p.feature_w) - 9);
+            uint source_y = uint(start_y) + ky;
+            uint source_x = uint(start_x) + kx;
+            float dot_value = 0.0;
+            for (uint d = 0u; d < 64u; ++d) {
+                dot_value += query_vector[d] *
+                    keys[key_index(batch_index, source_y, source_x, head * 64u + d)];
+            }
+            scores[lane] = dot_value * 0.125;
+        }
+        barrier();
+
+        if (lane == 0u) {
+            float maximum = scores[0];
+            for (uint i = 1u; i < 81u; ++i) {
+                maximum = max(maximum, scores[i]);
+            }
+            float denominator = 0.0;
+            for (uint i = 0u; i < 81u; ++i) {
+                scores[i] = exp(scores[i] - maximum);
+                denominator += scores[i];
+            }
+            float inverse_denominator = 1.0 / denominator;
+            for (uint i = 0u; i < 81u; ++i) {
+                scores[i] *= inverse_denominator;
+            }
+        }
+        barrier();
+
+        for (uint channel_part = 0u; channel_part < 2u; ++channel_part) {
+            uint value_dim = lane + channel_part * 128u;
+            uint channel = head * 256u + value_dim;
+            float sum = 0.0;
+            for (uint neighbor = 0u; neighbor < 81u; ++neighbor) {
+                uint ky = neighbor / 9u;
+                uint kx = neighbor - ky * 9u;
+                int center_y = int(qy / dilation_h);
+                int center_x = int(qx / dilation_w);
+                int start_y = clamp(center_y - 4, 0, int(p.feature_h) - 9);
+                int start_x = clamp(center_x - 4, 0, int(p.feature_w) - 9);
+                sum += scores[neighbor] * values[value_index(
+                    batch_index,
+                    uint(start_y) + ky,
+                    uint(start_x) + kx,
+                    channel)];
+            }
+            if (channel_part == 0u) {
+                result0 += sample_weight[pixel] * sum;
+            } else {
+                result1 += sample_weight[pixel] * sum;
+            }
+        }
+        barrier();
+    }
+
+    output_values[token * 1024u + head * 256u + lane] = result0;
+    output_values[token * 1024u + head * 256u + lane + 128u] = result1;
+}

@@ -2,7 +2,7 @@
 
 #include "trellis.h"
 #include "trellis_platform.h"
-#include "trellis_pipeline_internal.h"
+#include "image_to_3d_internal.h"
 #include "trellis_sparse_backend.h"
 #include "raylib.h"
 #include "raymath.h"
@@ -180,6 +180,7 @@ typedef struct viewer_options {
     int mesh_postprocess_remesh;
     int mesh_postprocess_no_simplify;
     int mesh_postprocess_decimation_target;
+    int vkmesh_gpu_workspace_budget_mib;
     int model_cache;
     int model_cache_budget_mib;
     int width;
@@ -1130,6 +1131,7 @@ static void usage(FILE * out, const char * argv0) {
         "  --mesh-remesh, --no-mesh-remesh\n"
         "  --mesh-postprocess-simplify, --mesh-postprocess-no-simplify\n"
         "  --mesh-decimation-target N\n"
+        "  --vkmesh-gpu-workspace-budget-mib N\n"
         "  --no-model-cache, --model-cache-budget-mib N\n"
         "  --use-ggml-flash-attn, --no-ggml-flash-attn\n"
         "  --decode-max-levels N, --decode-max-input-tokens N\n"
@@ -1233,6 +1235,9 @@ static int parse_options(int argc, char ** argv, viewer_options * options) {
         } else if (strcmp(argv[i], "--mesh-decimation-target") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options->mesh_postprocess_decimation_target)) return 0;
             options->mesh_postprocess_no_simplify = 0;
+        } else if (strcmp(argv[i], "--vkmesh-gpu-workspace-budget-mib") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options->vkmesh_gpu_workspace_budget_mib) ||
+                options->vkmesh_gpu_workspace_budget_mib < 0) return 0;
         } else if (strcmp(argv[i], "--model-cache") == 0) {
             options->model_cache = 1;
         } else if (strcmp(argv[i], "--no-model-cache") == 0) {
@@ -2073,7 +2078,8 @@ static int run_vkmesh_external(
     int no_simplify,
     int remesh,
     int remesh_resolution,
-    int device) {
+    int device,
+    int gpu_workspace_budget_mib) {
     char exe[VIEWER_MAX_PATH];
     if (!find_vkmesh_executable(exe, sizeof(exe))) {
         return -1;
@@ -2092,10 +2098,12 @@ static int run_vkmesh_external(
     char target_text[64];
     char remesh_resolution_text[64];
     char device_text[64];
+    char workspace_budget_text[64];
     snprintf(target_text, sizeof(target_text), "%d", target > 0 ? target : 1000000);
     snprintf(remesh_resolution_text, sizeof(remesh_resolution_text), "%d", remesh_resolution > 0 ? remesh_resolution : 512);
     snprintf(device_text, sizeof(device_text), "%d", device >= 0 ? device : 0);
-    char * argv[30];
+    snprintf(workspace_budget_text, sizeof(workspace_budget_text), "%d", gpu_workspace_budget_mib > 0 ? gpu_workspace_budget_mib : 0);
+    char * argv[32];
     int argc = 0;
     argv[argc++] = exe;
     argv[argc++] = (char *) "--input";
@@ -2107,6 +2115,8 @@ static int run_vkmesh_external(
     argv[argc++] = (char *) "--postprocess";
     argv[argc++] = (char *) "--device";
     argv[argc++] = device_text;
+    argv[argc++] = (char *) "--gpu-workspace-budget-mib";
+    argv[argc++] = workspace_budget_text;
     if (remesh) {
         argv[argc++] = (char *) "--remesh";
         argv[argc++] = (char *) "--remesh-resolution";
@@ -2162,6 +2172,7 @@ static trellis_status run_mesh_postprocess(
     pp.remesh_band = 1.0f;
     pp.remesh_project = 0.0f;
     pp.device = options->device;
+    pp.gpu_workspace_budget_mib = options->vkmesh_gpu_workspace_budget_mib;
     trellis_status status = trellis_vkmesh_postprocess(mesh, &processed, &projection, &pp);
     if (status != TRELLIS_STATUS_OK) {
         trellis_mesh_free(&processed);
@@ -2177,7 +2188,8 @@ static trellis_status run_mesh_postprocess(
             options->mesh_postprocess_no_simplify,
             options->mesh_postprocess_remesh,
             options->resolution,
-            options->device);
+            options->device,
+            options->vkmesh_gpu_workspace_budget_mib);
     if (external_status < 0) {
         return TRELLIS_STATUS_NOT_FOUND;
     }

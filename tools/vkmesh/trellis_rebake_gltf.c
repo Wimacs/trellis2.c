@@ -1,5 +1,5 @@
 #include "trellis.h"
-#include "../../src/pipeline/trellis_pipeline_internal.h"
+#include "../../src/tasks/image_to_3d/image_to_3d_internal.h"
 
 #include <errno.h>
 #include <limits.h>

@@ -175,7 +175,9 @@ static trellis_status validate_dit_flow_checkpoint(
     const char * safetensors_path,
     trellis_checkpoint_report * report,
     int64_t in_channels,
-    int64_t out_channels) {
+    int64_t out_channels,
+    int64_t pixal_proj_channels,
+    bool allow_pixal_rope_phases) {
     if (safetensors_path == NULL || report == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -199,57 +201,84 @@ static trellis_status validate_dit_flow_checkpoint(
         MOD = 9216,
     };
 
-    expect_linear(&st, report, "input_layer.weight", "input_layer.bias", TRELLIS_DTYPE_BF16, C, in_channels);
-    expect_linear(&st, report, "t_embedder.mlp.0.weight", "t_embedder.mlp.0.bias", TRELLIS_DTYPE_BF16, C, T_FREQ);
-    expect_linear(&st, report, "t_embedder.mlp.2.weight", "t_embedder.mlp.2.bias", TRELLIS_DTYPE_BF16, C, C);
-    expect_linear(&st, report, "adaLN_modulation.1.weight", "adaLN_modulation.1.bias", TRELLIS_DTYPE_BF16, MOD, C);
+    const bool is_pixal = trellis_safetensors_find(
+        &st,
+        "blocks.0.cross_attn.proj_linear.weight") != NULL;
+    const trellis_dtype flow_dtype = is_pixal ? TRELLIS_DTYPE_F32 : TRELLIS_DTYPE_BF16;
+
+    expect_linear(&st, report, "input_layer.weight", "input_layer.bias", flow_dtype, C, in_channels);
+    expect_linear(&st, report, "t_embedder.mlp.0.weight", "t_embedder.mlp.0.bias", flow_dtype, C, T_FREQ);
+    expect_linear(&st, report, "t_embedder.mlp.2.weight", "t_embedder.mlp.2.bias", flow_dtype, C, C);
+    expect_linear(&st, report, "adaLN_modulation.1.weight", "adaLN_modulation.1.bias", flow_dtype, MOD, C);
 
     char name[160];
     for (int i = 0; i < BLOCKS; ++i) {
         snprintf(name, sizeof(name), "blocks.%d.modulation", i);
-        expect_vec(&st, report, name, TRELLIS_DTYPE_BF16, MOD);
+        expect_vec(&st, report, name, flow_dtype, MOD);
         snprintf(name, sizeof(name), "blocks.%d.norm2.weight", i);
-        expect_vec(&st, report, name, TRELLIS_DTYPE_BF16, C);
+        expect_vec(&st, report, name, flow_dtype, C);
         snprintf(name, sizeof(name), "blocks.%d.norm2.bias", i);
-        expect_vec(&st, report, name, TRELLIS_DTYPE_BF16, C);
+        expect_vec(&st, report, name, flow_dtype, C);
 
         snprintf(name, sizeof(name), "blocks.%d.self_attn.to_qkv.weight", i);
         char bias[160];
         snprintf(bias, sizeof(bias), "blocks.%d.self_attn.to_qkv.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, 3 * C, C);
+        expect_linear(&st, report, name, bias, flow_dtype, 3 * C, C);
         snprintf(name, sizeof(name), "blocks.%d.self_attn.to_out.weight", i);
         snprintf(bias, sizeof(bias), "blocks.%d.self_attn.to_out.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, C, C);
+        expect_linear(&st, report, name, bias, flow_dtype, C, C);
         snprintf(name, sizeof(name), "blocks.%d.self_attn.q_rms_norm.gamma", i);
         int64_t qk_shape[TRELLIS_MAX_DIMS] = {0};
         shape2(qk_shape, HEADS, HEAD_DIM);
-        expect_named(&st, report, name, TRELLIS_DTYPE_BF16, 2, qk_shape);
+        expect_named(&st, report, name, flow_dtype, 2, qk_shape);
         snprintf(name, sizeof(name), "blocks.%d.self_attn.k_rms_norm.gamma", i);
-        expect_named(&st, report, name, TRELLIS_DTYPE_BF16, 2, qk_shape);
+        expect_named(&st, report, name, flow_dtype, 2, qk_shape);
 
-        snprintf(name, sizeof(name), "blocks.%d.cross_attn.to_q.weight", i);
-        snprintf(bias, sizeof(bias), "blocks.%d.cross_attn.to_q.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, C, C);
-        snprintf(name, sizeof(name), "blocks.%d.cross_attn.to_kv.weight", i);
-        snprintf(bias, sizeof(bias), "blocks.%d.cross_attn.to_kv.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, 2 * C, COND_C);
-        snprintf(name, sizeof(name), "blocks.%d.cross_attn.to_out.weight", i);
-        snprintf(bias, sizeof(bias), "blocks.%d.cross_attn.to_out.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, C, C);
-        snprintf(name, sizeof(name), "blocks.%d.cross_attn.q_rms_norm.gamma", i);
-        expect_named(&st, report, name, TRELLIS_DTYPE_BF16, 2, qk_shape);
-        snprintf(name, sizeof(name), "blocks.%d.cross_attn.k_rms_norm.gamma", i);
-        expect_named(&st, report, name, TRELLIS_DTYPE_BF16, 2, qk_shape);
+        const char * cross_prefix = is_pixal ?
+            "cross_attn.cross_attn_block" : "cross_attn";
+        snprintf(name, sizeof(name), "blocks.%d.%s.to_q.weight", i, cross_prefix);
+        snprintf(bias, sizeof(bias), "blocks.%d.%s.to_q.bias", i, cross_prefix);
+        expect_linear(&st, report, name, bias, flow_dtype, C, C);
+        snprintf(name, sizeof(name), "blocks.%d.%s.to_kv.weight", i, cross_prefix);
+        snprintf(bias, sizeof(bias), "blocks.%d.%s.to_kv.bias", i, cross_prefix);
+        expect_linear(&st, report, name, bias, flow_dtype, 2 * C, COND_C);
+        snprintf(name, sizeof(name), "blocks.%d.%s.to_out.weight", i, cross_prefix);
+        snprintf(bias, sizeof(bias), "blocks.%d.%s.to_out.bias", i, cross_prefix);
+        expect_linear(&st, report, name, bias, flow_dtype, C, C);
+        snprintf(name, sizeof(name), "blocks.%d.%s.q_rms_norm.gamma", i, cross_prefix);
+        expect_named(&st, report, name, flow_dtype, 2, qk_shape);
+        snprintf(name, sizeof(name), "blocks.%d.%s.k_rms_norm.gamma", i, cross_prefix);
+        expect_named(&st, report, name, flow_dtype, 2, qk_shape);
+
+        if (is_pixal) {
+            snprintf(name, sizeof(name), "blocks.%d.cross_attn.proj_linear.weight", i);
+            snprintf(bias, sizeof(bias), "blocks.%d.cross_attn.proj_linear.bias", i);
+            expect_linear(
+                &st,
+                report,
+                name,
+                bias,
+                flow_dtype,
+                C,
+                pixal_proj_channels);
+        }
 
         snprintf(name, sizeof(name), "blocks.%d.mlp.mlp.0.weight", i);
         snprintf(bias, sizeof(bias), "blocks.%d.mlp.mlp.0.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, MLP, C);
+        expect_linear(&st, report, name, bias, flow_dtype, MLP, C);
         snprintf(name, sizeof(name), "blocks.%d.mlp.mlp.2.weight", i);
         snprintf(bias, sizeof(bias), "blocks.%d.mlp.mlp.2.bias", i);
-        expect_linear(&st, report, name, bias, TRELLIS_DTYPE_BF16, C, MLP);
+        expect_linear(&st, report, name, bias, flow_dtype, C, MLP);
     }
 
-    expect_linear(&st, report, "out_layer.weight", "out_layer.bias", TRELLIS_DTYPE_BF16, out_channels, C);
+    expect_linear(&st, report, "out_layer.weight", "out_layer.bias", flow_dtype, out_channels, C);
+
+    if (is_pixal && allow_pixal_rope_phases &&
+        trellis_safetensors_find(&st, "rope_phases") != NULL) {
+        int64_t rope_shape[TRELLIS_MAX_DIMS] = {0};
+        shape2(rope_shape, 4096, 64);
+        expect_named(&st, report, "rope_phases", TRELLIS_DTYPE_C64, 2, rope_shape);
+    }
 
     status = finish_report(&st, report);
     trellis_safetensors_close(&st);
@@ -259,13 +288,13 @@ static trellis_status validate_dit_flow_checkpoint(
 trellis_status trellis_ss_flow_validate_checkpoint(
     const char * safetensors_path,
     trellis_checkpoint_report * report) {
-    return validate_dit_flow_checkpoint(safetensors_path, report, 8, 8);
+    return validate_dit_flow_checkpoint(safetensors_path, report, 8, 8, 1024, true);
 }
 
 trellis_status trellis_shape_slat_flow_validate_checkpoint(
     const char * safetensors_path,
     trellis_checkpoint_report * report) {
-    return validate_dit_flow_checkpoint(safetensors_path, report, 32, 32);
+    return validate_dit_flow_checkpoint(safetensors_path, report, 32, 32, 2048, false);
 }
 
 static void expect_sparse_convnext_block(

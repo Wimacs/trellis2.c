@@ -137,6 +137,7 @@ typedef struct vkmesh_u64_u32_hash {
     uint64_t * keys;
     uint32_t * vals;
     size_t capacity;
+    size_t count;
 } vkmesh_u64_u32_hash;
 
 typedef struct vkmesh_vk_buffer {
@@ -144,6 +145,7 @@ typedef struct vkmesh_vk_buffer {
     VkDeviceMemory memory;
     void * mapped;
     size_t bytes;
+    size_t allocation_bytes;
 } vkmesh_vk_buffer;
 
 typedef enum vkmesh_pipeline_kind {
@@ -209,6 +211,9 @@ typedef struct vkmesh_vk {
     VkDescriptorSet descriptor_set;
     VkCommandBuffer command_buffer;
     VkFence completion_fence;
+    size_t workspace_budget_bytes;
+    size_t workspace_current_bytes;
+    size_t workspace_peak_bytes;
 } vkmesh_vk;
 
 typedef struct vkmesh_device_mesh {
@@ -218,6 +223,16 @@ typedef struct vkmesh_device_mesh {
     uint32_t n_vertices;
     uint32_t n_faces;
 } vkmesh_device_mesh;
+
+typedef struct vkmesh_distance_query {
+    vkmesh_vk * vk;
+    vkmesh_vk_buffer buffers[4];
+    uint32_t face_count;
+    uint32_t node_count;
+    uint32_t point_capacity;
+    uint32_t output_word_offset;
+    uint32_t batch_count;
+} vkmesh_distance_query;
 
 typedef struct vkmesh_push {
     uint32_t n;
@@ -291,6 +306,7 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
 /* Nested helpers reuse one context per call without sharing Vulkan objects across threads. */
 static VKMESH_THREAD_LOCAL vkmesh_vk * g_active_vkmesh_vk = NULL;
 static VKMESH_THREAD_LOCAL int g_vkmesh_device_index = 0;
+static VKMESH_THREAD_LOCAL int g_vkmesh_workspace_budget_mib = 0;
 
 typedef enum vkmesh_error_kind {
     VKMESH_ERROR_NONE = 0,
@@ -589,10 +605,93 @@ static uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits, 
     return UINT32_MAX;
 }
 
+static int vkmesh_device_supports_memory_budget(VkPhysicalDevice physical) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+        return 0;
+    }
+    VkExtensionProperties * extensions = (VkExtensionProperties *) malloc((size_t) count * sizeof(*extensions));
+    if (extensions == NULL) return 0;
+    int supported = 0;
+    if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, extensions) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (strcmp(extensions[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+                supported = 1;
+                break;
+            }
+        }
+    }
+    free(extensions);
+    return supported;
+}
+
+static size_t vkmesh_resolve_workspace_budget(VkPhysicalDevice physical) {
+    const size_t mib = 1024u * 1024u;
+    int requested_mib = g_vkmesh_workspace_budget_mib;
+    if (requested_mib <= 0) {
+        const char * env = getenv("TRELLIS_VKMESH_GPU_WORKSPACE_BUDGET_MIB");
+        int parsed = 0;
+        if (env != NULL && env[0] != '\0') {
+            if (parse_int_arg(env, &parsed) && parsed > 0) {
+                requested_mib = parsed;
+            } else {
+                fprintf(stderr,
+                    "vkmesh: ignoring invalid TRELLIS_VKMESH_GPU_WORKSPACE_BUDGET_MIB='%s'\n",
+                    env);
+            }
+        }
+    }
+    if (requested_mib > 0) {
+        if ((size_t) requested_mib > SIZE_MAX / mib) return SIZE_MAX;
+        return (size_t) requested_mib * mib;
+    }
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props;
+    memset(&budget_props, 0, sizeof(budget_props));
+    budget_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 props2;
+    memset(&props2, 0, sizeof(props2));
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    const int has_budget = vkmesh_device_supports_memory_budget(physical);
+    if (has_budget) props2.pNext = &budget_props;
+    vkGetPhysicalDeviceMemoryProperties2(physical, &props2);
+
+    VkDeviceSize best_heap_budget = 0;
+    VkDeviceSize best_heap_available = 0;
+    for (uint32_t i = 0; i < props2.memoryProperties.memoryTypeCount; ++i) {
+        const VkMemoryType * type = &props2.memoryProperties.memoryTypes[i];
+        const VkMemoryPropertyFlags required =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if ((type->propertyFlags & required) != required) continue;
+        const uint32_t heap_index = type->heapIndex;
+        VkDeviceSize heap_budget = has_budget ?
+            budget_props.heapBudget[heap_index] : props2.memoryProperties.memoryHeaps[heap_index].size;
+        VkDeviceSize heap_usage = has_budget ? budget_props.heapUsage[heap_index] : 0;
+        VkDeviceSize available = heap_budget > heap_usage ? heap_budget - heap_usage : 0;
+        if (available > best_heap_available) {
+            best_heap_available = available;
+            best_heap_budget = heap_budget;
+        }
+    }
+
+    const VkDeviceSize cap = (VkDeviceSize) 2048u * mib;
+    const VkDeviceSize minimum = (VkDeviceSize) 64u * mib;
+    VkDeviceSize headroom = best_heap_budget / 8u;
+    if (headroom < (VkDeviceSize) 512u * mib) headroom = (VkDeviceSize) 512u * mib;
+    VkDeviceSize automatic = best_heap_budget / 4u;
+    if (automatic > cap) automatic = cap;
+    VkDeviceSize pressure_limit = best_heap_available > headroom ? best_heap_available - headroom : best_heap_available / 2u;
+    if (automatic > pressure_limit) automatic = pressure_limit;
+    if (automatic < minimum) automatic = minimum;
+    if (automatic > (VkDeviceSize) SIZE_MAX) return SIZE_MAX;
+    return (size_t) automatic;
+}
+
 static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b);
 static int vkmesh_vk_init(vkmesh_vk * vk);
 
 static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+    if (vk == NULL || out == NULL || bytes == 0) return 0;
     memset(out, 0, sizeof(*out));
     out->bytes = bytes;
     VkBufferCreateInfo buffer_info;
@@ -606,6 +705,20 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(vk->device, out->buffer, &req);
+    if (req.size > (VkDeviceSize) SIZE_MAX ||
+        (vk->workspace_budget_bytes > 0 &&
+         ((size_t) req.size > vk->workspace_budget_bytes ||
+          vk->workspace_current_bytes > vk->workspace_budget_bytes - (size_t) req.size))) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        fprintf(stderr,
+            "vkmesh: GPU workspace budget exceeded request=%.1f MiB current=%.1f MiB budget=%.1f MiB\n",
+            (double) req.size / (1024.0 * 1024.0),
+            (double) vk->workspace_current_bytes / (1024.0 * 1024.0),
+            (double) vk->workspace_budget_bytes / (1024.0 * 1024.0));
+        vkDestroyBuffer(vk->device, out->buffer, NULL);
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
     uint32_t memory_type = find_memory_type(
         vk->physical_device,
         req.memoryTypeBits,
@@ -631,6 +744,11 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
         vk_buffer_destroy(vk, out);
         return 0;
     }
+    out->allocation_bytes = (size_t) req.size;
+    vk->workspace_current_bytes += out->allocation_bytes;
+    if (vk->workspace_current_bytes > vk->workspace_peak_bytes) {
+        vk->workspace_peak_bytes = vk->workspace_current_bytes;
+    }
     memset(out->mapped, 0, bytes);
     return 1;
 }
@@ -640,12 +758,22 @@ static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b) {
     if (b->mapped != NULL) vkUnmapMemory(vk->device, b->memory);
     if (b->memory != VK_NULL_HANDLE) vkFreeMemory(vk->device, b->memory, NULL);
     if (b->buffer != VK_NULL_HANDLE) vkDestroyBuffer(vk->device, b->buffer, NULL);
+    if (vk != NULL && b->allocation_bytes <= vk->workspace_current_bytes) {
+        vk->workspace_current_bytes -= b->allocation_bytes;
+    }
     memset(b, 0, sizeof(*b));
 }
 
 static void vkmesh_vk_destroy(vkmesh_vk * vk) {
     if (vk == NULL) return;
     if (vk->device != VK_NULL_HANDLE) vkDeviceWaitIdle(vk->device);
+    if (vk->workspace_peak_bytes > 0) {
+        fprintf(stderr,
+            "vkmesh: GPU workspace peak %.1f MiB (budget %.1f MiB, live at destroy %.1f MiB)\n",
+            (double) vk->workspace_peak_bytes / (1024.0 * 1024.0),
+            (double) vk->workspace_budget_bytes / (1024.0 * 1024.0),
+            (double) vk->workspace_current_bytes / (1024.0 * 1024.0));
+    }
     if (vk->completion_fence != VK_NULL_HANDLE) vkDestroyFence(vk->device, vk->completion_fence, NULL);
     if (vk->descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk->device, vk->descriptor_pool, NULL);
     for (uint32_t i = 0; i < VKMESH_PIPE_COUNT; ++i) {
@@ -791,7 +919,12 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
 
     VkPhysicalDeviceProperties device_props;
     vkGetPhysicalDeviceProperties(vk->physical_device, &device_props);
-    fprintf(stderr, "vkmesh: using Vulkan device %d: %s\n", g_vkmesh_device_index, device_props.deviceName);
+    vk->workspace_budget_bytes = vkmesh_resolve_workspace_budget(vk->physical_device);
+    fprintf(stderr,
+        "vkmesh: using Vulkan device %d: %s (GPU workspace budget %.1f MiB)\n",
+        g_vkmesh_device_index,
+        device_props.deviceName,
+        (double) vk->workspace_budget_bytes / (1024.0 * 1024.0));
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info;
@@ -5101,6 +5234,9 @@ static int vkmesh_build_bvh(
     (void) bvh_build_recursive(tris, 0, (int) mesh->n_faces, nodes, &node_count);
     for (int64_t i = 0; i < mesh->n_faces; ++i) tri_indices[i] = tris[i].face;
     free(tris);
+    vkmesh_bvh_node * compact_nodes =
+        (vkmesh_bvh_node *) realloc(nodes, (size_t) node_count * sizeof(*nodes));
+    if (compact_nodes != NULL) nodes = compact_nodes;
     *nodes_out = nodes;
     *node_count_out = node_count;
     *tri_indices_out = tri_indices;
@@ -5114,42 +5250,6 @@ static uint32_t u32_from_float(float value) {
     } v;
     v.f = value;
     return v.u;
-}
-
-static int pack_bvh_aux_buffer(
-    const float * points,
-    int64_t point_count,
-    const vkmesh_bvh_node * nodes,
-    uint32_t node_count,
-    const uint32_t * tri_indices,
-    int64_t tri_count,
-    uint32_t ** words_out,
-    size_t * word_count_out) {
-    *words_out = NULL;
-    *word_count_out = 0;
-    size_t point_words = (size_t) point_count * 3u;
-    size_t node_words = (size_t) node_count * 8u;
-    size_t tri_words = (size_t) tri_count;
-    size_t total_words = point_words + node_words + tri_words;
-    uint32_t * words = (uint32_t *) malloc(total_words * sizeof(uint32_t));
-    if (words == NULL) return 0;
-    for (int64_t i = 0; i < point_count * 3; ++i) words[i] = u32_from_float(points[i]);
-    size_t node_base = point_words;
-    for (uint32_t i = 0; i < node_count; ++i) {
-        size_t base = node_base + (size_t) i * 8u;
-        words[base + 0u] = u32_from_float(nodes[i].bmin[0]);
-        words[base + 1u] = u32_from_float(nodes[i].bmin[1]);
-        words[base + 2u] = u32_from_float(nodes[i].bmin[2]);
-        words[base + 3u] = nodes[i].left;
-        words[base + 4u] = u32_from_float(nodes[i].bmax[0]);
-        words[base + 5u] = u32_from_float(nodes[i].bmax[1]);
-        words[base + 6u] = u32_from_float(nodes[i].bmax[2]);
-        words[base + 7u] = nodes[i].meta;
-    }
-    memcpy(words + point_words + node_words, tri_indices, tri_words * sizeof(uint32_t));
-    *words_out = words;
-    *word_count_out = total_words;
-    return 1;
 }
 
 static int load_points(const char * path, float ** points_out, int64_t * count_out) {
@@ -5212,6 +5312,186 @@ static float float_from_u32(uint32_t bits) {
     return v.f;
 }
 
+static void vkmesh_distance_query_destroy(vkmesh_distance_query * query) {
+    if (query == NULL) return;
+    if (query->vk != NULL) {
+        for (uint32_t i = 0; i < 4; ++i) vk_buffer_destroy(query->vk, &query->buffers[i]);
+    }
+    memset(query, 0, sizeof(*query));
+}
+
+static int vkmesh_distance_query_init(
+    vkmesh_distance_query * query,
+    vkmesh_vk * vk,
+    const vkmesh_mesh * mesh,
+    const vkmesh_bvh_node * nodes,
+    uint32_t node_count,
+    const uint32_t * tri_indices,
+    int64_t max_point_count) {
+    if (query == NULL || vk == NULL || mesh == NULL || nodes == NULL || tri_indices == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_vertices > UINT32_MAX ||
+        mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX ||
+        node_count == 0 || max_point_count <= 0) {
+        return 0;
+    }
+    memset(query, 0, sizeof(*query));
+    query->vk = vk;
+    query->face_count = (uint32_t) mesh->n_faces;
+    query->node_count = node_count;
+
+    const size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
+    const size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
+    if ((size_t) node_count > SIZE_MAX / (8u * sizeof(uint32_t)) ||
+        (size_t) mesh->n_faces > SIZE_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    const size_t node_words = (size_t) node_count * 8u;
+    const size_t tri_words = (size_t) mesh->n_faces;
+    if (node_words > UINT32_MAX || tri_words > UINT32_MAX - node_words) {
+        fprintf(stderr, "vkmesh: BVH is too large for 32-bit shader addressing\n");
+        return 0;
+    }
+    const size_t aux_bytes = (node_words + tri_words) * sizeof(uint32_t);
+
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(vk->physical_device, &properties);
+    const VkDeviceSize max_range = properties.limits.maxStorageBufferRange;
+    if ((VkDeviceSize) faces_bytes > max_range || (VkDeviceSize) vertices_bytes > max_range ||
+        (VkDeviceSize) aux_bytes > max_range) {
+        fprintf(stderr,
+            "vkmesh: source geometry exceeds maxStorageBufferRange; faces=%.1f MiB vertices=%.1f MiB bvh=%.1f MiB limit=%.1f MiB\n",
+            (double) faces_bytes / (1024.0 * 1024.0),
+            (double) vertices_bytes / (1024.0 * 1024.0),
+            (double) aux_bytes / (1024.0 * 1024.0),
+            (double) max_range / (1024.0 * 1024.0));
+        return 0;
+    }
+
+    if (!vk_buffer_create(vk, faces_bytes, &query->buffers[0]) ||
+        !vk_buffer_create(vk, vertices_bytes, &query->buffers[1]) ||
+        !vk_buffer_create(vk, aux_bytes, &query->buffers[3])) {
+        goto fail;
+    }
+    memcpy(query->buffers[0].mapped, mesh->faces, faces_bytes);
+    memcpy(query->buffers[1].mapped, mesh->vertices, vertices_bytes);
+    uint32_t * aux = (uint32_t *) query->buffers[3].mapped;
+    for (uint32_t i = 0; i < node_count; ++i) {
+        const size_t base = (size_t) i * 8u;
+        aux[base + 0u] = u32_from_float(nodes[i].bmin[0]);
+        aux[base + 1u] = u32_from_float(nodes[i].bmin[1]);
+        aux[base + 2u] = u32_from_float(nodes[i].bmin[2]);
+        aux[base + 3u] = nodes[i].left;
+        aux[base + 4u] = u32_from_float(nodes[i].bmax[0]);
+        aux[base + 5u] = u32_from_float(nodes[i].bmax[1]);
+        aux[base + 6u] = u32_from_float(nodes[i].bmax[2]);
+        aux[base + 7u] = nodes[i].meta;
+    }
+    memcpy(aux + node_words, tri_indices, tri_words * sizeof(uint32_t));
+
+    size_t available = vk->workspace_budget_bytes > vk->workspace_current_bytes ?
+        vk->workspace_budget_bytes - vk->workspace_current_bytes : 0;
+    size_t capacity = available / (5u * sizeof(uint32_t));
+    const size_t scratch_cap_bytes = 256u * 1024u * 1024u;
+    if (capacity > scratch_cap_bytes / (5u * sizeof(uint32_t))) {
+        capacity = scratch_cap_bytes / (5u * sizeof(uint32_t));
+    }
+    size_t max_range_capacity = (size_t) (max_range / (5u * sizeof(uint32_t)));
+    uint64_t max_dispatch_points = (uint64_t) properties.limits.maxComputeWorkGroupCount[0] * 128u;
+    if (capacity > max_range_capacity) capacity = max_range_capacity;
+    if ((uint64_t) capacity > max_dispatch_points) capacity = (size_t) max_dispatch_points;
+    if (capacity > UINT32_MAX / 5u) capacity = UINT32_MAX / 5u;
+    if ((uint64_t) capacity > (uint64_t) max_point_count) capacity = (size_t) max_point_count;
+    if (capacity > 128u) capacity &= ~(size_t) 127u;
+    if (capacity == 0) {
+        fprintf(stderr, "vkmesh: GPU workspace budget leaves no room for distance-query batches\n");
+        goto fail;
+    }
+
+    while (capacity > 0) {
+        if (vk_buffer_create(vk, capacity * 5u * sizeof(uint32_t), &query->buffers[2])) break;
+        if (capacity <= 128u) goto fail;
+        capacity = (capacity / 2u) & ~(size_t) 127u;
+    }
+    query->point_capacity = (uint32_t) capacity;
+    query->output_word_offset = query->point_capacity * 3u;
+    fprintf(stderr,
+        "vkmesh: distance workspace static=%.1f MiB batch=%.1f MiB max_batch_points=%u\n",
+        (double) (faces_bytes + vertices_bytes + aux_bytes) / (1024.0 * 1024.0),
+        (double) query->buffers[2].allocation_bytes / (1024.0 * 1024.0),
+        query->point_capacity);
+    return 1;
+
+fail:
+    vkmesh_distance_query_destroy(query);
+    return 0;
+}
+
+static int vkmesh_distance_query_submit_loaded(
+    vkmesh_distance_query * query,
+    uint32_t count,
+    float * distances,
+    uint32_t * face_ids) {
+    if (query == NULL || query->vk == NULL || count == 0 || count > query->point_capacity) {
+        return 0;
+    }
+    uint32_t * io = (uint32_t *) query->buffers[2].mapped;
+    vkmesh_push push;
+    memset(&push, 0, sizeof(push));
+    push.n = count;
+    push.aux0 = query->face_count;
+    push.aux1 = query->node_count;
+    push.aux2 = query->output_word_offset;
+    const uint32_t groups = (count + 127u) / 128u;
+    if (!vkmesh_dispatch(query->vk, VKMESH_PIPE_UNSIGNED_DISTANCE, query->buffers, &push, groups)) return 0;
+
+    const uint32_t * raw = io + query->output_word_offset;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (distances != NULL) distances[i] = float_from_u32(raw[(size_t) i * 2u + 0u]);
+        if (face_ids != NULL) face_ids[i] = raw[(size_t) i * 2u + 1u];
+    }
+    query->batch_count += 1u;
+    return 1;
+}
+
+static int vkmesh_distance_query_dispatch(
+    vkmesh_distance_query * query,
+    const float * points,
+    uint32_t count,
+    float * distances,
+    uint32_t * face_ids) {
+    if (query == NULL || points == NULL || count == 0 || count > query->point_capacity) return 0;
+    uint32_t * io = (uint32_t *) query->buffers[2].mapped;
+    for (uint32_t i = 0; i < count * 3u; ++i) io[i] = u32_from_float(points[i]);
+    return vkmesh_distance_query_submit_loaded(query, count, distances, face_ids);
+}
+
+static int vkmesh_distance_query_points(
+    vkmesh_distance_query * query,
+    const float * points,
+    int64_t point_count,
+    float * distances,
+    uint32_t * face_ids) {
+    if (query == NULL || points == NULL || point_count <= 0 ||
+        (distances == NULL && face_ids == NULL)) {
+        return 0;
+    }
+    int64_t offset = 0;
+    while (offset < point_count) {
+        uint32_t batch = query->point_capacity;
+        if ((int64_t) batch > point_count - offset) batch = (uint32_t) (point_count - offset);
+        if (!vkmesh_distance_query_dispatch(
+                query,
+                points + (size_t) offset * 3u,
+                batch,
+                distances != NULL ? distances + offset : NULL,
+                face_ids != NULL ? face_ids + offset : NULL)) {
+            return 0;
+        }
+        offset += batch;
+    }
+    return 1;
+}
+
 static int vkmesh_unsigned_distance_vulkan_with_bvh(
     const vkmesh_mesh * mesh,
     const vkmesh_bvh_node * nodes,
@@ -5229,43 +5509,18 @@ static int vkmesh_unsigned_distance_vulkan_with_bvh(
         return 0;
     }
 
-    uint32_t * aux_words = NULL;
-    size_t aux_word_count = 0;
-    if (!pack_bvh_aux_buffer(points, point_count, nodes, node_count, tri_indices, mesh->n_faces, &aux_words, &aux_word_count)) {
-        return 0;
-    }
-
     vkmesh_vk local_vk;
     vkmesh_vk * vk = NULL;
     int owns_vk = 0;
     if (!vkmesh_acquire_vk(&vk, &local_vk, &owns_vk)) {
-        free(aux_words);
         return 0;
     }
-    vkmesh_vk_buffer buffers[4];
-    memset(buffers, 0, sizeof(buffers));
-    const size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
-    const size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
-    const size_t out_bytes = (size_t) point_count * 2u * sizeof(uint32_t);
-    const size_t aux_bytes = aux_word_count * sizeof(uint32_t);
+    vkmesh_distance_query query;
+    memset(&query, 0, sizeof(query));
     int ok = 0;
-    if (!vk_buffer_create(vk, faces_bytes, &buffers[0]) ||
-        !vk_buffer_create(vk, vertices_bytes, &buffers[1]) ||
-        !vk_buffer_create(vk, out_bytes, &buffers[2]) ||
-        !vk_buffer_create(vk, aux_bytes, &buffers[3])) {
+    if (!vkmesh_distance_query_init(&query, vk, mesh, nodes, node_count, tri_indices, point_count)) {
         goto cleanup;
     }
-    memcpy(buffers[0].mapped, mesh->faces, faces_bytes);
-    memcpy(buffers[1].mapped, mesh->vertices, vertices_bytes);
-    memcpy(buffers[3].mapped, aux_words, aux_bytes);
-
-    vkmesh_push push;
-    memset(&push, 0, sizeof(push));
-    push.n = (uint32_t) point_count;
-    push.aux0 = (uint32_t) mesh->n_faces;
-    push.aux1 = node_count;
-    uint32_t groups = (uint32_t) ((point_count + 127) / 128);
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNSIGNED_DISTANCE, buffers, &push, groups)) goto cleanup;
 
     float * distances = (float *) malloc((size_t) point_count * sizeof(float));
     uint32_t * face_ids = face_ids_out != NULL ? (uint32_t *) malloc((size_t) point_count * sizeof(uint32_t)) : NULL;
@@ -5274,19 +5529,21 @@ static int vkmesh_unsigned_distance_vulkan_with_bvh(
         free(face_ids);
         goto cleanup;
     }
-    const uint32_t * raw = (const uint32_t *) buffers[2].mapped;
-    for (int64_t i = 0; i < point_count; ++i) {
-        distances[i] = float_from_u32(raw[(size_t) i * 2u + 0u]);
-        if (face_ids != NULL) face_ids[i] = raw[(size_t) i * 2u + 1u];
+    if (!vkmesh_distance_query_points(&query, points, point_count, distances, face_ids)) {
+        free(distances);
+        free(face_ids);
+        goto cleanup;
     }
     *distances_out = distances;
     if (face_ids_out != NULL) *face_ids_out = face_ids;
     ok = 1;
 
 cleanup:
-    for (uint32_t i = 0; i < 4; ++i) vk_buffer_destroy(vk, &buffers[i]);
+    if (query.batch_count > 0u) {
+        fprintf(stderr, "vkmesh: distance query batches=%u\n", query.batch_count);
+    }
+    vkmesh_distance_query_destroy(&query);
     if (owns_vk) vkmesh_vk_destroy(vk);
-    free(aux_words);
     return ok;
 }
 
@@ -5362,8 +5619,9 @@ static int vkmesh_hash_init(vkmesh_u64_u32_hash * map, size_t expected_entries) 
     if (map == NULL) return 0;
     memset(map, 0, sizeof(*map));
     size_t cap = 0;
-    if (expected_entries > SIZE_MAX / 2u) return 0;
+    if (expected_entries > (SIZE_MAX - 16u) / 2u) return 0;
     if (!vkmesh_next_pow2_size(expected_entries * 2u + 16u, &cap)) return 0;
+    if (cap > SIZE_MAX / sizeof(uint64_t) || cap > SIZE_MAX / sizeof(uint32_t)) return 0;
     map->keys = (uint64_t *) malloc(cap * sizeof(uint64_t));
     map->vals = (uint32_t *) malloc(cap * sizeof(uint32_t));
     if (map->keys == NULL || map->vals == NULL) {
@@ -5384,20 +5642,63 @@ static void vkmesh_hash_destroy(vkmesh_u64_u32_hash * map) {
     memset(map, 0, sizeof(*map));
 }
 
-static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
-    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
+static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key);
+
+static int vkmesh_hash_insert_no_grow(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
     size_t mask = map->capacity - 1u;
     size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
     for (size_t i = 0; i < map->capacity; ++i) {
         uint64_t prev = map->keys[slot];
-        if (prev == UINT64_MAX || prev == key) {
+        if (prev == key) {
+            map->vals[slot] = value;
+            return 1;
+        }
+        if (prev == UINT64_MAX) {
             map->keys[slot] = key;
             map->vals[slot] = value;
+            map->count += 1u;
             return 1;
         }
         slot = (slot + 1u) & mask;
     }
     return 0;
+}
+
+static int vkmesh_hash_grow(vkmesh_u64_u32_hash * map) {
+    if (map == NULL || map->capacity == 0 || map->capacity > SIZE_MAX / 2u) return 0;
+    vkmesh_u64_u32_hash grown;
+    memset(&grown, 0, sizeof(grown));
+    const size_t new_capacity = map->capacity * 2u;
+    if (new_capacity > SIZE_MAX / sizeof(uint64_t) || new_capacity > SIZE_MAX / sizeof(uint32_t)) return 0;
+    grown.keys = (uint64_t *) malloc(new_capacity * sizeof(uint64_t));
+    grown.vals = (uint32_t *) malloc(new_capacity * sizeof(uint32_t));
+    if (grown.keys == NULL || grown.vals == NULL) {
+        free(grown.keys);
+        free(grown.vals);
+        return 0;
+    }
+    for (size_t i = 0; i < new_capacity; ++i) grown.keys[i] = UINT64_MAX;
+    grown.capacity = new_capacity;
+    for (size_t i = 0; i < map->capacity; ++i) {
+        if (map->keys[i] != UINT64_MAX &&
+            !vkmesh_hash_insert_no_grow(&grown, map->keys[i], map->vals[i])) {
+            vkmesh_hash_destroy(&grown);
+            return 0;
+        }
+    }
+    free(map->keys);
+    free(map->vals);
+    *map = grown;
+    return 1;
+}
+
+static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
+    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
+    if (vkmesh_hash_lookup(map, key) != UINT32_MAX) {
+        return vkmesh_hash_insert_no_grow(map, key, value);
+    }
+    if (map->count + 1u > map->capacity - map->capacity / 4u && !vkmesh_hash_grow(map)) return 0;
+    return vkmesh_hash_insert_no_grow(map, key, value);
 }
 
 static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key) {
@@ -5465,35 +5766,86 @@ static int vkmesh_mesh_bounds(const vkmesh_mesh * mesh, float bmin[3], float bma
     return 1;
 }
 
-static int vkmesh_remesh_build_points(
+static void vkmesh_distance_query_load_coords(
+    vkmesh_distance_query * query,
+    const vkmesh_remesh_coord * coords,
+    int64_t offset,
+    uint32_t count,
+    int grid_resolution,
+    const float center[3],
+    float scale,
+    int centers) {
+    uint32_t * io = (uint32_t *) query->buffers[2].mapped;
+    const float inv_res = 1.0f / (float) grid_resolution;
+    const float point_offset = centers ? 0.5f : 0.0f;
+    for (uint32_t i = 0; i < count; ++i) {
+        const vkmesh_remesh_coord * coord = &coords[offset + i];
+        io[(size_t) i * 3u + 0u] = u32_from_float(
+            (((float) coord->x + point_offset) * inv_res - 0.5f) * scale + center[0]);
+        io[(size_t) i * 3u + 1u] = u32_from_float(
+            (((float) coord->y + point_offset) * inv_res - 0.5f) * scale + center[1]);
+        io[(size_t) i * 3u + 2u] = u32_from_float(
+            (((float) coord->z + point_offset) * inv_res - 0.5f) * scale + center[2]);
+    }
+}
+
+static int vkmesh_distance_query_coord_values(
+    vkmesh_distance_query * query,
     const vkmesh_remesh_coord * coords,
     int64_t count,
     int grid_resolution,
     const float center[3],
     float scale,
     int centers,
-    float ** points_out) {
-    *points_out = NULL;
-    if (coords == NULL || count <= 0 || count > UINT32_MAX || grid_resolution <= 0) return 0;
-    if ((uint64_t) count > (uint64_t) SIZE_MAX / (3u * sizeof(float))) return 0;
-    float * points = (float *) malloc((size_t) count * 3u * sizeof(float));
-    if (points == NULL) return 0;
-    const float inv_res = 1.0f / (float) grid_resolution;
-    const float offset = centers ? 0.5f : 0.0f;
-    for (int64_t i = 0; i < count; ++i) {
-        points[(size_t) i * 3u + 0u] = (((float) coords[i].x + offset) * inv_res - 0.5f) * scale + center[0];
-        points[(size_t) i * 3u + 1u] = (((float) coords[i].y + offset) * inv_res - 0.5f) * scale + center[1];
-        points[(size_t) i * 3u + 2u] = (((float) coords[i].z + offset) * inv_res - 0.5f) * scale + center[2];
+    float * values) {
+    if (query == NULL || coords == NULL || count <= 0 || grid_resolution <= 0 || values == NULL) return 0;
+    int64_t offset = 0;
+    while (offset < count) {
+        uint32_t batch = query->point_capacity;
+        if ((int64_t) batch > count - offset) batch = (uint32_t) (count - offset);
+        vkmesh_distance_query_load_coords(
+            query, coords, offset, batch, grid_resolution, center, scale, centers);
+        if (!vkmesh_distance_query_submit_loaded(query, batch, values + offset, NULL)) return 0;
+        offset += batch;
     }
-    *points_out = points;
+    return 1;
+}
+
+static int vkmesh_distance_query_filter_coords(
+    vkmesh_distance_query * query,
+    vkmesh_remesh_coord * coords,
+    int64_t count,
+    int grid_resolution,
+    const float center[3],
+    float scale,
+    float eps,
+    float threshold,
+    int64_t * keep_count_out) {
+    if (query == NULL || coords == NULL || count <= 0 || grid_resolution <= 0 || keep_count_out == NULL) return 0;
+    int64_t offset = 0;
+    int64_t keep_count = 0;
+    while (offset < count) {
+        uint32_t batch = query->point_capacity;
+        if ((int64_t) batch > count - offset) batch = (uint32_t) (count - offset);
+        vkmesh_distance_query_load_coords(
+            query, coords, offset, batch, grid_resolution, center, scale, 1);
+        if (!vkmesh_distance_query_submit_loaded(query, batch, NULL, NULL)) return 0;
+        const uint32_t * raw =
+            (const uint32_t *) query->buffers[2].mapped + query->output_word_offset;
+        for (uint32_t i = 0; i < batch; ++i) {
+            float distance = float_from_u32(raw[(size_t) i * 2u]);
+            if (fabsf(distance - eps) < threshold) {
+                coords[keep_count++] = coords[offset + i];
+            }
+        }
+        offset += batch;
+    }
+    *keep_count_out = keep_count;
     return 1;
 }
 
 static int vkmesh_remesh_refine_sparse_grid(
-    const vkmesh_mesh * mesh,
-    const vkmesh_bvh_node * nodes,
-    uint32_t node_count,
-    const uint32_t * tri_indices,
+    vkmesh_distance_query * query,
     int resolution,
     const float center[3],
     float scale,
@@ -5531,21 +5883,19 @@ static int vkmesh_remesh_refine_sparse_grid(
     int ok = 0;
     int level = 0;
     while (1) {
-        float * points = NULL;
-        float * distances = NULL;
-        if (!vkmesh_remesh_build_points(coords, coord_count, base_resolution, center, scale, 1, &points) ||
-            !vkmesh_unsigned_distance_vulkan_with_bvh(mesh, nodes, node_count, tri_indices, points, coord_count, &distances, NULL)) {
-            free(points);
-            free(distances);
-            goto cleanup;
-        }
         const float cell_size = scale / (float) base_resolution;
         int64_t keep_count = 0;
-        for (int64_t i = 0; i < coord_count; ++i) {
-            float d = fabsf(distances[i] - eps);
-            if (d < 0.87f * cell_size) {
-                coords[keep_count++] = coords[i];
-            }
+        if (!vkmesh_distance_query_filter_coords(
+                query,
+                coords,
+                coord_count,
+                base_resolution,
+                center,
+                scale,
+                eps,
+                0.87f * cell_size,
+                &keep_count)) {
+            goto cleanup;
         }
         fprintf(stderr,
             "vkmesh: remesh sparse_grid level=%d resolution=%d candidates=%" PRId64 " kept=%" PRId64 "\n",
@@ -5553,8 +5903,6 @@ static int vkmesh_remesh_refine_sparse_grid(
             base_resolution,
             coord_count,
             keep_count);
-        free(points);
-        free(distances);
         coord_count = keep_count;
         if (coord_count <= 0) goto cleanup;
         if (base_resolution >= resolution) break;
@@ -5588,6 +5936,9 @@ static int vkmesh_remesh_refine_sparse_grid(
         ++level;
     }
 
+    vkmesh_remesh_coord * compact_coords =
+        (vkmesh_remesh_coord *) realloc(coords, (size_t) coord_count * sizeof(*coords));
+    if (compact_coords != NULL) coords = compact_coords;
     *coords_out = coords;
     *count_out = coord_count;
     coords = NULL;
@@ -5622,8 +5973,9 @@ static int vkmesh_remesh_collect_grid_vertices(
     *grid_out = NULL;
     *grid_count_out = 0;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
-    if (coord_count > (int64_t) (SIZE_MAX / 8u)) return 0;
-    if (!vkmesh_hash_init(vert_hash_out, (size_t) coord_count * 4u)) return 0;
+    if ((uint64_t) coord_count > (uint64_t) SIZE_MAX) return 0;
+    /* Start near the observed unique-corner count and grow only for unusually sparse cells. */
+    if (!vkmesh_hash_init(vert_hash_out, (size_t) coord_count)) return 0;
 
     vkmesh_remesh_coord * grid = NULL;
     int64_t grid_count = 0;
@@ -5647,6 +5999,9 @@ static int vkmesh_remesh_collect_grid_vertices(
             }
         }
     }
+    vkmesh_remesh_coord * compact_grid =
+        (vkmesh_remesh_coord *) realloc(grid, (size_t) grid_count * sizeof(*grid));
+    if (compact_grid != NULL) grid = compact_grid;
     *grid_out = grid;
     *grid_count_out = grid_count;
     grid = NULL;
@@ -5681,12 +6036,12 @@ static int vkmesh_remesh_simple_dual_contour(
     const float * grid_values,
     int resolution,
     float ** dual_out,
-    int32_t ** intersected_out) {
+    int8_t ** intersected_out) {
     *dual_out = NULL;
     *intersected_out = NULL;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     float * dual = (float *) malloc((size_t) coord_count * 3u * sizeof(float));
-    int32_t * intersected = (int32_t *) calloc((size_t) coord_count * 3u, sizeof(int32_t));
+    int8_t * intersected = (int8_t *) calloc((size_t) coord_count * 3u, sizeof(int8_t));
     if (dual == NULL || intersected == NULL) {
         free(dual);
         free(intersected);
@@ -5838,7 +6193,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     int64_t coord_count,
     const vkmesh_u64_u32_hash * active_hash,
     const float * dual,
-    const int32_t * intersected,
+    const int8_t * intersected,
     int resolution,
     const float center[3],
     float scale,
@@ -5870,7 +6225,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     int ok = 0;
     for (int64_t i = 0; i < coord_count; ++i) {
         for (int axis = 0; axis < 3; ++axis) {
-            int32_t dir = intersected[(size_t) i * 3u + (size_t) axis];
+            int32_t dir = (int32_t) intersected[(size_t) i * 3u + (size_t) axis];
             if (dir == 0) continue;
             int32_t q[4];
             int valid = 1;
@@ -6017,25 +6372,16 @@ static void vkmesh_closest_point_triangle(
 static int vkmesh_remesh_project_back(
     vkmesh_mesh * mesh,
     const vkmesh_mesh * source,
-    const vkmesh_bvh_node * nodes,
-    uint32_t node_count,
-    const uint32_t * tri_indices,
+    vkmesh_distance_query * query,
     float project_back) {
     if (project_back <= 0.0f) return 1;
-    float * distances = NULL;
-    uint32_t * face_ids = NULL;
-    if (!vkmesh_unsigned_distance_vulkan_with_bvh(
-            source,
-            nodes,
-            node_count,
-            tri_indices,
-            mesh->vertices,
-            mesh->n_vertices,
-            &distances,
-            &face_ids)) {
+    if ((uint64_t) mesh->n_vertices > (uint64_t) SIZE_MAX / sizeof(uint32_t)) return 0;
+    uint32_t * face_ids = (uint32_t *) malloc((size_t) mesh->n_vertices * sizeof(uint32_t));
+    if (face_ids == NULL ||
+        !vkmesh_distance_query_points(query, mesh->vertices, mesh->n_vertices, NULL, face_ids)) {
+        free(face_ids);
         return 0;
     }
-    (void) distances;
     for (int64_t i = 0; i < mesh->n_vertices; ++i) {
         uint32_t face_id = face_ids[i];
         if (face_id >= (uint32_t) source->n_faces) continue;
@@ -6050,20 +6396,21 @@ static int vkmesh_remesh_project_back(
         p[1] -= project_back * (p[1] - q[1]);
         p[2] -= project_back * (p[2] - q[2]);
     }
-    free(distances);
     free(face_ids);
     return 1;
 }
 
-static int vkmesh_remesh_narrow_band_dc(
-    vkmesh_mesh * mesh,
+static int vkmesh_remesh_narrow_band_dc_to(
+    const vkmesh_mesh * mesh,
     int resolution,
     float band,
-    float project_back) {
-    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+    float project_back,
+    vkmesh_mesh * result) {
+    if (result == NULL || mesh == result || mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX) {
         return 0;
     }
+    memset(result, 0, sizeof(*result));
     if (resolution <= 0) resolution = 1024;
     if (band <= 0.0f) band = 1.0f;
     if (project_back < 0.0f) project_back = 0.0f;
@@ -6100,20 +6447,32 @@ static int vkmesh_remesh_narrow_band_dc(
     memset(&vert_hash, 0, sizeof(vert_hash));
     vkmesh_remesh_coord * grid_verts = NULL;
     int64_t grid_vert_count = 0;
-    float * grid_points = NULL;
     float * grid_values = NULL;
     float * dual = NULL;
-    int32_t * intersected = NULL;
+    int8_t * intersected = NULL;
     vkmesh_mesh out;
     memset(&out, 0, sizeof(out));
+    vkmesh_distance_query distance_query;
+    memset(&distance_query, 0, sizeof(distance_query));
+    vkmesh_vk local_vk;
+    vkmesh_vk * vk = NULL;
+    int owns_vk = 0;
     int ok = 0;
 
+    if (!vkmesh_acquire_vk(&vk, &local_vk, &owns_vk)) goto cleanup;
     if (!vkmesh_build_bvh(mesh, &nodes, &node_count, &tri_indices)) goto cleanup;
-    if (!vkmesh_remesh_refine_sparse_grid(
+    if (!vkmesh_distance_query_init(
+            &distance_query,
+            vk,
             mesh,
             nodes,
             node_count,
             tri_indices,
+            UINT32_MAX / 5u)) {
+        goto cleanup;
+    }
+    if (!vkmesh_remesh_refine_sparse_grid(
+            &distance_query,
             resolution,
             center,
             scale,
@@ -6126,34 +6485,55 @@ static int vkmesh_remesh_narrow_band_dc(
     if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
     if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
     fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
-    if (!vkmesh_remesh_build_points(grid_verts, grid_vert_count, resolution, center, scale, 0, &grid_points) ||
-        !vkmesh_unsigned_distance_vulkan_with_bvh(
-            mesh,
-            nodes,
-            node_count,
-            tri_indices,
-            grid_points,
-            grid_vert_count,
-            &grid_values,
-            NULL)) {
+    if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
+    grid_values = (float *) malloc((size_t) grid_vert_count * sizeof(float));
+    if (grid_values == NULL ||
+        !vkmesh_distance_query_coord_values(
+            &distance_query, grid_verts, grid_vert_count, resolution, center, scale, 0, grid_values)) {
         goto cleanup;
     }
     for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
 
-    if (!vkmesh_remesh_simple_dual_contour(coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected) ||
-        !vkmesh_remesh_build_mesh_from_dc(coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) {
-        goto cleanup;
+    if (project_back <= 0.0f) {
+        if (distance_query.batch_count > 0u) {
+            fprintf(stderr, "vkmesh: remesh distance batches=%u\n", distance_query.batch_count);
+        }
+        vkmesh_distance_query_destroy(&distance_query);
+        free(nodes);
+        nodes = NULL;
+        free(tri_indices);
+        tri_indices = NULL;
     }
+    if (!vkmesh_remesh_simple_dual_contour(
+            coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected)) goto cleanup;
+    vkmesh_hash_destroy(&vert_hash);
+    free(grid_verts);
+    grid_verts = NULL;
+    free(grid_values);
+    grid_values = NULL;
+    if (!vkmesh_remesh_build_mesh_from_dc(
+            coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) goto cleanup;
     fprintf(stderr, "vkmesh: remesh after_dual_contour vertices=%" PRId64 " faces=%" PRId64 "\n", out.n_vertices, out.n_faces);
-    if (!vkmesh_remesh_project_back(&out, mesh, nodes, node_count, tri_indices, project_back)) goto cleanup;
+    free(coords);
+    coords = NULL;
+    vkmesh_hash_destroy(&active_hash);
+    free(dual);
+    dual = NULL;
+    free(intersected);
+    intersected = NULL;
+    if (!vkmesh_remesh_project_back(&out, mesh, &distance_query, project_back)) goto cleanup;
 
-    mesh_free(mesh);
-    *mesh = out;
+    *result = out;
     memset(&out, 0, sizeof(out));
-    fprintf(stderr, "vkmesh: remesh_narrow_band_dc done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
+    fprintf(stderr, "vkmesh: remesh_narrow_band_dc done vertices=%" PRId64 " faces=%" PRId64 "\n", result->n_vertices, result->n_faces);
     ok = 1;
 
 cleanup:
+    if (distance_query.batch_count > 0u) {
+        fprintf(stderr, "vkmesh: remesh distance batches=%u\n", distance_query.batch_count);
+    }
+    vkmesh_distance_query_destroy(&distance_query);
+    if (owns_vk) vkmesh_vk_destroy(vk);
     mesh_free(&out);
     free(nodes);
     free(tri_indices);
@@ -6161,11 +6541,24 @@ cleanup:
     vkmesh_hash_destroy(&active_hash);
     vkmesh_hash_destroy(&vert_hash);
     free(grid_verts);
-    free(grid_points);
     free(grid_values);
     free(dual);
     free(intersected);
     return ok;
+}
+
+static int vkmesh_remesh_narrow_band_dc(
+    vkmesh_mesh * mesh,
+    int resolution,
+    float band,
+    float project_back) {
+    if (mesh == NULL) return 0;
+    vkmesh_mesh result;
+    memset(&result, 0, sizeof(result));
+    if (!vkmesh_remesh_narrow_band_dc_to(mesh, resolution, band, project_back, &result)) return 0;
+    mesh_free(mesh);
+    *mesh = result;
+    return 1;
 }
 
 static uint32_t vkmesh_find_parent_u32(const uint32_t * parent, uint32_t count, uint32_t x) {
@@ -6884,17 +7277,36 @@ static int vkmesh_device_fill_holes(
 
     const uint32_t vertex_count = dm->n_vertices;
     const uint32_t face_count = dm->n_faces;
-    const size_t max_boundary_count = (size_t) face_count * 3u;
     size_t edge_count = 0;
     size_t edge_sort_count = 0;
     int ok = 0;
 
-    if (!vk_buffer_create(vk, max_boundary_count * sizeof(vkmesh_boundary_edge), &boundary_buffer) ||
-        !vk_buffer_create(vk, sizeof(uint32_t), &counter_buffer)) {
+    if (!vk_buffer_create(vk, sizeof(uint32_t), &counter_buffer)) {
         goto cleanup;
     }
 
     if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &dummy_buffer, &edge_count, &edge_sort_count)) {
+        goto cleanup;
+    }
+
+    size_t boundary_count_size = 0;
+    const vkmesh_edge * sorted_edges = (const vkmesh_edge *) edges_buffer.mapped;
+    for (size_t begin = 0; begin < edge_count;) {
+        size_t end = begin + 1u;
+        while (end < edge_count &&
+               sorted_edges[end].min_v == sorted_edges[begin].min_v &&
+               sorted_edges[end].max_v == sorted_edges[begin].max_v) {
+            ++end;
+        }
+        if (end == begin + 1u) ++boundary_count_size;
+        begin = end;
+    }
+    if (boundary_count_size == 0u) {
+        ok = 1;
+        goto cleanup;
+    }
+    if (boundary_count_size > UINT32_MAX ||
+        !vk_buffer_create(vk, boundary_count_size * sizeof(vkmesh_boundary_edge), &boundary_buffer)) {
         goto cleanup;
     }
 
@@ -6910,11 +7322,8 @@ static int vkmesh_device_fill_holes(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_BOUNDARY_EDGES, compact_buffers, &push, edge_groups)) goto cleanup;
 
     uint32_t boundary_count = ((const uint32_t *) counter_buffer.mapped)[0];
-    if ((size_t) boundary_count > max_boundary_count) goto cleanup;
-    if (boundary_count == 0u) {
-        ok = 1;
-        goto cleanup;
-    }
+    if ((size_t) boundary_count != boundary_count_size) goto cleanup;
+    vk_buffer_destroy(vk, &edges_buffer);
 
     size_t hole_words_size = (size_t) boundary_count * 7u + (size_t) vertex_count * 2u;
     if (hole_words_size > UINT32_MAX) goto cleanup;
@@ -7610,12 +8019,19 @@ static int vkmesh_trellis_postprocess_device_inner(
 
     if (remesh) {
         if (projection_candidate.vertices != NULL) {
-            if (!mesh_clone(&projection_candidate, &remesh_work)) goto cleanup;
-        } else if (!vkmesh_device_mesh_download(&dm, &remesh_work)) {
-            goto cleanup;
+            vkmesh_device_mesh_destroy(&dm);
+            if (!vkmesh_remesh_narrow_band_dc_to(
+                    &projection_candidate,
+                    remesh_resolution,
+                    remesh_band,
+                    remesh_project,
+                    &remesh_work)) goto cleanup;
+        } else {
+            if (!vkmesh_device_mesh_download(&dm, &remesh_work)) goto cleanup;
+            vkmesh_device_mesh_destroy(&dm);
+            if (!vkmesh_remesh_narrow_band_dc(
+                    &remesh_work, remesh_resolution, remesh_band, remesh_project)) goto cleanup;
         }
-        vkmesh_device_mesh_destroy(&dm);
-        if (!vkmesh_remesh_narrow_band_dc(&remesh_work, remesh_resolution, remesh_band, remesh_project)) goto cleanup;
         if (remesh_work.n_faces > (int64_t) decimation_target) {
             if (!vkmesh_log_simplify(
                     &remesh_work,
@@ -8088,7 +8504,8 @@ trellis_status trellis_vkmesh_postprocess(
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (options != NULL &&
-        (options->device < 0 || options->decimation_target < 0 ||
+        (options->device < 0 || options->gpu_workspace_budget_mib < 0 ||
+         options->decimation_target < 0 ||
          options->simplify_steps < 0 || options->remesh_resolution < 0 ||
          options->max_hole_perimeter < 0.0f || options->degenerate_abs < 0.0f ||
          options->degenerate_rel < 0.0f || options->min_component_area < 0.0f ||
@@ -8148,7 +8565,9 @@ trellis_status trellis_vkmesh_postprocess(
     const float remesh_project =
         options != NULL && options->remesh_project > 0.0f ? options->remesh_project : 0.0f;
     const int previous_device = g_vkmesh_device_index;
+    const int previous_workspace_budget_mib = g_vkmesh_workspace_budget_mib;
     g_vkmesh_device_index = options != NULL ? options->device : 0;
+    g_vkmesh_workspace_budget_mib = options != NULL ? options->gpu_workspace_budget_mib : 0;
     g_vkmesh_last_error = VKMESH_ERROR_NONE;
 
     if (!vkmesh_trellis_postprocess(
@@ -8199,6 +8618,7 @@ trellis_status trellis_vkmesh_postprocess(
 
 cleanup:
     g_vkmesh_device_index = previous_device;
+    g_vkmesh_workspace_budget_mib = previous_workspace_budget_mib;
     if (status != TRELLIS_STATUS_OK) {
         trellis_mesh_free(mesh_out);
         if (projection_mesh_out != NULL) {
@@ -8250,6 +8670,7 @@ static void print_usage(const char * argv0) {
         "  --remesh-project X            Project remesh vertices back to source, default 0\n"
         "  --texture-size N              xatlas pack resolution, default 1024\n"
         "  --device N                    Vulkan physical-device index, default 0\n"
+        "  --gpu-workspace-budget-mib N  VkDeviceMemory workspace cap, default auto (max 2048 MiB)\n"
         "  --unsigned-distance pts.txt   Compute UDF for text points: x y z per line\n"
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
         "  --projection-mesh-output FILE With --postprocess, write post-fill source meshbin for texture projection\n"
@@ -8277,6 +8698,7 @@ int main(int argc, char ** argv) {
     int remesh_resolution = 1024;
     int texture_size = 1024;
     int device = 0;
+    int gpu_workspace_budget_mib = 0;
     int trellis_postprocess = 0;
     int fill_holes = 1;
     int remove_duplicate_faces = 0;
@@ -8383,6 +8805,11 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "vkmesh: invalid --device\n");
                 return 2;
             }
+        } else if (strcmp(argv[i], "--gpu-workspace-budget-mib") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &gpu_workspace_budget_mib)) {
+                fprintf(stderr, "vkmesh: invalid --gpu-workspace-budget-mib\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--unsigned-distance") == 0 && i + 1 < argc) {
             points_path = argv[++i];
         } else if (strcmp(argv[i], "--distance-output") == 0 && i + 1 < argc) {
@@ -8434,7 +8861,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "vkmesh: --distance-output is required with --unsigned-distance\n");
         return 2;
     }
-    if (device < 0 || texture_size <= 0 || max_hole_perimeter < 0.0f ||
+    if (device < 0 || gpu_workspace_budget_mib < 0 || texture_size <= 0 || max_hole_perimeter < 0.0f ||
         degenerate_abs < 0.0f || degenerate_rel < 0.0f || min_component_area < 0.0f ||
         simplify_steps < 0 || simplify_threshold < 0.0f || lambda_edge_length < 0.0f ||
         lambda_skinny < 0.0f || target_faces < 0 ||
@@ -8443,6 +8870,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     g_vkmesh_device_index = device;
+    g_vkmesh_workspace_budget_mib = gpu_workspace_budget_mib;
 
     vkmesh_mesh mesh;
     memset(&mesh, 0, sizeof(mesh));

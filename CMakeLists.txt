@@ -75,7 +75,7 @@ if (TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE)
 endif()
 message(STATUS "TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE=${TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE}")
 
-if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
+if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OR TRELLIS2_C_BUILD_TOOLS)
     find_package(Vulkan REQUIRED)
     if (NOT Vulkan_GLSLC_EXECUTABLE)
         find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
@@ -100,43 +100,54 @@ endif()
 
 set(TRELLIS2_C_SOURCES
     src/runtime/trellis_runtime.c
-    src/model/trellis_sparse_guides.c
-    src/model/trellis_sparse_structure_decoder.c
-    src/model/trellis_dino.c
-    src/model/trellis_birefnet.c
-    src/mesh/trellis_flex_dual_grid.c
-    src/model/trellis_slat_flow_model.c
-    src/model/trellis_ggml_layers.c
-    src/pipeline/trellis_pipeline.c
-    src/pipeline/trellis_pipeline_model_cache.c
-    src/pipeline/trellis_dit_flow_executor.c
-    src/pipeline/trellis_flow_sampler.c
-    src/pipeline/trellis_sparse_structure_pipeline.c
-    src/pipeline/trellis_structured_latent_pipeline.c
-    tools/vkmesh/trellis_gltf_export.c
-    src/io/trellis_safetensors.c
-    src/model/trellis_sparse_unet_vae_decoder.c
-    src/model/trellis_sparse_unet_vae_decoder_exec.c
-    src/model/sparse/trellis_sparse_cpu.c
-    src/io/trellis_weights.c
+    src/runtime/trellis_model_package.c
+    src/runtime/trellis_registry.c
+    src/tasks/image_to_3d/adapter.c
+    src/tasks/image_to_3d/adapters/trellis2.c
+    src/tasks/image_to_3d/adapters/pixal3d.c
+    src/ops/sparse/guides.c
+    src/architectures/sparse_structure_decoder/decoder.c
+    src/architectures/dinov3/dinov3.c
+    src/architectures/pixal_naf/pixal_naf.c
+    src/architectures/birefnet/birefnet.c
+    src/ops/mesh/flex_dual_grid.c
+    src/architectures/dit_flow/dit_flow.c
+    src/ops/ggml/ggml_layers.c
+    src/tasks/image_to_3d/image_to_3d.c
+    src/tasks/image_to_3d/model_cache.c
+    src/architectures/dit_flow/dit_flow_executor.c
+    src/ops/sampling/flow_sampler.c
+    src/ops/projection/pixal_projection.c
+    src/ops/projected_attention/projected_attention.c
+    src/tasks/image_to_3d/stages/sparse_structure.c
+    src/tasks/image_to_3d/stages/structured_latent.c
+    src/tasks/image_to_3d/export/gltf.c
+    src/weights/safetensors.c
+    src/architectures/sparse_unet_decoder/decoder.c
+    src/architectures/sparse_unet_decoder/executor.c
+    src/ops/sparse/trellis_sparse_cpu.c
+    src/ops/sparse/trellis_pixal_naf_backend.c
+    src/weights/tensor_store.c
 )
 
 if (NOT TRELLIS2_C_HAS_VKMESH_C_API)
     list(APPEND TRELLIS2_C_SOURCES
-        src/mesh/trellis_vkmesh_stubs.c
+        src/ops/mesh/vkmesh_stubs.c
     )
 endif()
 
 if (TRELLIS2_C_BACKEND STREQUAL "cuda")
     list(APPEND TRELLIS2_C_SOURCES
-        src/model/sparse/trellis_sparse_vulkan_stubs.c
-        src/model/trellis_cuda_kernels.cu
-        src/model/trellis_cuda_forward.cu
+        src/ops/sparse/trellis_sparse_vulkan_stubs.c
+        src/ops/sparse/cuda/kernels.cu
+        src/ops/sparse/cuda/forward.cu
+        src/ops/projected_attention/projected_attention_cuda.cu
     )
 else()
     list(APPEND TRELLIS2_C_SOURCES
-        src/model/sparse/trellis_sparse_vulkan.c
-        src/model/trellis_cuda_stubs.c
+        src/ops/sparse/trellis_sparse_vulkan.c
+        src/ops/sparse/cuda/stubs.c
+        src/ops/projected_attention/projected_attention_cuda_stubs.c
     )
 endif()
 
@@ -148,7 +159,7 @@ if (WIN32)
 endif()
 
 if (GGML_VULKAN)
-    set(TRELLIS_SPARSE_SHADER_DIR "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/shaders")
+    set(TRELLIS_SPARSE_SHADER_DIR "${CMAKE_CURRENT_LIST_DIR}/src/ops/sparse/shaders")
     set(TRELLIS_SPARSE_SHADER_COMMON_DEPS
         "${TRELLIS_SPARSE_SHADER_DIR}/sparse_common.inc"
         "${TRELLIS_SPARSE_SHADER_DIR}/sparse_mat_common.inc"
@@ -179,34 +190,35 @@ if (GGML_VULKAN)
         set(TRELLIS_SPARSE_VK_HEADERS "${TRELLIS_SPARSE_VK_HEADERS}" PARENT_SCOPE)
     endfunction()
 
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm src/model/sparse/shaders/row_norm.comp trellis_sparse_vk_row_norm_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm_silu src/model/sparse/shaders/row_norm_silu.comp trellis_sparse_vk_row_norm_silu_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_silu src/model/sparse/shaders/silu.comp trellis_sparse_vk_silu_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_add src/model/sparse/shaders/add.comp trellis_sparse_vk_add_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_gather src/model/sparse/shaders/c2s_gather.comp trellis_sparse_vk_c2s_gather_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_skip_repeat src/model/sparse/shaders/skip_repeat.comp trellis_sparse_vk_skip_repeat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_fill_bias src/model/sparse/shaders/fill_bias.comp trellis_sparse_vk_fill_bias_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_hash_insert src/model/sparse/shaders/rulebook_hash_insert.comp trellis_sparse_vk_rulebook_hash_insert_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_fill src/model/sparse/shaders/rulebook_fill.comp trellis_sparse_vk_rulebook_fill_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_count src/model/sparse/shaders/c2s_count.comp trellis_sparse_vk_c2s_count_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_fill src/model/sparse/shaders/c2s_fill.comp trellis_sparse_vk_c2s_fill_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_stride src/model/sparse/shaders/scan_i32_stride.comp trellis_sparse_vk_scan_i32_stride_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_block src/model/sparse/shaders/scan_i32_block.comp trellis_sparse_vk_scan_i32_block_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_add_block_offsets src/model/sparse/shaders/scan_i32_add_block_offsets.comp trellis_sparse_vk_scan_i32_add_block_offsets_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_dispatch src/model/sparse/shaders/rulebook_dispatch.comp trellis_sparse_vk_rulebook_dispatch_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_tile_valid src/model/sparse/shaders/rulebook_tile_valid.comp trellis_sparse_vk_rulebook_tile_valid_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_mask_init src/model/sparse/shaders/rulebook_mask_init.comp trellis_sparse_vk_rulebook_mask_init_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_sort_bitonic src/model/sparse/shaders/sort_bitonic.comp trellis_sparse_vk_sort_bitonic_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_count src/model/sparse/shaders/rulebook_valid_sorted_count.comp trellis_sparse_vk_rulebook_valid_sorted_count_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_scatter src/model/sparse/shaders/rulebook_valid_sorted_scatter.comp trellis_sparse_vk_rulebook_valid_sorted_scatter_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_mat src/model/sparse/shaders/linear_mat.comp trellis_sparse_vk_linear_mat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_mat src/model/sparse/shaders/linear_silu_mat.comp trellis_sparse_vk_linear_silu_mat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_mat src/model/sparse/shaders/sparse_conv_offset_mat.comp trellis_sparse_vk_sparse_conv_offset_mat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_mat src/model/sparse/shaders/sparse_conv_masked_mat.comp trellis_sparse_vk_sparse_conv_masked_mat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_sorted_mat src/model/sparse/shaders/sparse_conv_masked_sorted_mat.comp trellis_sparse_vk_sparse_conv_masked_sorted_mat_spv vulkan1.2)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_coop src/model/sparse/shaders/linear_coop.comp trellis_sparse_vk_linear_coop_spv vulkan1.3)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_coop src/model/sparse/shaders/linear_silu_coop.comp trellis_sparse_vk_linear_silu_coop_spv vulkan1.3)
-    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_coop src/model/sparse/shaders/sparse_conv_offset_coop.comp trellis_sparse_vk_sparse_conv_offset_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm src/ops/sparse/shaders/row_norm.comp trellis_sparse_vk_row_norm_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm_silu src/ops/sparse/shaders/row_norm_silu.comp trellis_sparse_vk_row_norm_silu_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_silu src/ops/sparse/shaders/silu.comp trellis_sparse_vk_silu_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_add src/ops/sparse/shaders/add.comp trellis_sparse_vk_add_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_gather src/ops/sparse/shaders/c2s_gather.comp trellis_sparse_vk_c2s_gather_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_skip_repeat src/ops/sparse/shaders/skip_repeat.comp trellis_sparse_vk_skip_repeat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_fill_bias src/ops/sparse/shaders/fill_bias.comp trellis_sparse_vk_fill_bias_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_hash_insert src/ops/sparse/shaders/rulebook_hash_insert.comp trellis_sparse_vk_rulebook_hash_insert_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_fill src/ops/sparse/shaders/rulebook_fill.comp trellis_sparse_vk_rulebook_fill_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_count src/ops/sparse/shaders/c2s_count.comp trellis_sparse_vk_c2s_count_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_fill src/ops/sparse/shaders/c2s_fill.comp trellis_sparse_vk_c2s_fill_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_stride src/ops/sparse/shaders/scan_i32_stride.comp trellis_sparse_vk_scan_i32_stride_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_block src/ops/sparse/shaders/scan_i32_block.comp trellis_sparse_vk_scan_i32_block_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_add_block_offsets src/ops/sparse/shaders/scan_i32_add_block_offsets.comp trellis_sparse_vk_scan_i32_add_block_offsets_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_dispatch src/ops/sparse/shaders/rulebook_dispatch.comp trellis_sparse_vk_rulebook_dispatch_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_tile_valid src/ops/sparse/shaders/rulebook_tile_valid.comp trellis_sparse_vk_rulebook_tile_valid_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_mask_init src/ops/sparse/shaders/rulebook_mask_init.comp trellis_sparse_vk_rulebook_mask_init_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sort_bitonic src/ops/sparse/shaders/sort_bitonic.comp trellis_sparse_vk_sort_bitonic_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_count src/ops/sparse/shaders/rulebook_valid_sorted_count.comp trellis_sparse_vk_rulebook_valid_sorted_count_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_scatter src/ops/sparse/shaders/rulebook_valid_sorted_scatter.comp trellis_sparse_vk_rulebook_valid_sorted_scatter_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_mat src/ops/sparse/shaders/linear_mat.comp trellis_sparse_vk_linear_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_mat src/ops/sparse/shaders/linear_silu_mat.comp trellis_sparse_vk_linear_silu_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_mat src/ops/sparse/shaders/sparse_conv_offset_mat.comp trellis_sparse_vk_sparse_conv_offset_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_mat src/ops/sparse/shaders/sparse_conv_masked_mat.comp trellis_sparse_vk_sparse_conv_masked_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_sorted_mat src/ops/sparse/shaders/sparse_conv_masked_sorted_mat.comp trellis_sparse_vk_sparse_conv_masked_sorted_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_coop src/ops/sparse/shaders/linear_coop.comp trellis_sparse_vk_linear_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_coop src/ops/sparse/shaders/linear_silu_coop.comp trellis_sparse_vk_linear_silu_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_coop src/ops/sparse/shaders/sparse_conv_offset_coop.comp trellis_sparse_vk_sparse_conv_offset_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_pixal_naf_attention_project src/ops/sparse/shaders/pixal_naf_attention_project.comp trellis_sparse_vk_pixal_naf_attention_project_spv vulkan1.2)
 
     set(TRELLIS_GLTF_BAKE_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_vert.spv")
     set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
@@ -219,30 +231,30 @@ if (GGML_VULKAN)
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=vertex --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.vert"
                 -o "${TRELLIS_GLTF_BAKE_VERT_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.vert"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake vertex shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=fragment --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
                 -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_dilate.comp"
                 -o "${TRELLIS_GLTF_DILATE_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_dilate.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture dilation shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_fill_empty.comp"
                 -o "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_fill_empty.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
@@ -307,30 +319,30 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=vertex --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.vert"
                 -o "${TRELLIS_GLTF_BAKE_VERT_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.vert"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake vertex shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=fragment --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
                 -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_dilate.comp"
                 -o "${TRELLIS_GLTF_DILATE_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_dilate.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture dilation shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_fill_empty.comp"
                 -o "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_fill_empty.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
@@ -384,10 +396,22 @@ target_include_directories(trellis2_c
     PUBLIC
         "${CMAKE_CURRENT_LIST_DIR}/include"
     PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/src/model"
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/sparse"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/sparse/cuda"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/adapters"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/stages"
+        "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
+        "${CMAKE_CURRENT_LIST_DIR}/src/architectures/pixal_naf"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/projected_attention"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection"
+        "${CMAKE_CURRENT_LIST_DIR}/src/weights"
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/stb"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/raylib/src/external"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
 )
 
@@ -435,6 +459,59 @@ endif()
 
 if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(
+            NAME trellis2_c_glb_verifier_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_verify_glb.py)
+        set_tests_properties(trellis2_c_glb_verifier_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+    endif()
+
+    add_executable(trellis2_c_model_package_tests
+        tests/test_model_package.c
+    )
+    target_compile_definitions(trellis2_c_model_package_tests PRIVATE
+        TRELLIS_TEST_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(trellis2_c_model_package_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    target_link_libraries(trellis2_c_model_package_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_model_package_tests COMMAND trellis2_c_model_package_tests)
+
+    add_executable(trellis2_c_model_registry_tests
+        tests/test_model_registry.c
+    )
+    target_include_directories(trellis2_c_model_registry_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    target_link_libraries(trellis2_c_model_registry_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_model_registry_tests COMMAND trellis2_c_model_registry_tests)
+
+    add_executable(trellis2_c_attention_policy_tests
+        tests/test_attention_policy.c
+    )
+    target_link_libraries(trellis2_c_attention_policy_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_attention_policy_tests COMMAND trellis2_c_attention_policy_tests)
+
+    add_executable(trellis2_c_image_to_3d_adapter_tests
+        tests/test_image_to_3d_adapter.c
+    )
+    target_compile_definitions(trellis2_c_image_to_3d_adapter_tests PRIVATE
+        TRELLIS_TEST_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(trellis2_c_image_to_3d_adapter_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_image_to_3d_adapter_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_image_to_3d_adapter_tests COMMAND trellis2_c_image_to_3d_adapter_tests)
+
+    add_executable(trellis2_c_gltf_axes_tests
+        tests/test_gltf_axes.c
+    )
+    target_include_directories(trellis2_c_gltf_axes_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_gltf_axes_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_gltf_axes_tests COMMAND trellis2_c_gltf_axes_tests)
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests
             tests/test_trellis.c
@@ -443,7 +520,10 @@ if (TRELLIS2_C_BUILD_TESTS)
         )
         target_compile_definitions(trellis2_c_tests PRIVATE _POSIX_C_SOURCE=200809L)
         target_include_directories(trellis2_c_tests PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/src/model"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/sparse/cuda"
+            "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
+            "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
             "${CMAKE_CURRENT_LIST_DIR}/tools/debug")
         target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
         add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
@@ -459,11 +539,66 @@ if (TRELLIS2_C_BUILD_TESTS)
         COMMAND trellis2_c_backend_ops_tests ${TRELLIS2_C_BACKEND})
     set_tests_properties(trellis2_c_backend_ops_${TRELLIS2_C_BACKEND}_tests PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(trellis2_c_pixal_condition_tests
+        tests/test_pixal_condition.c
+    )
+    target_include_directories(trellis2_c_pixal_condition_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection")
+    target_link_libraries(trellis2_c_pixal_condition_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_pixal_condition_tests COMMAND trellis2_c_pixal_condition_tests)
+
+    add_executable(trellis2_c_pixal_naf_attention_tests
+        tests/test_pixal_naf_attention.c
+    )
+    target_include_directories(trellis2_c_pixal_naf_attention_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops/projected_attention")
+    target_link_libraries(trellis2_c_pixal_naf_attention_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_pixal_naf_attention_tests COMMAND trellis2_c_pixal_naf_attention_tests)
+
+    add_executable(trellis2_c_pixal_naf_encoder_tests
+        tests/test_pixal_naf_encoder.c
+    )
+    target_include_directories(trellis2_c_pixal_naf_encoder_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/architectures/pixal_naf")
+    target_link_libraries(trellis2_c_pixal_naf_encoder_tests PRIVATE trellis2_c ggml)
+    add_test(
+        NAME trellis2_c_pixal_naf_encoder_${TRELLIS2_C_BACKEND}_tests
+        COMMAND trellis2_c_pixal_naf_encoder_tests ${TRELLIS2_C_BACKEND})
+    set_tests_properties(
+        trellis2_c_pixal_naf_encoder_${TRELLIS2_C_BACKEND}_tests
+        PROPERTIES SKIP_RETURN_CODE 77)
+
+    if (TRELLIS2_C_BACKEND STREQUAL "vulkan")
+        add_executable(trellis2_c_pixal_naf_vulkan_tests
+            tests/test_pixal_naf_vulkan.c
+        )
+        target_include_directories(trellis2_c_pixal_naf_vulkan_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/projected_attention")
+        target_link_libraries(trellis2_c_pixal_naf_vulkan_tests PRIVATE trellis2_c)
+        add_test(NAME trellis2_c_pixal_naf_vulkan_tests COMMAND trellis2_c_pixal_naf_vulkan_tests)
+        set_tests_properties(trellis2_c_pixal_naf_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+        add_executable(trellis2_c_pixal_naf_cuda_tests
+            tests/test_pixal_naf_cuda.c
+        )
+        target_include_directories(trellis2_c_pixal_naf_cuda_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/projected_attention")
+        target_link_libraries(trellis2_c_pixal_naf_cuda_tests PRIVATE trellis2_c)
+        add_test(NAME trellis2_c_pixal_naf_cuda_tests COMMAND trellis2_c_pixal_naf_cuda_tests)
+        set_tests_properties(trellis2_c_pixal_naf_cuda_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     add_executable(trellis2_c_sparse_decoder_backend_tests
         tests/test_sparse_decoder_backend.c
     )
     target_include_directories(trellis2_c_sparse_decoder_backend_tests PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/src/model")
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops")
     target_link_libraries(trellis2_c_sparse_decoder_backend_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_sparse_decoder_backend_cpu_tests COMMAND trellis2_c_sparse_decoder_backend_tests cpu)
     set_tests_properties(trellis2_c_sparse_decoder_backend_cpu_tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -517,6 +652,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
     add_executable(trellis-rebake-gltf
         tools/vkmesh/trellis_rebake_gltf.c
     )
+    target_include_directories(trellis-rebake-gltf PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
     target_link_libraries(trellis-rebake-gltf PRIVATE trellis2_c ggml)
     if (UNIX)
         target_link_libraries(trellis-rebake-gltf PRIVATE m)
@@ -527,7 +664,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis-verify PRIVATE m)
     endif()
 
-    if (GGML_VULKAN)
+    # vkmesh is a standalone Vulkan utility even when the inference backend is
+    # CUDA.  Building it beside trellis-image-to-gltf lets the CUDA pipeline's
+    # existing sibling-executable discovery work without --vkmesh.
+    if (Vulkan_FOUND)
         function(add_vkmesh_shader NAME SOURCE SYMBOL)
             set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
             set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
@@ -627,7 +767,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
             find_package(Threads REQUIRED)
             add_executable(trellis2_c_vkmesh_tests tests/test_vkmesh.c)
             target_include_directories(trellis2_c_vkmesh_tests PRIVATE
-                "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+                "${CMAKE_CURRENT_LIST_DIR}/src/ops"
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
+                "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf")
             target_link_libraries(trellis2_c_vkmesh_tests PRIVATE
                 trellis2_c ggml Vulkan::Vulkan Threads::Threads)
             add_dependencies(trellis2_c_vkmesh_tests vkmesh)
@@ -637,6 +780,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
         endif()
         if (TARGET trellis-image-to-gltf)
             add_dependencies(trellis-image-to-gltf vkmesh)
+        endif()
+        if (TRELLIS2_C_BUILD_TESTS)
+            add_test(NAME trellis2_c_vkmesh_cli_smoke
+                COMMAND $<TARGET_FILE:vkmesh> --help)
         endif()
     endif()
 
@@ -650,8 +797,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
         endif()
         add_executable(trellis-gui ${TRELLIS_GUI_SOURCES})
         target_include_directories(trellis-gui PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
-            "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ops/sparse"
+            "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
+            "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow")
         target_link_libraries(trellis-gui PRIVATE trellis2_c ggml raylib)
         if (WIN32)
             target_link_libraries(trellis-gui PRIVATE comdlg32 shell32)

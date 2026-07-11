@@ -1,7 +1,8 @@
 #include "trellis.h"
 #include "trellis_platform.h"
 #include "trellis_checkpoint_validate.h"
-#include "trellis_cuda_kernels.h"
+#include "kernels.h"
+#include "image_to_3d_internal.h"
 #include "trellis_sparse_reference.h"
 
 #include <errno.h>
@@ -114,6 +115,147 @@ static void test_safetensors(void) {
     CHECK_TRUE(trellis_safetensors_read_f32(&st, mc, out, 1) == TRELLIS_STATUS_OK);
     CHECK_CLOSE(out[0], 5.5f, 1e-3f);
     trellis_safetensors_close(&st);
+    trellis_unlink(path);
+}
+
+static void test_cascade_coord_quantization(void) {
+    const int32_t decoder_coords[] = {
+        2, 8, 63, 511,
+        0, 4, 7, 507,
+        0, 4, 7, 507,
+    };
+    const int32_t expected_trellis[] = {
+        0, 0, 0, 63,
+        2, 1, 7, 63,
+    };
+    const int32_t expected_pixal[] = {
+        0, 1, 1, 62,
+        2, 1, 8, 63,
+    };
+    int32_t * coords = NULL;
+    int64_t n = 0;
+
+    CHECK_TRUE(trellis_pipeline_quantize_cascade_coords(
+        decoder_coords,
+        3,
+        512,
+        1024,
+        TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS,
+        &coords,
+        &n) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(n == 2);
+    CHECK_TRUE(memcmp(coords, expected_trellis, sizeof(expected_trellis)) == 0);
+    free(coords);
+    coords = NULL;
+
+    CHECK_TRUE(trellis_pipeline_quantize_cascade_coords(
+        decoder_coords,
+        3,
+        512,
+        1024,
+        TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL,
+        &coords,
+        &n) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(n == 2);
+    CHECK_TRUE(memcmp(coords, expected_pixal, sizeof(expected_pixal)) == 0);
+    free(coords);
+}
+
+static void test_safetensors_c64_store_skip(void) {
+    char path[PATH_MAX];
+    FILE * f = trellis_open_temp_file(path, sizeof(path), "trellis2_c_safetensors_c64", NULL);
+    CHECK_TRUE(f != NULL);
+
+    const char * header =
+        "{\"rope_phases\":{\"dtype\":\"C64\",\"shape\":[2,2],\"data_offsets\":[0,32]},"
+        "\"weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[32,36]}}";
+    uint64_t hlen = (uint64_t) strlen(header);
+    unsigned char hbuf[8];
+    for (int i = 0; i < 8; ++i) {
+        hbuf[i] = (unsigned char) ((hlen >> (8 * i)) & 0xff);
+    }
+    fwrite(hbuf, 1, 8, f);
+    fwrite(header, 1, strlen(header), f);
+    const float rope_phases[8] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        -1.0f, 0.0f,
+        0.0f, -1.0f,
+    };
+    const float weight = 7.25f;
+    fwrite(rope_phases, 1, sizeof(rope_phases), f);
+    fwrite(&weight, 1, sizeof(weight), f);
+    fclose(f);
+
+    trellis_safetensors st;
+    CHECK_TRUE(trellis_safetensors_open(path, &st) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(st.n_tensors == 2);
+    const trellis_safetensor_meta * rope = trellis_safetensors_find(&st, "rope_phases");
+    CHECK_TRUE(rope != NULL);
+    CHECK_TRUE(rope->dtype == TRELLIS_DTYPE_C64);
+    CHECK_TRUE(strcmp(trellis_dtype_name(rope->dtype), "C64") == 0);
+    CHECK_TRUE(trellis_dtype_size(rope->dtype) == 8);
+    CHECK_TRUE(trellis_safetensor_nelements(rope) == 4);
+    float unsupported_out[4] = {0};
+    CHECK_TRUE(
+        trellis_safetensors_read_f32(&st, rope, unsupported_out, 4) ==
+        TRELLIS_STATUS_NOT_IMPLEMENTED);
+    trellis_safetensors_close(&st);
+
+    trellis_backend_context cpu;
+    CHECK_TRUE(trellis_backend_init(&cpu, TRELLIS_BACKEND_CPU, 0) == TRELLIS_STATUS_OK);
+    trellis_tensor_store store;
+    CHECK_TRUE(trellis_tensor_store_init(&store, 4, 0) == TRELLIS_STATUS_OK);
+    size_t loaded = 0;
+    CHECK_TRUE(
+        trellis_tensor_store_load_safetensors(&store, &cpu, path, false, &loaded) ==
+        TRELLIS_STATUS_OK);
+    CHECK_TRUE(loaded == 1);
+    CHECK_TRUE(store.n_entries == 1);
+    CHECK_TRUE(trellis_tensor_store_get(&store, "rope_phases") == NULL);
+    struct ggml_tensor * loaded_weight = trellis_tensor_store_get(&store, "weight");
+    CHECK_TRUE(loaded_weight != NULL);
+    float weight_out = 0.0f;
+    ggml_backend_tensor_get(loaded_weight, &weight_out, 0, sizeof(weight_out));
+    CHECK_CLOSE(weight_out, weight, 1e-6f);
+
+    trellis_tensor_store_free(&store);
+    trellis_backend_free(&cpu);
+    trellis_unlink(path);
+}
+
+static void test_safetensors_c64_store_rejects_non_rope_tensor(void) {
+    char path[PATH_MAX];
+    FILE * f = trellis_open_temp_file(path, sizeof(path), "trellis2_c_safetensors_c64_reject", NULL);
+    CHECK_TRUE(f != NULL);
+
+    const char * header =
+        "{\"model.rope_phases\":{\"dtype\":\"C64\",\"shape\":[1],\"data_offsets\":[0,8]}}";
+    uint64_t hlen = (uint64_t) strlen(header);
+    unsigned char hbuf[8];
+    for (int i = 0; i < 8; ++i) {
+        hbuf[i] = (unsigned char) ((hlen >> (8 * i)) & 0xff);
+    }
+    const float complex_value[2] = {1.0f, -2.0f};
+    fwrite(hbuf, 1, sizeof(hbuf), f);
+    fwrite(header, 1, strlen(header), f);
+    fwrite(complex_value, 1, sizeof(complex_value), f);
+    fclose(f);
+
+    trellis_backend_context cpu;
+    CHECK_TRUE(trellis_backend_init(&cpu, TRELLIS_BACKEND_CPU, 0) == TRELLIS_STATUS_OK);
+    trellis_tensor_store store;
+    CHECK_TRUE(trellis_tensor_store_init(&store, 4, 0) == TRELLIS_STATUS_OK);
+    size_t loaded = 123;
+    CHECK_TRUE(
+        trellis_tensor_store_load_safetensors(&store, &cpu, path, false, &loaded) ==
+        TRELLIS_STATUS_NOT_IMPLEMENTED);
+    CHECK_TRUE(loaded == 0);
+    CHECK_TRUE(store.n_entries == 0);
+    CHECK_TRUE(store.buffer == NULL);
+
+    trellis_tensor_store_free(&store);
+    trellis_backend_free(&cpu);
     trellis_unlink(path);
 }
 
@@ -1501,13 +1643,80 @@ static void test_real_stage2_checkpoint_manifests_if_present(void) {
     CHECK_TRUE(report.dtype_mismatches == 0);
 }
 
+static void test_real_pixal_flow_manifests_if_present(void) {
+    const char * ss_candidates[] = {
+        "Pixal3D/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+        "../Pixal3D/Pixal3D/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+        "../../Pixal3D/Pixal3D/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+    };
+    const char * shape_512_candidates[] = {
+        "Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+        "../Pixal3D/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+        "../../Pixal3D/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+    };
+    const char * shape_1024_candidates[] = {
+        "Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+        "../Pixal3D/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+        "../../Pixal3D/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+    };
+
+    trellis_checkpoint_report report;
+    const char * ss = first_existing_path(ss_candidates, 3);
+    if (ss != NULL) {
+        CHECK_TRUE(trellis_ss_flow_validate_checkpoint(ss, &report) == TRELLIS_STATUS_OK);
+        CHECK_TRUE(report.expected_tensors == report.actual_tensors);
+        CHECK_TRUE(report.actual_tensors == 700 || report.actual_tensors == 701);
+        CHECK_TRUE(report.missing_tensors == 0);
+        CHECK_TRUE(report.shape_mismatches == 0);
+        CHECK_TRUE(report.dtype_mismatches == 0);
+        CHECK_TRUE(report.extra_tensors == 0);
+    }
+
+    const char * shape_512 = first_existing_path(shape_512_candidates, 3);
+    if (shape_512 != NULL) {
+        CHECK_TRUE(trellis_shape_slat_flow_validate_checkpoint(shape_512, &report) == TRELLIS_STATUS_OK);
+        CHECK_TRUE(report.expected_tensors == 700);
+        CHECK_TRUE(report.actual_tensors == 700);
+        CHECK_TRUE(report.missing_tensors == 0);
+        CHECK_TRUE(report.shape_mismatches == 0);
+        CHECK_TRUE(report.dtype_mismatches == 0);
+        CHECK_TRUE(report.extra_tensors == 0);
+    }
+
+    const char * shape_1024 = first_existing_path(shape_1024_candidates, 3);
+    if (shape_1024 != NULL) {
+        CHECK_TRUE(trellis_shape_slat_flow_validate_checkpoint(shape_1024, &report) == TRELLIS_STATUS_OK);
+        CHECK_TRUE(report.expected_tensors == 700);
+        CHECK_TRUE(report.actual_tensors == 700);
+        CHECK_TRUE(report.missing_tensors == 0);
+        CHECK_TRUE(report.shape_mismatches == 0);
+        CHECK_TRUE(report.dtype_mismatches == 0);
+        CHECK_TRUE(report.extra_tensors == 0);
+    }
+
+    if (ss != NULL && shape_512 != NULL) {
+        CHECK_TRUE(
+            trellis_shape_slat_flow_validate_checkpoint(ss, &report) ==
+            TRELLIS_STATUS_PARSE_ERROR);
+        CHECK_TRUE(report.shape_mismatches != 0);
+        CHECK_TRUE(
+            trellis_ss_flow_validate_checkpoint(shape_512, &report) ==
+            TRELLIS_STATUS_PARSE_ERROR);
+        CHECK_TRUE(report.shape_mismatches != 0);
+    }
+}
+
 int main(void) {
     test_safetensors();
+    test_safetensors_c64_store_skip();
+    test_safetensors_c64_store_rejects_non_rope_tensor();
+    test_cascade_coord_quantization();
     test_flexible_dual_grid_mesh_host();
     test_flow_and_sparse_host();
     test_stage1_sampler_math();
     test_real_stage1_checkpoint_manifests_if_present();
     test_real_stage2_checkpoint_manifests_if_present();
+    test_real_pixal_flow_manifests_if_present();
     test_tensor_store_loader_preserves_f16_cpu();
 
     if (g_failures != 0) {

@@ -40,20 +40,53 @@ structured-latent shape flow, shape decode, texture decode, TRELLIS topology
 postprocess, and writes a GLB or glTF in one command. It does not open raylib.
 Sparse coords and DINO condition data are passed directly in memory, so no stage
 handoff files are written by default. The CLI defaults to the PyTorch app-style
-`1024_cascade` pipeline and vkmesh remesh postprocess without simplification. If
-no output path is passed, it writes `output.glb`. WebP inputs are converted to a
+pipeline for the detected family (TRELLIS.2 `512`, Pixal3D `1024_cascade`) and
+vkmesh remesh postprocess without simplification. If no output path is passed,
+it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
 stb_image loader does not decode WebP directly.
+For opaque input, both model families use an auto-discovered BiRefNet model when
+available. Pixal3D requires foreground isolation; TRELLIS.2 remains able to run
+without BiRefNet for compatibility.
+
+Pixal3D checkpoints are auto-detected and use the same command. Convert the NAF
+release checkpoint once, then pass it with the Pixal3D model directory:
+
+```sh
+python3 tools/convert_naf_weights.py \
+  /path/to/naf_release.pth \
+  ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors
+
+../build/trellis-image-to-gltf \
+  --model ../Pixal3D/Pixal3D \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image ../assets/example_image/T.png \
+  --gltf benchmark_outputs/pixal3d.glb
+```
+
+Pixal3D also supports `1536_cascade`. `--naf` falls back to
+`TRELLIS_NAF_PATH` and then `ckpts/naf_release.safetensors`. Use
+`--no-model-cache` or `--model-cache-budget-mib N` on memory-constrained GPUs.
+The `--fov`, `--camera-distance`, and `--mesh-scale` flags control Pixal3D
+projection. If distance is omitted or zero, it is fitted to FOV and mesh scale
+as `1 / (2 * mesh_scale * tan(fov / 2))`; a positive distance remains explicit.
+This path does not estimate FOV from the image. A foreground-isolated RGBA input
+is used directly. For opaque input, BiRefNet is discovered from
+`TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
+DINO; `--birefnet FILE` remains an explicit override.
 
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
-`trellis_pipeline_image_to_gltf()` from `src/pipeline/trellis_pipeline.c`.
+`trellis_pipeline_image_to_gltf_ex()` from `src/tasks/image_to_3d/image_to_3d.c`.
+The legacy `trellis_pipeline_image_to_gltf()` entry point remains available and
+uses the fitted default Pixal3D camera plus automatic NAF path discovery.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and
 unwraps UVs by default. Pass an explicit simplify target when you want face
 decimation.
-The implementation lives under `tools/vkmesh/`; compute shaders, including the
-glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
+The standalone remesher lives under `tools/vkmesh/` and its compute shaders
+live under `tools/vkmesh/shaders/`. The image-to-3D glTF exporter and its
+texture bake shaders live under `src/tasks/image_to_3d/export/`.
 
 ```sh
 ../build/trellis-image-to-gltf \
@@ -79,9 +112,18 @@ image-to-3D pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for
 geometry-only meshbin output, `--cleanup` for a single primitive cleanup pass, or
 individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
-When `trellis-image-to-gltf` is run from a Vulkan build tree it first looks for a
-sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
-only when using a custom binary.
+Vulkan inference calls the integrated vkmesh C API. CUDA builds place the
+standalone `vkmesh` beside `trellis-image-to-gltf`, and the pipeline finds that
+sibling automatically; `PATH` and `--vkmesh FILE` are only fallbacks for a
+custom layout.
+vkmesh keeps its Vulkan buffer workspace bounded. By default it derives a
+conservative budget from `VK_EXT_memory_budget` (with a 2048 MiB ceiling), keeps
+source geometry/BVH resident once, and streams distance-query points through a
+reusable batch buffer. Override the cap with
+`--vkmesh-gpu-workspace-budget-mib N` in `trellis-image-to-gltf`,
+`--gpu-workspace-budget-mib N` in standalone `vkmesh`, or
+`TRELLIS_VKMESH_GPU_WORKSPACE_BUDGET_MIB`. The limit covers vkmesh
+`VkDeviceMemory` workspace, not model weights owned by the rest of the process.
 UV parameterization and packing use CPU xatlas. For large meshes, the glTF
 exporter first builds manifold face adjacency on the CPU, grows connected local
 chunks, and adds each chunk to xatlas as its own mesh. Vulkan acceleration starts
@@ -107,15 +149,15 @@ a specific graph backend.
 Pipeline code lives under `src/`:
 
 - `src/runtime/trellis_runtime.c`: CUDA backend setup, logging/progress, model path/load helpers.
-- `src/model/trellis_dino.c`: DINOv3 image encoder weight binding and graph definition.
-- `src/model/trellis_cuda_forward.cu`: CUDA forward paths for sparse 3D decoder networks.
-- `src/model/trellis_slat_flow_model.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition.
-- `src/model/trellis_sparse_structure_decoder.c`: sparse-structure VAE decoder weight binding.
-- `src/model/trellis_sparse_unet_vae_decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders.
-- `src/model/trellis_cuda_kernels.cu`: internal CUDA kernels for sparse shape decoding.
-- `src/pipeline/trellis_sparse_structure_pipeline.c`: image -> sparse coords + DINO condition.
-- `src/pipeline/trellis_structured_latent_pipeline.c`: sparse coords + condition -> shape/texture SLat.
-- `src/pipeline/trellis_pipeline.c`: image -> textured GLB/glTF orchestration.
+- `src/architectures/dinov3/dinov3.c`: DINOv3 image encoder weight binding and graph definition.
+- `src/ops/sparse/cuda/forward.cu`: CUDA forward paths for sparse 3D decoder networks.
+- `src/architectures/dit_flow/dit_flow.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition.
+- `src/architectures/sparse_structure_decoder/decoder.c`: sparse-structure VAE decoder weight binding.
+- `src/architectures/sparse_unet_decoder/decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders.
+- `src/ops/sparse/cuda/kernels.cu`: internal CUDA kernels for sparse shape decoding.
+- `src/tasks/image_to_3d/stages/sparse_structure.c`: image -> sparse coords + DINO condition.
+- `src/tasks/image_to_3d/stages/structured_latent.c`: sparse coords + condition -> shape/texture SLat.
+- `src/tasks/image_to_3d/image_to_3d.c`: image -> textured GLB/glTF orchestration.
 - `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests.
 - `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug.
 
