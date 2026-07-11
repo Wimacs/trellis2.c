@@ -40,10 +40,14 @@ structured-latent shape flow, shape decode, texture decode, TRELLIS topology
 postprocess, and writes a GLB or glTF in one command. It does not open raylib.
 Sparse coords and DINO condition data are passed directly in memory, so no stage
 handoff files are written by default. The CLI defaults to the PyTorch app-style
-`1024_cascade` pipeline and vkmesh remesh postprocess without simplification. If
-no output path is passed, it writes `output.glb`. WebP inputs are converted to a
+pipeline for the detected family (TRELLIS.2 `512`, Pixal3D `1024_cascade`) and
+vkmesh remesh postprocess without simplification. If no output path is passed,
+it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
 stb_image loader does not decode WebP directly.
+For opaque input, both model families use an auto-discovered BiRefNet model when
+available. Pixal3D requires foreground isolation; TRELLIS.2 remains able to run
+without BiRefNet for compatibility.
 
 Pixal3D checkpoints are auto-detected and use the same command. Convert the NAF
 release checkpoint once, then pass it with the Pixal3D model directory:
@@ -56,10 +60,8 @@ python3 tools/convert_naf_weights.py \
 ../build/trellis-image-to-gltf \
   --model ../Pixal3D/Pixal3D \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --naf ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors \
   --image ../assets/example_image/T.png \
-  --gltf benchmark_outputs/pixal3d.glb \
-  --pipeline 1024_cascade
+  --gltf benchmark_outputs/pixal3d.glb
 ```
 
 Pixal3D also supports `1536_cascade`. `--naf` falls back to
@@ -68,10 +70,10 @@ Pixal3D also supports `1536_cascade`. `--naf` falls back to
 The `--fov`, `--camera-distance`, and `--mesh-scale` flags control Pixal3D
 projection. If distance is omitted or zero, it is fitted to FOV and mesh scale
 as `1 / (2 * mesh_scale * tan(fov / 2))`; a positive distance remains explicit.
-This path does not estimate FOV from the image. Use a transparent RGBA input or
-pass `--birefnet FILE` for foreground removal and the required subject crop.
-Opaque Pixal3D inputs require `--birefnet`; a foreground-isolated RGBA image
-with transparency can be passed without it.
+This path does not estimate FOV from the image. A foreground-isolated RGBA input
+is used directly. For opaque input, BiRefNet is discovered from
+`TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
+DINO; `--birefnet FILE` remains an explicit override.
 
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
 `trellis_pipeline_image_to_gltf_ex()` from `src/tasks/image_to_3d/image_to_3d.c`.
@@ -110,9 +112,10 @@ image-to-3D pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for
 geometry-only meshbin output, `--cleanup` for a single primitive cleanup pass, or
 individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
-When `trellis-image-to-gltf` is run from a Vulkan build tree it first looks for a
-sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
-only when using a custom binary.
+Vulkan inference calls the integrated vkmesh C API. CUDA builds place the
+standalone `vkmesh` beside `trellis-image-to-gltf`, and the pipeline finds that
+sibling automatically; `PATH` and `--vkmesh FILE` are only fallbacks for a
+custom layout.
 vkmesh keeps its Vulkan buffer workspace bounded. By default it derives a
 conservative budget from `VK_EXT_memory_budget` (with a 2048 MiB ceiling), keeps
 source geometry/BVH resident once, and streams distance-query points through a

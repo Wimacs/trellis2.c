@@ -10,7 +10,7 @@ static const trellis_model_family_descriptor g_families[] = {
         sizeof(trellis_model_family_descriptor),
         "trellis2",
         "image_to_3d",
-        "1024_cascade",
+        "512",
     },
     {
         TRELLIS_REGISTRY_ABI_VERSION,

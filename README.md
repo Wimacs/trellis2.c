@@ -32,6 +32,11 @@ If the repository was cloned without `--recursive`, run:
 git submodule update --init --recursive
 ```
 
+Both inference backends build vkmesh and the Vulkan texture baker by default,
+so the Vulkan SDK (headers, loader, and `glslc`) is a build dependency even for
+CUDA. This keeps remesh and texture export available to the normal one-command
+inference path without installing a separate vkmesh executable.
+
 CUDA:
 
 ```sh
@@ -97,10 +102,15 @@ Linux:
 ./build/trellis-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
   --image example_image/T.png \
   --gltf output.glb
 ```
+
+The model adapter selects the standard pipeline automatically: TRELLIS.2 uses
+the 512 pipeline, while Pixal3D uses the 1024 cascade. Both use vkmesh for hole
+filling and remeshing, with simplification disabled by default. For opaque
+input, both also use an auto-discovered BiRefNet model when available; Pixal3D
+requires it, while TRELLIS.2 can still run without it.
 
 ### Pixal3D
 
@@ -121,10 +131,8 @@ Run the 1024 cascade on CUDA or Vulkan with:
 ./build/trellis-image-to-gltf \
   --model ../Pixal3D/Pixal3D \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --naf ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors \
   --image example_image/T.png \
-  --gltf pixal3d.glb \
-  --pipeline 1024_cascade
+  --gltf pixal3d.glb
 ```
 
 `1536_cascade` is also supported. `--naf` may be omitted when
@@ -135,9 +143,10 @@ projection defaults to horizontal FOV `0.857556` and mesh scale `1`; when
 `--camera-distance` is omitted or zero, distance is fitted as
 `1 / (2 * mesh_scale * tan(fov / 2))` (`1.09375` for those defaults). An
 explicit positive `--camera-distance` is preserved. This fits distance to the
-selected FOV but does not estimate FOV from the image. The input must already
-contain a transparent foreground mask, or
-`--birefnet FILE` must be supplied so Pixal3D can apply its subject crop.
+selected FOV but does not estimate FOV from the image. A transparent foreground
+mask is used directly. For opaque input, BiRefNet is discovered from
+`TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
+DINO; `--birefnet FILE` remains an explicit override.
 TRELLIS.2 checkpoints ignore the NAF and camera options.
 
 C callers that need Pixal3D overrides can initialize
@@ -179,7 +188,6 @@ Windows:
 .\build-win\Release\trellis-image-to-gltf.exe `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
   --image example_image\T.png `
   --gltf output.glb
 ```
@@ -191,7 +199,6 @@ For a Windows Vulkan build, use:
   --backend vulkan `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
   --image example_image\T.png `
   --gltf output.glb
 ```

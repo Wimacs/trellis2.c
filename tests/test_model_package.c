@@ -122,6 +122,7 @@ static void test_repository_templates(void) {
     CHECK_TRUE(snprintf(root, sizeof(root), "%s/models/trellis2", TRELLIS_TEST_SOURCE_DIR) > 0);
     CHECK_TRUE(trellis_model_package_load(root, &package) == TRELLIS_STATUS_OK);
     CHECK_TRUE(strcmp(package.family, "trellis2") == 0);
+    CHECK_TRUE(strcmp(package.profile, "512") == 0);
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "shape_flow_1024");
     CHECK_TRUE(flow != NULL && flow->execution.attention == TRELLIS_ATTENTION_FLASH);
@@ -136,6 +137,7 @@ static void test_repository_templates(void) {
     CHECK_TRUE(snprintf(root, sizeof(root), "%s/models/pixal3d", TRELLIS_TEST_SOURCE_DIR) > 0);
     CHECK_TRUE(trellis_model_package_load(root, &package) == TRELLIS_STATUS_OK);
     CHECK_TRUE(strcmp(package.family, "pixal3d") == 0);
+    CHECK_TRUE(strcmp(package.profile, "1024_cascade") == 0);
     flow = trellis_model_package_find_component(&package, "shape_flow_1024");
     CHECK_TRUE(flow != NULL && flow->execution.attention == TRELLIS_ATTENTION_FLASH);
     CHECK_TRUE(flow->execution.compute_dtype == TRELLIS_DTYPE_BF16);
@@ -155,6 +157,7 @@ static void test_legacy_fallback(int pixal) {
     CHECK_TRUE(package.source == TRELLIS_MODEL_PACKAGE_SOURCE_LEGACY);
     CHECK_TRUE(package.legacy_pixal_marker_probes == 1);
     CHECK_TRUE(strcmp(package.family, pixal ? "pixal3d" : "trellis2") == 0);
+    CHECK_TRUE(strcmp(package.profile, pixal ? "1024_cascade" : "512") == 0);
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "sparse_structure_flow");
     CHECK_TRUE(flow != NULL);

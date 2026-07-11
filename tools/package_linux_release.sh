@@ -260,7 +260,7 @@ build_targets() {
         trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
         -j "$JOBS"
     cmake --build "$CUDA_BUILD" --target \
-        trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf \
+        trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
         -j "$JOBS"
 }
 
@@ -338,8 +338,6 @@ export PATH="$HERE/bin:$PATH"
 exec "$HERE/bin/trellis-image-to-gltf" \
     --model "$HERE/TRELLIS.2/TRELLIS.2-4B" \
     --dino "$HERE/TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m" \
-    --birefnet "$HERE/TRELLIS.2/BiRefNet/BiRefNet-F16.gguf" \
-    --vkmesh "$HERE/bin/vkmesh" \
     "$@"
 SH
         chmod 755 "$pkg/run-cli.sh"
@@ -416,7 +414,7 @@ copy_common_tools() {
         copy_exec "$build_dir/trellis-birefnet-rgba" "$pkg/bin"
         copy_exec "$build_dir/trellis-rebake-gltf" "$pkg/bin"
     fi
-    copy_exec "$VULKAN_BUILD/vkmesh" "$pkg/bin"
+    copy_exec "$build_dir/vkmesh" "$pkg/bin"
     write_download_scripts "$pkg"
     copy_example_image "$pkg"
 }
@@ -433,7 +431,7 @@ package_one() {
     fi
     copy_common_tools "$build_dir" "$pkg" "$flavor"
 
-    local binaries=("$VULKAN_BUILD/vkmesh")
+    local binaries=("$build_dir/vkmesh")
     if [[ "$flavor" == "gui" ]]; then
         binaries+=("$build_dir/trellis-gui")
     else
@@ -462,7 +460,7 @@ require_executable "$VULKAN_BUILD/vkmesh"
 for target in trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf; do
     require_executable "$VULKAN_BUILD/$target"
 done
-for target in trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf; do
+for target in trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh; do
     require_executable "$CUDA_BUILD/$target"
 done
 

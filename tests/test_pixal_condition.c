@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -195,9 +196,27 @@ static void test_pixal_pipeline_rejects_opaque_input_without_birefnet(void) {
     options.image_path = image_path;
     options.device = 0;
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
+
+    const char * ambient_birefnet = getenv("TRELLIS_BIREFNET_PATH");
+    char * saved_birefnet = NULL;
+    if (ambient_birefnet != NULL) {
+        saved_birefnet = (char *) malloc(strlen(ambient_birefnet) + 1u);
+        if (saved_birefnet != NULL) {
+            strcpy(saved_birefnet, ambient_birefnet);
+        }
+    }
+    CHECK_TRUE(ambient_birefnet == NULL || saved_birefnet != NULL);
+    CHECK_TRUE(trellis_unsetenv("TRELLIS_BIREFNET_PATH") == 0);
     CHECK_TRUE(
         trellis_pipeline_image_to_gltf_ex(&options, &pixal_options) ==
         TRELLIS_STATUS_INVALID_ARGUMENT);
+    if (saved_birefnet != NULL) {
+        CHECK_TRUE(trellis_setenv(
+            "TRELLIS_BIREFNET_PATH", saved_birefnet, 1) == 0);
+    } else {
+        CHECK_TRUE(trellis_unsetenv("TRELLIS_BIREFNET_PATH") == 0);
+    }
+    free(saved_birefnet);
 
     trellis_unlink(image_path);
     trellis_unlink(checkpoint_path);

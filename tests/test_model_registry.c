@@ -43,6 +43,12 @@ static void test_descriptor_headers_and_lookup(void) {
     CHECK_TRUE(trellis_registry_architecture_at(trellis_registry_architecture_count()) == NULL);
     CHECK_TRUE(trellis_registry_task_at(trellis_registry_task_count()) == NULL);
     CHECK_TRUE(trellis_registry_find_family("missing") == NULL);
+    CHECK_TRUE(strcmp(
+        trellis_registry_find_family("trellis2")->default_profile,
+        "512") == 0);
+    CHECK_TRUE(strcmp(
+        trellis_registry_find_family("pixal3d")->default_profile,
+        "1024_cascade") == 0);
 }
 
 static void test_non_3d_task_fixture(void) {

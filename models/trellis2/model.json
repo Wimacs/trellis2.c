@@ -3,7 +3,7 @@
   "id": "trellis2-4b",
   "family": "trellis2",
   "task": "image_to_3d",
-  "profile": "1024_cascade",
+  "profile": "512",
   "components": [
     {
       "role": "sparse_structure_flow",

@@ -789,7 +789,7 @@ static trellis_status populate_legacy_package(
     package->id = string_duplicate(is_pixal ? "pixal3d-legacy" : "trellis2-legacy");
     package->family = string_duplicate(is_pixal ? "pixal3d" : "trellis2");
     package->task = string_duplicate("image_to_3d");
-    package->profile = string_duplicate("1024_cascade");
+    package->profile = string_duplicate(is_pixal ? "1024_cascade" : "512");
     if (package->root == NULL || package->id == NULL || package->family == NULL ||
         package->task == NULL || package->profile == NULL) {
         return TRELLIS_STATUS_OUT_OF_MEMORY;

@@ -75,7 +75,7 @@ if (TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE)
 endif()
 message(STATUS "TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE=${TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE}")
 
-if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
+if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OR TRELLIS2_C_BUILD_TOOLS)
     find_package(Vulkan REQUIRED)
     if (NOT Vulkan_GLSLC_EXECUTABLE)
         find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
@@ -664,7 +664,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis-verify PRIVATE m)
     endif()
 
-    if (GGML_VULKAN)
+    # vkmesh is a standalone Vulkan utility even when the inference backend is
+    # CUDA.  Building it beside trellis-image-to-gltf lets the CUDA pipeline's
+    # existing sibling-executable discovery work without --vkmesh.
+    if (Vulkan_FOUND)
         function(add_vkmesh_shader NAME SOURCE SYMBOL)
             set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
             set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
@@ -777,6 +780,10 @@ if (TRELLIS2_C_BUILD_TOOLS)
         endif()
         if (TARGET trellis-image-to-gltf)
             add_dependencies(trellis-image-to-gltf vkmesh)
+        endif()
+        if (TRELLIS2_C_BUILD_TESTS)
+            add_test(NAME trellis2_c_vkmesh_cli_smoke
+                COMMAND $<TARGET_FILE:vkmesh> --help)
         endif()
     endif()
 

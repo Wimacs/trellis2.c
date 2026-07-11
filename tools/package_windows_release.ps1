@@ -206,7 +206,7 @@ function Copy-Common($DestinationDir, $BuildDir) {
     foreach ($Name in @("trellis-gui.exe", "trellis2_c.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "raylib.dll")) {
         Copy-Required (Join-Path $BuildDir $Name) $DestinationDir
     }
-    Copy-Required (Join-Path $VulkanBuild "vkmesh.exe") $DestinationDir
+    Copy-Required (Join-Path $BuildDir "vkmesh.exe") $DestinationDir
     Write-Launcher $DestinationDir
     Write-DownloadScripts $DestinationDir
     Copy-ExampleImage $DestinationDir

@@ -33,13 +33,13 @@ static void usage(FILE * out, const char * argv0) {
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
         "  --naf FILE              Pixal3D NAF weights converted to safetensors; not used by TRELLIS.2\n"
-        "  --birefnet FILE         BiRefNet GGUF; required for opaque Pixal3D input, optional for TRELLIS.2\n"
+        "  --birefnet FILE         Override auto-discovered BiRefNet GGUF for opaque input\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
         "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures, default output.glb\n"
         "  --glb FILE              Alias of --gltf\n"
         "  --output FILE           Alias of --gltf\n"
         "  --texture-size N        glTF texture size, default 1024\n"
-        "  --pipeline NAME         512, 1024, 1024_cascade, or Pixal3D 1536_cascade; default 1024_cascade\n"
+        "  --pipeline NAME         512, 1024, 1024_cascade, or 1536_cascade; default Trellis=512, Pixal3D=1024_cascade\n"
         "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
         "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
         "  --mesh-postprocess-simplify Run vkmesh simplify after remesh/cleanup, default off\n"
@@ -165,7 +165,7 @@ int main(int argc, char ** argv) {
     options.sparse_structure_steps = 12;
     options.structured_latent_steps = 12;
     options.latent_size = 16;
-    options.pipeline_type = "1024_cascade";
+    options.pipeline_type = NULL;
     options.resolution = 1024;
     options.cond_resolution = 512;
     options.sparse_resolution = 32;
@@ -189,8 +189,7 @@ int main(int argc, char ** argv) {
     options.max_num_tokens = 49152;
     options.model_cache = 1;
     options.model_cache_budget_mib = 0;
-    /* Zero means automatic: TRELLIS.2 uses FlashAttention while Pixal3D uses
-       explicit SDPA until the shared flash path has BF16-safe K/V support. */
+    /* Zero means the model package/adapter selects its FlashAttention policy. */
     options.use_ggml_flash_attn = 0;
     pixal_options.camera_angle_x = 0.8575560450553894f;
     pixal_options.camera_distance = 0.0f;

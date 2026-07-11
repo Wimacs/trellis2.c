@@ -255,6 +255,58 @@ static trellis_status image_has_transparent_alpha(
     return TRELLIS_STATUS_OK;
 }
 
+static int resolve_packaged_birefnet_path(
+    const char * model_dir,
+    const char * dino_dir,
+    char * path,
+    size_t path_size) {
+    if (model_dir == NULL || model_dir[0] == '\0' || path == NULL || path_size == 0) {
+        return 0;
+    }
+    const char * environment_path = getenv("TRELLIS_BIREFNET_PATH");
+    if (environment_path != NULL && environment_path[0] != '\0') {
+        const int n = snprintf(path, path_size, "%s", environment_path);
+        if (n >= 0 && (size_t) n < path_size && trellis_access_read(path)) {
+            return 1;
+        }
+    }
+    static const char * candidates[] = {
+        "ckpts/BiRefNet-F16.gguf",
+        "BiRefNet-F16.gguf",
+        "BiRefNet/BiRefNet-F16.gguf",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (trellis_make_model_path(
+                model_dir,
+                candidates[i],
+                path,
+                path_size) == TRELLIS_STATUS_OK &&
+            trellis_access_read(path)) {
+            return 1;
+        }
+    }
+    if (dino_dir != NULL && dino_dir[0] != '\0') {
+        static const char * dino_sibling_candidates[] = {
+            "../BiRefNet/BiRefNet-F16.gguf",
+            "../BiRefNet-F16.gguf",
+        };
+        for (size_t i = 0;
+             i < sizeof(dino_sibling_candidates) / sizeof(dino_sibling_candidates[0]);
+             ++i) {
+            if (trellis_make_model_path(
+                    dino_dir,
+                    dino_sibling_candidates[i],
+                    path,
+                    path_size) == TRELLIS_STATUS_OK &&
+                trellis_access_read(path)) {
+                return 1;
+            }
+        }
+    }
+    path[0] = '\0';
+    return 0;
+}
+
 static int convert_webp_to_png_ffmpeg(const char * input_path, const char * output_path) {
     char * argv[] = {
         (char *) "ffmpeg",
@@ -1344,6 +1396,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     const char * pixal_naf_override = pixal_options->naf_path;
+    if (pixal_naf_override == NULL || pixal_naf_override[0] == '\0') {
+        pixal_naf_override = getenv("TRELLIS_NAF_PATH");
+    }
     float pixal_camera_angle_x = pixal_options->camera_angle_x;
     float pixal_camera_distance = pixal_options->camera_distance;
     float pixal_mesh_scale = pixal_options->mesh_scale;
@@ -1447,6 +1502,11 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     }
 
     const char * sparse_structure_image_path = options->image_path;
+    const char * effective_birefnet_path =
+        options->birefnet_path != NULL && options->birefnet_path[0] != '\0' ?
+            options->birefnet_path : NULL;
+    char packaged_birefnet_path[4096];
+    packaged_birefnet_path[0] = '\0';
     if (path_has_ext(options->image_path, "webp")) {
         if (!trellis_make_temp_path(
             temp_image,
@@ -1465,8 +1525,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         }
         sparse_structure_image_path = temp_image;
     }
-    if (task_adapter->requires_transparent_foreground &&
-        (options->birefnet_path == NULL || options->birefnet_path[0] == '\0')) {
+    if (effective_birefnet_path == NULL) {
         int has_transparent_alpha = 0;
         status = image_has_transparent_alpha(
             sparse_structure_image_path,
@@ -1477,14 +1536,23 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             return status;
         }
         if (!has_transparent_alpha) {
-            TRELLIS_ERROR(
-                "pipeline: Pixal3D requires foreground-isolated input; provide --birefnet FILE or a transparent RGBA image");
-            unlink_if_set(temp_image);
-            trellis_model_package_free(&model_package);
-            return TRELLIS_STATUS_INVALID_ARGUMENT;
+            if (resolve_packaged_birefnet_path(
+                    options->model_dir,
+                    options->dino_dir,
+                    packaged_birefnet_path,
+                    sizeof(packaged_birefnet_path))) {
+                effective_birefnet_path = packaged_birefnet_path;
+                TRELLIS_INFO("image prep: auto-discovered BiRefNet %s", effective_birefnet_path);
+            } else if (task_adapter->requires_transparent_foreground) {
+                TRELLIS_ERROR(
+                    "pipeline: opaque Pixal3D input requires BiRefNet; place it under model/ckpts or beside DINO, set TRELLIS_BIREFNET_PATH, or pass --birefnet FILE");
+                unlink_if_set(temp_image);
+                trellis_model_package_free(&model_package);
+                return TRELLIS_STATUS_INVALID_ARGUMENT;
+            }
         }
     }
-    if (options->birefnet_path != NULL && options->birefnet_path[0] != '\0') {
+    if (effective_birefnet_path != NULL) {
         if (!trellis_make_temp_path(
             temp_birefnet_image,
             sizeof(temp_birefnet_image),
@@ -1497,7 +1565,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         TRELLIS_INFO("image prep: running BiRefNet background removal -> %s", temp_birefnet_image);
         status = apply_birefnet_background_removal(
             sparse_structure_image_path,
-            options->birefnet_path,
+            effective_birefnet_path,
             temp_birefnet_image,
             graph_backend_kind,
             options->device);
@@ -1625,7 +1693,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     const char * pipeline_type =
         options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
             options->pipeline_type :
-            "";
+            model_package.profile;
     int use_1024_cascade = 0;
     int final_resolution = options->resolution > 0 ? options->resolution : 512;
     int sparse_cond_resolution = options->cond_resolution > 0 ? options->cond_resolution : 512;
