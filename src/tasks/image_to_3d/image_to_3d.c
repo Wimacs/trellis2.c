@@ -65,12 +65,38 @@ static int pipeline_component_path(
     return 1;
 }
 
-static int pipeline_component_flash_enabled(
+static trellis_ggml_attention_policy pipeline_component_attention_policy(
     const trellis_image_to_gltf_options * options,
     const trellis_model_component_instance * component) {
-    if (options->no_ggml_flash_attn) return 0;
-    if (options->use_ggml_flash_attn) return 1;
-    return component != NULL && component->execution.attention == TRELLIS_ATTENTION_FLASH;
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    int emulate_bf16_blocks = 0;
+    if (component != NULL) {
+        (void) trellis_image_to_3d_component_execution_policy(
+            component,
+            &policy,
+            &emulate_bf16_blocks);
+    }
+    if (options->no_ggml_flash_attn) {
+        policy.mode = TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
+    } else if (options->use_ggml_flash_attn &&
+               policy.mode == TRELLIS_GGML_ATTENTION_MODE_EXPLICIT) {
+        /* A force-Flash CLI override has no package K/V dtype to preserve. */
+        policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
+    return policy;
+}
+
+static const char * pipeline_attention_policy_name(
+    const trellis_ggml_attention_policy * policy) {
+    if (policy != NULL &&
+        policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16) {
+        return "flash/bf16";
+    }
+    if (policy != NULL &&
+        policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH) {
+        return "flash/f16";
+    }
+    return "explicit";
 }
 
 static int pipeline_component_emulates_bf16(
@@ -1561,10 +1587,14 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     const trellis_model_component_instance * shape_flow_lr_component = NULL;
     const trellis_model_component_instance * shape_flow_hr_component = NULL;
     const trellis_model_component_instance * texture_flow_component = NULL;
-    int sparse_flow_flash = 0;
-    int shape_flow_lr_flash = 0;
-    int shape_flow_hr_flash = 0;
-    int texture_flow_flash = 0;
+    trellis_ggml_attention_policy sparse_flow_attention =
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy shape_flow_lr_attention =
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy shape_flow_hr_attention =
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy texture_flow_attention =
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
 
     const char * pipeline_type =
         options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
@@ -1653,21 +1683,21 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         pixal_naf_path = naf_component_path;
     }
 
-    sparse_flow_flash = pipeline_component_flash_enabled(
+    sparse_flow_attention = pipeline_component_attention_policy(
         options, sparse_flow_component);
-    shape_flow_lr_flash = pipeline_component_flash_enabled(
+    shape_flow_lr_attention = pipeline_component_attention_policy(
         options, shape_flow_lr_component);
-    shape_flow_hr_flash = use_1024_cascade ?
-        pipeline_component_flash_enabled(options, shape_flow_hr_component) :
-        shape_flow_lr_flash;
-    texture_flow_flash = pipeline_component_flash_enabled(
+    shape_flow_hr_attention = use_1024_cascade ?
+        pipeline_component_attention_policy(options, shape_flow_hr_component) :
+        shape_flow_lr_attention;
+    texture_flow_attention = pipeline_component_attention_policy(
         options, texture_flow_component);
     TRELLIS_INFO(
         "attention policy: sparse=%s shape_lr=%s shape_hr=%s texture=%s%s",
-        sparse_flow_flash ? "flash" : "explicit",
-        shape_flow_lr_flash ? "flash" : "explicit",
-        shape_flow_hr_flash ? "flash" : "explicit",
-        texture_flow_flash ? "flash" : "explicit",
+        pipeline_attention_policy_name(&sparse_flow_attention),
+        pipeline_attention_policy_name(&shape_flow_lr_attention),
+        pipeline_attention_policy_name(&shape_flow_hr_attention),
+        pipeline_attention_policy_name(&texture_flow_attention),
         projected_conditioning && !options->use_ggml_flash_attn ?
             " (Pixal3D safe package defaults)" : "");
 
@@ -1704,7 +1734,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     sparse_structure.projected_conditioning = projected_conditioning;
     sparse_structure.emulate_bf16_blocks = pipeline_component_emulates_bf16(
         options, sparse_flow_component);
-    sparse_structure.use_ggml_flash_attn = sparse_flow_flash;
+    sparse_structure.attention_policy = sparse_flow_attention;
+    sparse_structure.use_ggml_flash_attn =
+        sparse_flow_attention.mode != TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
     sparse_structure.voxel_threshold = 0.0f;
     sparse_structure.camera_angle_x = pixal_camera_angle_x;
     sparse_structure.camera_distance = pixal_camera_distance;
@@ -1804,7 +1836,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     structured_latent.flow_no_rope = options->flow_no_rope;
     structured_latent.emulate_bf16_blocks = pipeline_component_emulates_bf16(
         options, shape_flow_lr_component);
-    structured_latent.use_ggml_flash_attn = shape_flow_lr_flash;
+    structured_latent.attention_policy = shape_flow_lr_attention;
+    structured_latent.use_ggml_flash_attn =
+        shape_flow_lr_attention.mode != TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
     structured_latent.backend = &graph_backend;
     structured_latent.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     structured_latent.cache = model_cache_ptr;
@@ -1950,7 +1984,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         hr_shape_options.resolution = actual_hr_resolution;
         hr_shape_options.emulate_bf16_blocks = pipeline_component_emulates_bf16(
             options, shape_flow_hr_component);
-        hr_shape_options.use_ggml_flash_attn = shape_flow_hr_flash;
+        hr_shape_options.attention_policy = shape_flow_hr_attention;
+        hr_shape_options.use_ggml_flash_attn =
+            shape_flow_hr_attention.mode != TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
         perf_start_us = ggml_time_us();
         status = trellis_pipeline_run_structured_latent(&hr_shape_options, &shape_latent);
         if (status != TRELLIS_STATUS_OK) {
@@ -2104,7 +2140,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     texture_options.flow_no_rope = options->flow_no_rope;
     texture_options.emulate_bf16_blocks = pipeline_component_emulates_bf16(
         options, texture_flow_component);
-    texture_options.use_ggml_flash_attn = texture_flow_flash;
+    texture_options.attention_policy = texture_flow_attention;
+    texture_options.use_ggml_flash_attn =
+        texture_flow_attention.mode != TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
     texture_options.backend = &graph_backend;
     texture_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     texture_options.cache = model_cache_ptr;

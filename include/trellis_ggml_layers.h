@@ -44,7 +44,11 @@ int trellis_ggml_flash_attn_enabled(void);
 typedef enum trellis_ggml_attention_mode {
     TRELLIS_GGML_ATTENTION_MODE_INVALID = 0,
     TRELLIS_GGML_ATTENTION_MODE_EXPLICIT = 1,
+    /* Legacy Flash Attention mode. K/V produced as F32 are narrowed to F16. */
     TRELLIS_GGML_ATTENTION_MODE_FLASH = 2,
+    TRELLIS_GGML_ATTENTION_MODE_FLASH_F16 = TRELLIS_GGML_ATTENTION_MODE_FLASH,
+    /* K/V produced as F32 are narrowed to BF16 before the backend Flash op. */
+    TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 = 3,
 } trellis_ggml_attention_mode;
 
 typedef struct trellis_ggml_attention_policy {

@@ -88,7 +88,8 @@ static int cfg_batch_attention_is_reasonable(
     if (weights->n_blocks <= 0 || debug_parts <= 0) {
         return 1;
     }
-    if (attention_policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH) {
+    if (attention_policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH ||
+        attention_policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16) {
         return 1;
     }
     size_t estimate = 0;

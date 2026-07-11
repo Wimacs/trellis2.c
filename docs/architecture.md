@@ -37,7 +37,11 @@ different adapter while sharing most architectures and operators.
 Execution choices such as explicit SDPA versus Flash Attention and activation
 dtype belong to a package/component instance.  They are not process-global
 model identity.  This lets two package instances use different safe numeric
-policies in the same process.
+policies in the same process.  Flash K/V dtype is part of that policy: legacy
+Flash means F16, while BF16 Flash is represented by a separate ABI-compatible
+mode. Backend lowering may still impose a narrower implementation, so model
+adapters retain safe family defaults rather than inferring support from a
+checkpoint dtype.
 
 ## Adding another task
 

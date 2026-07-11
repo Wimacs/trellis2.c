@@ -2,6 +2,7 @@
 #define TRELLIS2_C_IMAGE_TO_3D_INTERNAL_H
 
 #include "trellis.h"
+#include "trellis_ggml_layers.h"
 #include "../../architectures/dit_flow/projected_dit_flow.h"
 
 typedef enum trellis_pipeline_cache_entry_kind {
@@ -134,6 +135,8 @@ typedef struct trellis_sparse_structure_options {
     int flow_no_rope;
     int projected_conditioning;
     int emulate_bf16_blocks;
+    trellis_ggml_attention_policy attention_policy;
+    /* Legacy fallback when attention_policy was left zero-initialized. */
     int use_ggml_flash_attn;
     float voxel_threshold;
     float camera_angle_x;
@@ -230,6 +233,8 @@ typedef struct trellis_structured_latent_options {
     int flow_block_parts_override;
     int flow_no_rope;
     int emulate_bf16_blocks;
+    trellis_ggml_attention_policy attention_policy;
+    /* Legacy fallback when attention_policy was left zero-initialized. */
     int use_ggml_flash_attn;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;

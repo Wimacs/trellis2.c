@@ -485,8 +485,10 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     float * k_data = (float *) malloc(bytes);
     float * v_data = (float *) malloc(bytes);
     float * explicit_out = (float *) malloc(bytes);
-    float * flash_out = (float *) malloc(bytes);
-    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && explicit_out != NULL && flash_out != NULL);
+    float * flash_f16_out = (float *) malloc(bytes);
+    float * flash_bf16_out = (float *) malloc(bytes);
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL &&
+        explicit_out != NULL && flash_f16_out != NULL && flash_bf16_out != NULL);
 
     for (int64_t i = 0; i < nels; ++i) {
         q_data[i] = attention_input_value((int) i, 0.0137f, 0.125f);
@@ -505,19 +507,28 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     ggml_set_name(v, "v");
 
     const float scale = 1.0f / sqrtf((float) HEAD_DIM);
-    trellis_ggml_set_flash_attn_enabled(0);
-    struct ggml_tensor * explicit_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
+    trellis_ggml_attention_policy explicit_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy flash_f16_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    trellis_ggml_attention_policy flash_bf16_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    flash_f16_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    flash_bf16_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+    struct ggml_tensor * explicit_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &explicit_policy);
+    struct ggml_tensor * flash_f16_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &flash_f16_policy);
+    struct ggml_tensor * flash_bf16_y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, scale, &flash_bf16_policy);
+    CHECK_TRUE(explicit_y != NULL && flash_f16_y != NULL && flash_bf16_y != NULL);
     ggml_set_name(explicit_y, "sdpa_explicit");
-    trellis_ggml_set_flash_attn_enabled(1);
-    struct ggml_tensor * flash_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
-    ggml_set_name(flash_y, "sdpa_flash");
-    trellis_ggml_set_flash_attn_enabled(0);
-    CHECK_TRUE(explicit_y != NULL && flash_y != NULL);
-    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_y));
+    ggml_set_name(flash_f16_y, "sdpa_flash_f16");
+    ggml_set_name(flash_bf16_y, "sdpa_flash_bf16");
+    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_f16_y));
+    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_bf16_y));
 
     struct ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, explicit_y);
-    ggml_build_forward_expand(graph, flash_y);
+    ggml_build_forward_expand(graph, flash_f16_y);
+    ggml_build_forward_expand(graph, flash_bf16_y);
     ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
     CHECK_TRUE(alloc != NULL);
     CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
@@ -526,11 +537,25 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
     CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
     ggml_backend_tensor_get(explicit_y, explicit_out, 0, ggml_nbytes(explicit_y));
-    ggml_backend_tensor_get(flash_y, flash_out, 0, ggml_nbytes(flash_y));
+    ggml_backend_tensor_get(flash_f16_y, flash_f16_out, 0, ggml_nbytes(flash_f16_y));
+    ggml_backend_tensor_get(flash_bf16_y, flash_bf16_out, 0, ggml_nbytes(flash_bf16_y));
 
-    char name[128];
-    snprintf(name, sizeof(name), "sdpa_flash_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
-    const int ok = check_attention_close(flash_out, explicit_out, ggml_nelements(explicit_y), 2e-2f, name);
+    char f16_name[128];
+    char bf16_name[128];
+    snprintf(f16_name, sizeof(f16_name), "sdpa_flash_f16_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
+    snprintf(bf16_name, sizeof(bf16_name), "sdpa_flash_bf16_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
+    int ok = check_attention_close(
+        flash_f16_out,
+        explicit_out,
+        ggml_nelements(explicit_y),
+        2e-2f,
+        f16_name);
+    ok = ok && check_attention_close(
+        flash_bf16_out,
+        explicit_out,
+        ggml_nelements(explicit_y),
+        3e-2f,
+        bf16_name);
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -538,7 +563,8 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     free(k_data);
     free(v_data);
     free(explicit_out);
-    free(flash_out);
+    free(flash_f16_out);
+    free(flash_bf16_out);
     return ok;
 }
 

@@ -630,7 +630,7 @@ static int run_sparse_structure_image(
     int flow_no_rope,
     int projected_conditioning,
     int emulate_bf16_blocks,
-    int use_ggml_flash_attn,
+    const trellis_ggml_attention_policy * requested_attention_policy,
     float threshold,
     float camera_angle_x,
     float camera_distance,
@@ -841,9 +841,10 @@ static int run_sparse_structure_image(
             flow_model.projection.proj_channels);
     }
     flow_model.base = flow;
-    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
-    if (use_ggml_flash_attn) {
-        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    trellis_ggml_attention_policy attention_policy =
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (trellis_ggml_attention_policy_is_valid(requested_attention_policy)) {
+        attention_policy = *requested_attention_policy;
     }
 
     const size_t latent_count = (size_t) flow.in_channels * (size_t) tokens;
@@ -1161,6 +1162,14 @@ trellis_status trellis_pipeline_run_sparse_structure(
     if (backend == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    trellis_ggml_attention_policy attention_policy = options->attention_policy;
+    if (!trellis_ggml_attention_policy_is_valid(&attention_policy)) {
+        attention_policy = (trellis_ggml_attention_policy)
+            TRELLIS_GGML_ATTENTION_POLICY_INIT;
+        if (options->use_ggml_flash_attn) {
+            attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+        }
+    }
     int rc = run_sparse_structure_image(
         backend,
         options->model_dir,
@@ -1178,7 +1187,7 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->flow_no_rope,
         options->projected_conditioning,
         options->emulate_bf16_blocks,
-        options->use_ggml_flash_attn,
+        &attention_policy,
         options->voxel_threshold,
         options->camera_angle_x,
         options->camera_distance,

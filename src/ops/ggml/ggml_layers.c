@@ -19,7 +19,8 @@ int trellis_ggml_attention_policy_is_valid(
     return policy != NULL &&
         policy->struct_size >= sizeof(trellis_ggml_attention_policy) &&
         (policy->mode == TRELLIS_GGML_ATTENTION_MODE_EXPLICIT ||
-         policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH);
+         policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH ||
+         policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16);
 }
 
 static struct ggml_tensor * trellis_ggml_cast_param_like(
@@ -157,16 +158,21 @@ struct ggml_tensor * trellis_ggml_sdpa_with_policy(
     const int use_flash = policy == NULL ?
         g_trellis_ggml_use_flash_attn :
         (trellis_ggml_attention_policy_is_valid(policy) &&
-         policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH);
+         (policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH ||
+          policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16));
     if (policy != NULL && !trellis_ggml_attention_policy_is_valid(policy)) {
         return NULL;
     }
     if (use_flash) {
+        const enum ggml_type flash_kv_type =
+            policy != NULL &&
+            policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 ?
+                GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+            k = ggml_cast(ctx, k, flash_kv_type);
         }
         if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+            v = ggml_cast(ctx, v, flash_kv_type);
         }
         struct ggml_tensor * h = ggml_flash_attn_ext(ctx, q, k, v, NULL, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(h, GGML_PREC_F32);

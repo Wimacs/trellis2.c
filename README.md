@@ -147,7 +147,10 @@ Pixal3D automatically uses BF16-style block rounding and the explicit SDPA
 path. This avoids FP16 overflow in the current ggml flash-attention K/V path on
 long 1024-resolution sparse sequences; TRELLIS.2 keeps its existing flash
 attention default. `--use-ggml-flash-attn` is retained as an explicit debug
-override.
+override. A package's `flash_kv_dtype` is carried in the instance-scoped
+attention policy (`f16` and `bf16` are distinct). The current ggml CUDA
+multi-token kernel may internally narrow BF16 K/V to F16, so BF16 Flash is not
+used as a Pixal3D overflow workaround; Vulkan can retain the BF16 graph path.
 
 Windows:
 

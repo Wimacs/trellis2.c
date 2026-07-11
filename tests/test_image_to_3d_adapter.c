@@ -92,6 +92,25 @@ static void test_trellis_repository_package(void) {
     CHECK_TRUE(attention.mode == TRELLIS_GGML_ATTENTION_MODE_FLASH);
     CHECK_TRUE(emulate_bf16_blocks == 0);
 
+    /* A future package can request BF16 Flash K/V without changing the
+     * policy ABI; the current Trellis descriptor intentionally remains F16. */
+    trellis_model_component_instance bf16_flash_flow = *flow;
+    bf16_flash_flow.execution.flash_kv_dtype = TRELLIS_DTYPE_BF16;
+    attention = (trellis_ggml_attention_policy)
+        TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    CHECK_TRUE(trellis_image_to_3d_component_execution_policy(
+        &bf16_flash_flow,
+        &attention,
+        &emulate_bf16_blocks) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(attention.mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16);
+    trellis_model_component_instance * mutable_flow =
+        (trellis_model_component_instance *) flow;
+    mutable_flow->execution.flash_kv_dtype = TRELLIS_DTYPE_BF16;
+    const trellis_status mismatched_policy_status =
+        trellis_image_to_3d_adapter_validate_package(adapter, &package);
+    mutable_flow->execution.flash_kv_dtype = TRELLIS_DTYPE_F16;
+    CHECK_TRUE(mismatched_policy_status == TRELLIS_STATUS_PARSE_ERROR);
+
     /* The family adapter must reject a package missing a base task role. */
     const size_t saved_count = package.component_count;
     package.component_count = saved_count - 1;

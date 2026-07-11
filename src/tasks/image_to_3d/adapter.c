@@ -137,7 +137,10 @@ trellis_status trellis_image_to_3d_component_execution_policy(
                 component->execution.flash_kv_dtype != TRELLIS_DTYPE_BF16) {
                 return TRELLIS_STATUS_INVALID_ARGUMENT;
             }
-            attention.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+            attention.mode =
+                component->execution.flash_kv_dtype == TRELLIS_DTYPE_BF16 ?
+                    TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 :
+                    TRELLIS_GGML_ATTENTION_MODE_FLASH;
             break;
         default:
             return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -185,10 +188,14 @@ trellis_status trellis_image_to_3d_adapter_validate_package(
                 &emulate_bf16_blocks) != TRELLIS_STATUS_OK) {
             return TRELLIS_STATUS_PARSE_ERROR;
         }
-        const trellis_ggml_attention_mode expected_mode =
-            requirement->attention == TRELLIS_ATTENTION_FLASH ?
-                TRELLIS_GGML_ATTENTION_MODE_FLASH :
-                TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
+        trellis_ggml_attention_mode expected_mode =
+            TRELLIS_GGML_ATTENTION_MODE_EXPLICIT;
+        if (requirement->attention == TRELLIS_ATTENTION_FLASH) {
+            expected_mode =
+                requirement->flash_kv_dtype == TRELLIS_DTYPE_BF16 ?
+                    TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 :
+                    TRELLIS_GGML_ATTENTION_MODE_FLASH;
+        }
         if (attention.mode != expected_mode ||
             emulate_bf16_blocks != requirement->emulate_bf16_blocks) {
             return TRELLIS_STATUS_PARSE_ERROR;

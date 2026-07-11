@@ -562,9 +562,13 @@ trellis_status trellis_pipeline_run_structured_latent(
         TRELLIS_INFO("structured latent %s: bf16 block activation round-trip enabled", label);
     }
     flow_model.base = flow;
-    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
-    if (options->use_ggml_flash_attn) {
-        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    trellis_ggml_attention_policy attention_policy = options->attention_policy;
+    if (!trellis_ggml_attention_policy_is_valid(&attention_policy)) {
+        attention_policy = (trellis_ggml_attention_policy)
+            TRELLIS_GGML_ATTENTION_POLICY_INIT;
+        if (options->use_ggml_flash_attn) {
+            attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+        }
     }
 
     const size_t state_count = (size_t) options->n_coords * (size_t) state_channels;
