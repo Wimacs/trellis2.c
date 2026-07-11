@@ -257,10 +257,12 @@ build_targets() {
     configure_build_if_needed "$VULKAN_BUILD" vulkan
     configure_build_if_needed "$CUDA_BUILD" cuda
     cmake --build "$VULKAN_BUILD" --target \
-        trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
+        trellis-gui trellis2-image-to-gltf pixal3d-image-to-gltf \
+        trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
         -j "$JOBS"
     cmake --build "$CUDA_BUILD" --target \
-        trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
+        trellis-gui trellis2-image-to-gltf pixal3d-image-to-gltf \
+        trellis-birefnet-rgba trellis-rebake-gltf vkmesh \
         -j "$JOBS"
 }
 
@@ -329,18 +331,28 @@ exec "$HERE/bin/trellis-gui" --weights "$HERE/TRELLIS.2" "$@"
 SH
         chmod 755 "$pkg/run-gui.sh"
     else
-        cat > "$pkg/run-cli.sh" <<'SH'
+        cat > "$pkg/run-trellis2.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$HERE/bin:$PATH"
-exec "$HERE/bin/trellis-image-to-gltf" \
+exec "$HERE/bin/trellis2-image-to-gltf" \
     --model "$HERE/TRELLIS.2/TRELLIS.2-4B" \
     --dino "$HERE/TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m" \
     "$@"
 SH
-        chmod 755 "$pkg/run-cli.sh"
+        chmod 755 "$pkg/run-trellis2.sh"
+
+        cat > "$pkg/run-pixal3d.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$HERE/bin:$PATH"
+exec "$HERE/bin/pixal3d-image-to-gltf" "$@"
+SH
+        chmod 755 "$pkg/run-pixal3d.sh"
     fi
 
     cat > "$pkg/env.sh" <<'SH'
@@ -369,9 +381,11 @@ The GUI writes outputs to viewer_outputs/ next to this package.
 EOF
     else
         cat >> "$pkg/README.txt" <<'EOF'
-  ./run-cli.sh --image images.jpg --output output.glb
+  ./run-trellis2.sh --image images.jpg --output output.glb
+  ./run-pixal3d.sh --model /path/to/Pixal3D --dino /path/to/DINO --image images.jpg --output pixal3d.glb
 
-You can pass any trellis-image-to-gltf option after ./run-cli.sh.
+Each launcher invokes a model-pinned executable. The bundled downloader provides
+TRELLIS.2/DINO/BiRefNet weights; Pixal3D weights must be supplied separately.
 EOF
     fi
     cat >> "$pkg/README.txt" <<EOF
@@ -410,7 +424,8 @@ copy_common_tools() {
     if [[ "$flavor" == "gui" ]]; then
         copy_exec "$build_dir/trellis-gui" "$pkg/bin"
     else
-        copy_exec "$build_dir/trellis-image-to-gltf" "$pkg/bin"
+        copy_exec "$build_dir/trellis2-image-to-gltf" "$pkg/bin"
+        copy_exec "$build_dir/pixal3d-image-to-gltf" "$pkg/bin"
         copy_exec "$build_dir/trellis-birefnet-rgba" "$pkg/bin"
         copy_exec "$build_dir/trellis-rebake-gltf" "$pkg/bin"
     fi
@@ -435,7 +450,11 @@ package_one() {
     if [[ "$flavor" == "gui" ]]; then
         binaries+=("$build_dir/trellis-gui")
     else
-        binaries+=("$build_dir/trellis-image-to-gltf" "$build_dir/trellis-birefnet-rgba" "$build_dir/trellis-rebake-gltf")
+        binaries+=(
+            "$build_dir/trellis2-image-to-gltf"
+            "$build_dir/pixal3d-image-to-gltf"
+            "$build_dir/trellis-birefnet-rgba"
+            "$build_dir/trellis-rebake-gltf")
     fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
         copy_runtime_libs "$pkg/lib" "${binaries[@]}"
@@ -457,10 +476,10 @@ package_one() {
 build_targets
 
 require_executable "$VULKAN_BUILD/vkmesh"
-for target in trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf; do
+for target in trellis-gui trellis2-image-to-gltf pixal3d-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf; do
     require_executable "$VULKAN_BUILD/$target"
 done
-for target in trellis-gui trellis-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh; do
+for target in trellis-gui trellis2-image-to-gltf pixal3d-image-to-gltf trellis-birefnet-rgba trellis-rebake-gltf vkmesh; do
     require_executable "$CUDA_BUILD/$target"
 done
 

@@ -14,7 +14,7 @@
   <img src="img.png" alt="trellis2.c 本地工作区">
 </p>
 
-`trellis2.c` 是 TRELLIS.2 图像转 3D 的原生推理工具，支持 CUDA 和 Vulkan。主要命令是 `trellis-image-to-gltf`。
+`trellis2.c` 是 TRELLIS.2 和 Pixal3D 图像转 3D 的原生推理工具，支持 CUDA 和 Vulkan。每个模型使用独立命令：`trellis2-image-to-gltf` 和 `pixal3d-image-to-gltf`。
 
 ## 编译
 
@@ -93,7 +93,7 @@ python3 tools/download_weights.py --source modelscope
 Linux：
 
 ```sh
-./build/trellis-image-to-gltf \
+./build/trellis2-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
@@ -101,10 +101,25 @@ Linux：
   --gltf output.glb
 ```
 
+TRELLIS.2 命令固定使用 512 profile，并会在读取图片和初始化 GPU 前拒绝
+Pixal3D 模型包。Pixal3D 默认使用 `1024_cascade`，命令为：
+
+```sh
+./build/pixal3d-image-to-gltf \
+  --model ../Pixal3D/Pixal3D \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image example_image/T.png \
+  --gltf pixal3d.glb
+```
+
+Pixal3D 专用命令提供 `--naf`、`--fov`、`--camera-distance`、
+`--mesh-scale` 和 `--pipeline 1536_cascade`；这些参数不会出现在 TRELLIS.2
+命令中。两个命令共享底层 task、算子、vkmesh 补洞和 remesh 实现。
+
 Windows：
 
 ```powershell
-.\build-win\Release\trellis-image-to-gltf.exe `
+.\build-win\Release\trellis2-image-to-gltf.exe `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
   --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
@@ -115,7 +130,7 @@ Windows：
 Windows Vulkan 构建使用：
 
 ```powershell
-.\build-win-vulkan\Release\trellis-image-to-gltf.exe `
+.\build-win-vulkan\Release\trellis2-image-to-gltf.exe `
   --backend vulkan `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `

@@ -78,3 +78,21 @@ The extension sequence is:
 The legacy `trellis_pipeline_image_to_gltf()` and
 `trellis_pipeline_image_to_gltf_ex()` symbols remain compatibility wrappers
 around the registered `image_to_3d` task.
+
+## Model-pinned command line tools
+
+The library may host multiple families for the same task, but a user-facing
+inference executable belongs to exactly one model family.  The TRELLIS.2 and
+Pixal3D image-to-3D tools therefore use separate entry points:
+
+```text
+trellis2-image-to-gltf  -> family=trellis2, profile=512
+pixal3d-image-to-gltf   -> family=pixal3d, profile=1024_cascade
+```
+
+Both tools reuse the registered `image_to_3d` task and its operators.  They do
+not select a family from `argv[0]`, expose a `--family` switch, or silently
+dispatch from model metadata.  Their model-pinned library wrappers validate
+the package family before image loading or backend initialization.  A model
+for a different task, such as a future mesh-rigging model, receives another
+task-specific executable instead of adding modes to either image-to-3D tool.

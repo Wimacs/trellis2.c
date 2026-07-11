@@ -15,7 +15,8 @@
 </p>
 
 Native TRELLIS.2 and Pixal3D image-to-3D inference tool with CUDA and Vulkan
-support. The main command is `trellis-image-to-gltf`.
+support. Each model has a family-pinned command: `trellis2-image-to-gltf` or
+`pixal3d-image-to-gltf`.
 
 ## Build
 
@@ -99,25 +100,25 @@ This downloads TRELLIS.2, DINOv3, and the BiRefNet background-removal model:
 Linux:
 
 ```sh
-./build/trellis-image-to-gltf \
+./build/trellis2-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image example_image/T.png \
   --gltf output.glb
 ```
 
-The model adapter selects the standard pipeline automatically: TRELLIS.2 uses
-the 512 pipeline, while Pixal3D uses the 1024 cascade. Both use vkmesh for hole
-filling and remeshing, with simplification disabled by default. For opaque
-input, both also use an auto-discovered BiRefNet model when available; Pixal3D
-requires it, while TRELLIS.2 can still run without it.
+The TRELLIS.2 executable is fixed to the 512 profile. It rejects Pixal3D model
+packages before loading the image or initializing a GPU. Both model CLIs use
+vkmesh for hole filling and remeshing, with simplification disabled by default.
+For opaque input, both also use an auto-discovered BiRefNet model when available;
+Pixal3D requires it, while TRELLIS.2 can still run without it.
 
 ### Pixal3D
 
-Pixal3D uses the same executable and is detected from the checkpoint tensor
-layout. Its projected image conditioning also needs the ValeoAI NAF checkpoint,
-converted once from the release `.pth` file to safetensors (this command needs
-Python `torch` and `safetensors`):
+Pixal3D uses its own `pixal3d-image-to-gltf` executable. Its projected image
+conditioning also needs the ValeoAI NAF checkpoint, converted once from the
+release `.pth` file to safetensors (this command needs Python `torch` and
+`safetensors`):
 
 ```sh
 python3 tools/convert_naf_weights.py \
@@ -128,7 +129,7 @@ python3 tools/convert_naf_weights.py \
 Run the 1024 cascade on CUDA or Vulkan with:
 
 ```sh
-./build/trellis-image-to-gltf \
+./build/pixal3d-image-to-gltf \
   --model ../Pixal3D/Pixal3D \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image example_image/T.png \
@@ -147,13 +148,15 @@ selected FOV but does not estimate FOV from the image. A transparent foreground
 mask is used directly. For opaque input, BiRefNet is discovered from
 `TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
 DINO; `--birefnet FILE` remains an explicit override.
-TRELLIS.2 checkpoints ignore the NAF and camera options.
+NAF and camera projection options are exposed only by the Pixal3D executable.
 
 C callers that need Pixal3D overrides can initialize
 `trellis_pixal3d_options` with `TRELLIS_PIXAL3D_OPTIONS_INIT` and call
-`trellis_pipeline_image_to_gltf_ex()`; non-positive `camera_distance` selects
-the same FOV/mesh-scale fit. The legacy entry point uses that fitted default
-camera and automatic NAF lookup.
+`trellis_pipeline_pixal3d_image_to_gltf()`; non-positive `camera_distance`
+selects the same FOV/mesh-scale fit. TRELLIS.2 callers can use
+`trellis_pipeline_trellis2_image_to_gltf()`. The generic entry points remain as
+library compatibility APIs, but no command-line executable auto-dispatches
+between families.
 
 Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
 On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
@@ -185,7 +188,7 @@ family.
 Windows:
 
 ```powershell
-.\build-win\Release\trellis-image-to-gltf.exe `
+.\build-win\Release\trellis2-image-to-gltf.exe `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
   --image example_image\T.png `
@@ -195,7 +198,7 @@ Windows:
 For a Windows Vulkan build, use:
 
 ```powershell
-.\build-win-vulkan\Release\trellis-image-to-gltf.exe `
+.\build-win-vulkan\Release\trellis2-image-to-gltf.exe `
   --backend vulkan `
   --model ..\TRELLIS.2\TRELLIS.2-4B `
   --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `

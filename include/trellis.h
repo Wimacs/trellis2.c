@@ -819,6 +819,15 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options);
 
+/* Model-pinned entry points used by per-family CLIs.  They reject a model
+ * package from another family before image loading or backend initialization. */
+trellis_status trellis_pipeline_trellis2_image_to_gltf(
+    const trellis_image_to_gltf_options * options);
+
+trellis_status trellis_pipeline_pixal3d_image_to_gltf(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options);
+
 #include "trellis_ggml_layers.h"
 #include "trellis_flow_sampler.h"
 

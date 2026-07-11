@@ -641,12 +641,37 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis-infer PRIVATE trellis2_c ggml)
     endif()
 
-    add_executable(trellis-image-to-gltf
-        tools/trellis_image_to_gltf.c
+    set(TRELLIS_IMAGE_TO_GLTF_CLI_COMMON
+        tools/image_to_gltf_cli.c
     )
-    target_link_libraries(trellis-image-to-gltf PRIVATE trellis2_c ggml)
-    if (UNIX)
-        target_link_libraries(trellis-image-to-gltf PRIVATE m)
+    function(add_model_image_to_gltf_cli TARGET ENTRY_SOURCE)
+        add_executable(${TARGET}
+            ${ENTRY_SOURCE}
+            ${TRELLIS_IMAGE_TO_GLTF_CLI_COMMON}
+        )
+        target_include_directories(${TARGET} PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/tools")
+        target_link_libraries(${TARGET} PRIVATE trellis2_c ggml)
+        if (UNIX)
+            target_link_libraries(${TARGET} PRIVATE m)
+        endif()
+    endfunction()
+
+    add_model_image_to_gltf_cli(
+        trellis2-image-to-gltf
+        tools/trellis2_image_to_gltf.c)
+    add_model_image_to_gltf_cli(
+        pixal3d-image-to-gltf
+        tools/pixal3d_image_to_gltf.c)
+
+    if (TRELLIS2_C_BUILD_TESTS AND Python3_Interpreter_FOUND)
+        add_test(
+            NAME trellis2_c_model_cli_split_tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/tests/test_model_cli_split.py"
+                --trellis2 $<TARGET_FILE:trellis2-image-to-gltf>
+                --pixal3d $<TARGET_FILE:pixal3d-image-to-gltf>
+                --source-dir "${CMAKE_CURRENT_LIST_DIR}")
     endif()
 
     add_executable(trellis-rebake-gltf
@@ -665,8 +690,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
     endif()
 
     # vkmesh is a standalone Vulkan utility even when the inference backend is
-    # CUDA.  Building it beside trellis-image-to-gltf lets the CUDA pipeline's
-    # existing sibling-executable discovery work without --vkmesh.
+    # CUDA.  Building it beside the model-specific image-to-glTF CLIs lets the
+    # CUDA pipeline's sibling-executable discovery work without --vkmesh.
     if (Vulkan_FOUND)
         function(add_vkmesh_shader NAME SOURCE SYMBOL)
             set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
@@ -778,9 +803,13 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 COMMAND trellis2_c_vkmesh_tests $<TARGET_FILE:vkmesh>)
             set_tests_properties(trellis2_c_vkmesh_tests PROPERTIES SKIP_RETURN_CODE 77)
         endif()
-        if (TARGET trellis-image-to-gltf)
-            add_dependencies(trellis-image-to-gltf vkmesh)
-        endif()
+        foreach(IMAGE_TO_GLTF_TARGET
+                trellis2-image-to-gltf
+                pixal3d-image-to-gltf)
+            if (TARGET ${IMAGE_TO_GLTF_TARGET})
+                add_dependencies(${IMAGE_TO_GLTF_TARGET} vkmesh)
+            endif()
+        endforeach()
         if (TRELLIS2_C_BUILD_TESTS)
             add_test(NAME trellis2_c_vkmesh_cli_smoke
                 COMMAND $<TARGET_FILE:vkmesh> --help)

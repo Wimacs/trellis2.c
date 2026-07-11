@@ -1376,14 +1376,44 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
 #endif
 }
 
+static trellis_status trellis_pipeline_image_to_gltf_impl(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options,
+    const char * required_family);
+
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
-    return trellis_pipeline_image_to_gltf_ex(options, &pixal_options);
+    return trellis_pipeline_image_to_gltf_impl(options, &pixal_options, NULL);
 }
 
 trellis_status trellis_pipeline_image_to_gltf_ex(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options) {
+    return trellis_pipeline_image_to_gltf_impl(options, pixal_options, NULL);
+}
+
+trellis_status trellis_pipeline_trellis2_image_to_gltf(
+    const trellis_image_to_gltf_options * options) {
+    trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
+    return trellis_pipeline_image_to_gltf_impl(
+        options,
+        &pixal_options,
+        "trellis2");
+}
+
+trellis_status trellis_pipeline_pixal3d_image_to_gltf(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options) {
+    return trellis_pipeline_image_to_gltf_impl(
+        options,
+        pixal_options,
+        "pixal3d");
+}
+
+static trellis_status trellis_pipeline_image_to_gltf_impl(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options,
+    const char * required_family) {
     if (pixal_options == NULL ||
         pixal_options->struct_size < TRELLIS_PIXAL3D_OPTIONS_V1_SIZE ||
         !isfinite(pixal_options->camera_angle_x) ||
@@ -1441,6 +1471,17 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             options->model_dir,
             trellis_status_string(status));
         return status;
+    }
+    if (required_family != NULL &&
+        (model_package.family == NULL ||
+         strcmp(model_package.family, required_family) != 0)) {
+        TRELLIS_ERROR(
+            "model package '%s' has family '%s', but this entry point requires family '%s'",
+            model_package.id != NULL ? model_package.id : "unknown",
+            model_package.family != NULL ? model_package.family : "unknown",
+            required_family);
+        trellis_model_package_free(&model_package);
+        return TRELLIS_STATUS_PARSE_ERROR;
     }
     status = trellis_image_to_3d_adapter_resolve_package(
         &model_package, &task_adapter);

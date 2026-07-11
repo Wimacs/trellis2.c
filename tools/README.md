@@ -25,10 +25,10 @@ weights folder in the window, or pass it up front:
 ../build/trellis-gui --weights ../TRELLIS.2
 ```
 
-`trellis-image-to-gltf` is the default terminal inference app:
+`trellis2-image-to-gltf` is the TRELLIS.2 terminal inference app:
 
 ```sh
-../build/trellis-image-to-gltf \
+../build/trellis2-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image ../assets/example_image/T.png \
@@ -39,17 +39,17 @@ It loads an input image, runs DINO conditioning, sparse-structure flow,
 structured-latent shape flow, shape decode, texture decode, TRELLIS topology
 postprocess, and writes a GLB or glTF in one command. It does not open raylib.
 Sparse coords and DINO condition data are passed directly in memory, so no stage
-handoff files are written by default. The CLI defaults to the PyTorch app-style
-pipeline for the detected family (TRELLIS.2 `512`, Pixal3D `1024_cascade`) and
-vkmesh remesh postprocess without simplification. If no output path is passed,
-it writes `output.glb`. WebP inputs are converted to a
+handoff files are written by default. This executable is pinned to the
+TRELLIS.2 family and the `512` profile; a Pixal3D package is rejected before
+image loading or GPU initialization. It uses vkmesh remesh postprocess without
+simplification. If no output path is passed, it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
 stb_image loader does not decode WebP directly.
 For opaque input, both model families use an auto-discovered BiRefNet model when
 available. Pixal3D requires foreground isolation; TRELLIS.2 remains able to run
 without BiRefNet for compatibility.
 
-Pixal3D checkpoints are auto-detected and use the same command. Convert the NAF
+Pixal3D has a separate `pixal3d-image-to-gltf` executable. Convert the NAF
 release checkpoint once, then pass it with the Pixal3D model directory:
 
 ```sh
@@ -57,7 +57,7 @@ python3 tools/convert_naf_weights.py \
   /path/to/naf_release.pth \
   ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors
 
-../build/trellis-image-to-gltf \
+../build/pixal3d-image-to-gltf \
   --model ../Pixal3D/Pixal3D \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image ../assets/example_image/T.png \
@@ -75,10 +75,12 @@ is used directly. For opaque input, BiRefNet is discovered from
 `TRELLIS_BIREFNET_PATH`, the model directory, or a `BiRefNet` directory beside
 DINO; `--birefnet FILE` remains an explicit override.
 
-`trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
-`trellis_pipeline_image_to_gltf_ex()` from `src/tasks/image_to_3d/image_to_3d.c`.
-The legacy `trellis_pipeline_image_to_gltf()` entry point remains available and
-uses the fitted default Pixal3D camera plus automatic NAF path discovery.
+`trellis2_image_to_gltf.c` and `pixal3d_image_to_gltf.c` are thin model-pinned
+entry points over `image_to_gltf_cli.c`. They call
+`trellis_pipeline_trellis2_image_to_gltf()` and
+`trellis_pipeline_pixal3d_image_to_gltf()` respectively. The generic library
+entry points remain for source compatibility, but there is no generic CLI that
+auto-dispatches between model families.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and
@@ -89,7 +91,7 @@ live under `tools/vkmesh/shaders/`. The image-to-3D glTF exporter and its
 texture bake shaders live under `src/tasks/image_to_3d/export/`.
 
 ```sh
-../build/trellis-image-to-gltf \
+../build/trellis2-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --birefnet ../TRELLIS.2/BiRefNet/model.gguf \
@@ -113,14 +115,14 @@ geometry-only meshbin output, `--cleanup` for a single primitive cleanup pass, o
 individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
 Vulkan inference calls the integrated vkmesh C API. CUDA builds place the
-standalone `vkmesh` beside `trellis-image-to-gltf`, and the pipeline finds that
-sibling automatically; `PATH` and `--vkmesh FILE` are only fallbacks for a
-custom layout.
+standalone `vkmesh` beside both model CLIs, and the pipeline finds that sibling
+automatically; `PATH` and `--vkmesh FILE` are only fallbacks for a custom
+layout.
 vkmesh keeps its Vulkan buffer workspace bounded. By default it derives a
 conservative budget from `VK_EXT_memory_budget` (with a 2048 MiB ceiling), keeps
 source geometry/BVH resident once, and streams distance-query points through a
 reusable batch buffer. Override the cap with
-`--vkmesh-gpu-workspace-budget-mib N` in `trellis-image-to-gltf`,
+`--vkmesh-gpu-workspace-budget-mib N` in either model CLI,
 `--gpu-workspace-budget-mib N` in standalone `vkmesh`, or
 `TRELLIS_VKMESH_GPU_WORKSPACE_BUDGET_MIB`. The limit covers vkmesh
 `VkDeviceMemory` workspace, not model weights owned by the rest of the process.
@@ -165,7 +167,9 @@ Debug helpers:
 
 - `trellis_tool_cli.h`: terminal logging and diffusion.cpp-style progress output.
 - `trellis_tool_model.h`: shared safetensors-to-CUDA tensor-store loading helper.
-- `trellis_image_to_gltf.c`: one-shot image-to-GLB/glTF CLI entry point.
+- `image_to_gltf_cli.c`: shared image-to-GLB/glTF CLI implementation.
+- `trellis2_image_to_gltf.c`: Trellis2-only CLI entry point.
+- `pixal3d_image_to_gltf.c`: Pixal3D-only CLI entry point.
 - `debug/trellis_infer.c`: legacy/debug sparse-structure image/DINO/flow/voxel decode CLI.
 
 Standalone debug tools:

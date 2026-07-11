@@ -186,6 +186,8 @@ Weights:
 
 Included:
   - trellis-gui.exe
+  - trellis2-image-to-gltf.exe (TRELLIS.2-only CLI)
+  - pixal3d-image-to-gltf.exe (Pixal3D-only CLI; weights supplied separately)
   - vkmesh.exe for mesh postprocess
   - runtime DLLs for this backend
   - download_weights.py plus Windows wrapper scripts
@@ -203,7 +205,15 @@ Outputs are written to viewer_outputs\ next to the app.
 }
 
 function Copy-Common($DestinationDir, $BuildDir) {
-    foreach ($Name in @("trellis-gui.exe", "trellis2_c.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "raylib.dll")) {
+    foreach ($Name in @(
+        "trellis-gui.exe",
+        "trellis2-image-to-gltf.exe",
+        "pixal3d-image-to-gltf.exe",
+        "trellis2_c.dll",
+        "ggml.dll",
+        "ggml-base.dll",
+        "ggml-cpu.dll",
+        "raylib.dll")) {
         Copy-Required (Join-Path $BuildDir $Name) $DestinationDir
     }
     Copy-Required (Join-Path $BuildDir "vkmesh.exe") $DestinationDir

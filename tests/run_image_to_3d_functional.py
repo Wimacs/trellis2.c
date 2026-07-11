@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in end-to-end image-to-3D generation and GLB validation.
+"""Opt-in end-to-end Pixal3D generation and GLB validation.
 
 This runner is intentionally not registered with CTest: it needs real model
 weights, a DINO checkpoint, an input image, a GPU backend, and vkmesh.  It
@@ -152,8 +152,6 @@ def _build_command(
         os.fspath(args.output),
         "--backend",
         args.backend,
-        "--pipeline",
-        "1024_cascade",
         "--no-model-cache",
         "--mesh-postprocess",
         "--mesh-remesh",
@@ -183,7 +181,7 @@ def _generator_failure_exit_code(returncode: int) -> int:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run an explicit real image-to-3D generation with vkmesh remeshing, "
+            "Run an explicit real Pixal3D generation with vkmesh remeshing, "
             "then strictly validate the self-contained GLB"
         )
     )
@@ -191,7 +189,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--executable",
         required=True,
         type=Path,
-        help="trellis-image-to-gltf executable (path or command on PATH)",
+        help="pixal3d-image-to-gltf executable (path or command on PATH)",
     )
     parser.add_argument(
         "--model", required=True, type=Path, help="model directory containing ckpts/"

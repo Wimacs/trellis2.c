@@ -216,11 +216,43 @@ static void test_fake_non_3d_package(void) {
     CHECK_TRUE(adapter == NULL);
 }
 
+static void test_model_pinned_entrypoints_reject_wrong_family(void) {
+    char trellis_root[4096];
+    char pixal_root[4096];
+    CHECK_TRUE(snprintf(
+        trellis_root,
+        sizeof(trellis_root),
+        "%s/models/trellis2",
+        TRELLIS_TEST_SOURCE_DIR) > 0);
+    CHECK_TRUE(snprintf(
+        pixal_root,
+        sizeof(pixal_root),
+        "%s/models/pixal3d",
+        TRELLIS_TEST_SOURCE_DIR) > 0);
+
+    trellis_image_to_gltf_options options = {0};
+    options.dino_dir = "unused-dino";
+    options.image_path = "unused.png";
+    options.device = 0;
+
+    options.model_dir = pixal_root;
+    CHECK_TRUE(
+        trellis_pipeline_trellis2_image_to_gltf(&options) ==
+        TRELLIS_STATUS_PARSE_ERROR);
+
+    trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
+    options.model_dir = trellis_root;
+    CHECK_TRUE(
+        trellis_pipeline_pixal3d_image_to_gltf(&options, &pixal_options) ==
+        TRELLIS_STATUS_PARSE_ERROR);
+}
+
 int main(void) {
     test_descriptor_registry();
     test_trellis_repository_package();
     test_pixal_repository_package();
     test_fake_non_3d_package();
+    test_model_pinned_entrypoints_reject_wrong_family();
     if (g_failures != 0) {
         fprintf(stderr, "%d image_to_3d adapter test(s) failed\n", g_failures);
         return 1;

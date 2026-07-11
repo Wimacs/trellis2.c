@@ -1120,7 +1120,7 @@ static void usage(FILE * out, const char * argv0) {
         "\n"
         "Local raylib image-to-3D GUI. Uses auto-detected weights, or pass --weights DIR. Choose an image in the window.\n"
         "\n"
-        "Core options mirror trellis-image-to-gltf:\n"
+        "Core options mirror the TRELLIS.2 image-to-3D task:\n"
         "  --weights DIR            Folder containing downloaded TRELLIS, DINO, and optional BiRefNet weights\n"
         "  --model DIR, --dino DIR, --birefnet FILE, --image FILE\n"
         "  --out-dir DIR, --gltf FILE, --backend NAME, --device N\n"

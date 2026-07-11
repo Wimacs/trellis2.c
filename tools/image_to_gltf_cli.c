@@ -1,3 +1,5 @@
+#include "image_to_gltf_cli.h"
+
 #include "trellis.h"
 
 #include <errno.h>
@@ -8,7 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void print_banner(void) {
+static int is_pixal3d_cli(trellis_image_to_gltf_cli_model model) {
+    return model == TRELLIS_IMAGE_TO_GLTF_CLI_PIXAL3D;
+}
+
+static const char * cli_model_name(trellis_image_to_gltf_cli_model model) {
+    return is_pixal3d_cli(model) ? "Pixal3D" : "TRELLIS.2";
+}
+
+static const char * cli_executable_name(trellis_image_to_gltf_cli_model model) {
+    return is_pixal3d_cli(model) ?
+        "pixal3d-image-to-gltf" : "trellis2-image-to-gltf";
+}
+
+static void print_banner(trellis_image_to_gltf_cli_model model) {
     fputs(
         "  _______ ____  _____ _     _     ___ ____  ____    ____ \n"
         " |__   __|  _ \\| ____| |   | |   |_ _/ ___||___ \\  / ___|\n"
@@ -16,30 +31,34 @@ static void print_banner(void) {
         "    | |  |  _ <| |___| |___| |___ | | ___) |/ __/ | |___ \n"
         "    |_|  |_| \\_\\_____|_____|_____|___|____/|_____(_)____|\n"
         "\n"
-        "                 trellis2.c image-to-3D pipeline\n"
+        "                 trellis2.c model CLI\n"
         "\n",
         stdout);
+    fprintf(stdout, "                 %s image-to-3D\n\n", cli_model_name(model));
     fflush(stdout);
 }
 
-static void usage(FILE * out, const char * argv0) {
+static void usage(
+    FILE * out,
+    const char * argv0,
+    trellis_image_to_gltf_cli_model model) {
+    const int pixal3d = is_pixal3d_cli(model);
     fprintf(out,
         "Usage:\n"
         "  %s --model DIR --dino DIR --image FILE [--gltf FILE | --glb FILE | --output FILE] [options]\n"
         "\n"
-        "Runs image -> sparse structure -> shape SLat -> mesh/subs -> texture SLat -> GLB/glTF textures.\n"
+        "Runs the %s image-to-3D model. This executable rejects model packages from other families.\n"
+        "%s\n"
         "\n"
         "Options:\n"
-        "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
+        "  --model DIR             %s model directory containing model.json and ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
-        "  --naf FILE              Pixal3D NAF weights converted to safetensors; not used by TRELLIS.2\n"
         "  --birefnet FILE         Override auto-discovered BiRefNet GGUF for opaque input\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
         "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures, default output.glb\n"
         "  --glb FILE              Alias of --gltf\n"
         "  --output FILE           Alias of --gltf\n"
         "  --texture-size N        glTF texture size, default 1024\n"
-        "  --pipeline NAME         512, 1024, 1024_cascade, or 1536_cascade; default Trellis=512, Pixal3D=1024_cascade\n"
         "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
         "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
         "  --mesh-postprocess-simplify Run vkmesh simplify after remesh/cleanup, default off\n"
@@ -62,12 +81,6 @@ static void usage(FILE * out, const char * argv0) {
         "  --seed N                Sparse-structure latent seed, default 1\n"
         "  --noise-seed N          Structured-latent noise seed, default 18\n"
         "  --latent-size N         Sparse-structure latent grid edge, default 16\n"
-        "  --resolution N          Legacy shape resolution override, 512 or 1024; --pipeline controls normal runs\n"
-        "  --cond-resolution N     DINO input square edge, default 512\n"
-        "  --sparse-resolution N   Sparse-structure output edge, default 32\n"
-        "  --fov X                 Pixal3D horizontal camera FOV in radians, default 0.857556; updates auto distance\n"
-        "  --camera-distance X     Pixal3D projection distance; 0/default derives 1/(2*mesh_scale*tan(fov/2))\n"
-        "  --mesh-scale X          Pixal3D projection-space mesh scale, default 1; updates auto distance\n"
         "  --flow PATH             Override shape SLat flow safetensors path\n"
         "  --decoder PATH          Override FlexiDualGridVaeDecoder safetensors path\n"
         "  --rescale-t X           Shape SLat timestep rescale factor, default 3.0\n"
@@ -79,13 +92,28 @@ static void usage(FILE * out, const char * argv0) {
         "  --flow-block-parts N    Debug: per-block parts 1=self, 2=self+cross, 3=full\n"
         "  --flow-no-rope          Debug: disable sparse RoPE\n"
         "  --emulate-bf16-blocks   Debug: round structured-latent block activations like reference bf16 flow\n"
-        "  --use-ggml-flash-attn   Force ggml flash attention (TRELLIS.2 default; Pixal3D debug override)\n"
+        "  --use-ggml-flash-attn   Force ggml Flash Attention\n"
         "  --no-ggml-flash-attn    Force explicit SDPA\n"
         "  --decode-max-levels N   Debug: run only first N shape decoder levels, default full\n"
         "  --decode-max-input-tokens N Debug: truncate shape decoder input tokens\n"
-        "  --max-num-tokens N      Cascade token budget hint, default 49152\n"
         "  --verbose               Print debug logs\n",
-        argv0);
+        argv0,
+        cli_model_name(model),
+        pixal3d ?
+            "Profile: 1024_cascade by default; --pipeline also accepts 1536_cascade." :
+            "Profile: fixed 512.",
+        cli_model_name(model));
+    if (pixal3d) {
+        fputs(
+            "\nPixal3D options:\n"
+            "  --naf FILE              NAF weights converted to safetensors; default auto-discovery\n"
+            "  --pipeline NAME         1024_cascade (default) or 1536_cascade\n"
+            "  --fov X                 Horizontal camera FOV in radians, default 0.857556\n"
+            "  --camera-distance X     Projection distance; 0 derives it from FOV and mesh scale\n"
+            "  --mesh-scale X          Projection-space mesh scale, default 1\n"
+            "  --max-num-tokens N      Cascade token budget hint, default 49152\n",
+            out);
+    }
 }
 
 static const char * arg_value(int argc, char ** argv, int * i) {
@@ -155,8 +183,17 @@ static int parse_float_arg(const char * text, float * out) {
     return 1;
 }
 
-int main(int argc, char ** argv) {
-    print_banner();
+int trellis_image_to_gltf_cli_main(
+    trellis_image_to_gltf_cli_model model,
+    int argc,
+    char ** argv) {
+    if (model != TRELLIS_IMAGE_TO_GLTF_CLI_TRELLIS2 &&
+        model != TRELLIS_IMAGE_TO_GLTF_CLI_PIXAL3D) {
+        fprintf(stderr, "invalid image-to-3D CLI model\n");
+        return 2;
+    }
+    const int pixal3d = is_pixal3d_cli(model);
+    print_banner(model);
 
     trellis_image_to_gltf_options options;
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
@@ -165,7 +202,7 @@ int main(int argc, char ** argv) {
     options.sparse_structure_steps = 12;
     options.structured_latent_steps = 12;
     options.latent_size = 16;
-    options.pipeline_type = NULL;
+    options.pipeline_type = pixal3d ? "1024_cascade" : "512";
     options.resolution = 1024;
     options.cond_resolution = 512;
     options.sparse_resolution = 32;
@@ -200,7 +237,7 @@ int main(int argc, char ** argv) {
             options.model_dir = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--dino") == 0) {
             options.dino_dir = arg_value(argc, argv, &i);
-        } else if (strcmp(argv[i], "--naf") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--naf") == 0) {
             pixal_options.naf_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--birefnet") == 0) {
             options.birefnet_path = arg_value(argc, argv, &i);
@@ -247,7 +284,7 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.model_cache_budget_mib)) goto bad_args;
         } else if (strcmp(argv[i], "--backend") == 0) {
             options.backend = arg_value(argc, argv, &i);
-        } else if (strcmp(argv[i], "--pipeline") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--pipeline") == 0) {
             options.pipeline_type = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--ggml-backend") == 0 || strcmp(argv[i], "--sparse-backend") == 0 ||
                    strcmp(argv[i], "--ggml-device") == 0) {
@@ -274,17 +311,11 @@ int main(int argc, char ** argv) {
             if (!parse_u32_arg(arg_value(argc, argv, &i), &options.noise_seed)) goto bad_args;
         } else if (strcmp(argv[i], "--latent-size") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.latent_size)) goto bad_args;
-        } else if (strcmp(argv[i], "--resolution") == 0) {
-            if (!parse_int_arg(arg_value(argc, argv, &i), &options.resolution)) goto bad_args;
-        } else if (strcmp(argv[i], "--cond-resolution") == 0) {
-            if (!parse_int_arg(arg_value(argc, argv, &i), &options.cond_resolution)) goto bad_args;
-        } else if (strcmp(argv[i], "--sparse-resolution") == 0) {
-            if (!parse_int_arg(arg_value(argc, argv, &i), &options.sparse_resolution)) goto bad_args;
-        } else if (strcmp(argv[i], "--fov") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--fov") == 0) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.camera_angle_x)) goto bad_args;
-        } else if (strcmp(argv[i], "--camera-distance") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--camera-distance") == 0) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.camera_distance)) goto bad_args;
-        } else if (strcmp(argv[i], "--mesh-scale") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--mesh-scale") == 0) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &pixal_options.mesh_scale)) goto bad_args;
         } else if (strcmp(argv[i], "--texture-size") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.texture_size)) goto bad_args;
@@ -316,12 +347,12 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.decode_max_levels)) goto bad_args;
         } else if (strcmp(argv[i], "--decode-max-input-tokens") == 0) {
             if (!parse_i64_arg(arg_value(argc, argv, &i), &options.decode_max_input_tokens)) goto bad_args;
-        } else if (strcmp(argv[i], "--max-num-tokens") == 0) {
+        } else if (pixal3d && strcmp(argv[i], "--max-num-tokens") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.max_num_tokens)) goto bad_args;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             trellis_set_verbose(1);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(stdout, argv[0]);
+            usage(stdout, argv[0], model);
             return 0;
         } else {
             TRELLIS_ERROR("unknown option: %s", argv[i]);
@@ -333,7 +364,16 @@ int main(int argc, char ** argv) {
         options.gltf_path = "output.glb";
     }
 
-    if (pixal_options.camera_distance < 0.0f) {
+    if (pixal3d &&
+        strcmp(options.pipeline_type, "1024_cascade") != 0 &&
+        strcmp(options.pipeline_type, "1536_cascade") != 0) {
+        TRELLIS_ERROR(
+            "Pixal3D --pipeline must be 1024_cascade or 1536_cascade, got '%s'",
+            options.pipeline_type);
+        goto bad_args;
+    }
+
+    if (pixal3d && pixal_options.camera_distance < 0.0f) {
         TRELLIS_ERROR(
             "--camera-distance must be 0 for automatic FOV/mesh-scale fitting or greater than 0 for an explicit distance");
         goto bad_args;
@@ -349,23 +389,29 @@ int main(int argc, char ** argv) {
         options.mesh_remesh_resolution < 0 ||
         options.mesh_remesh_band <= 0.0f ||
         options.mesh_remesh_project < 0.0f ||
-        pixal_options.camera_angle_x <= 0.0f ||
-        pixal_options.camera_angle_x >= 3.14159265358979323846f ||
-        pixal_options.mesh_scale <= 0.0f ||
+        (pixal3d &&
+         (pixal_options.camera_angle_x <= 0.0f ||
+          pixal_options.camera_angle_x >= 3.14159265358979323846f ||
+          pixal_options.mesh_scale <= 0.0f)) ||
         options.vkmesh_gpu_workspace_budget_mib < 0 ||
         options.model_cache_budget_mib < 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }
 
-    trellis_status status = trellis_pipeline_image_to_gltf_ex(&options, &pixal_options);
+    trellis_status status = pixal3d ?
+        trellis_pipeline_pixal3d_image_to_gltf(&options, &pixal_options) :
+        trellis_pipeline_trellis2_image_to_gltf(&options);
     if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("trellis-image-to-gltf failed: %s", trellis_status_string(status));
+        TRELLIS_ERROR(
+            "%s failed: %s",
+            cli_executable_name(model),
+            trellis_status_string(status));
         return 1;
     }
     return 0;
 
 bad_args:
-    usage(stderr, argv[0]);
+    usage(stderr, argv[0], model);
     return 2;
 }
