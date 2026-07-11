@@ -690,10 +690,8 @@ static int run_sparse_structure_image(
     int owns_decoder_store = 0;
     trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
-    trellis_dit_flow_executor flow_executor_uncond;
     memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
     memset(&flow_executor_cond, 0, sizeof(flow_executor_cond));
-    memset(&flow_executor_uncond, 0, sizeof(flow_executor_uncond));
     int use_cfg_batch = 0;
     int rc = 1;
 
@@ -912,7 +910,7 @@ static int run_sparse_structure_image(
     }
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_WARN(
-            "sparse structure: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
+            "sparse structure: fused CFG executor init failed (%s); falling back to one reusable batch=1 graph",
             trellis_status_string(status));
         trellis_dit_flow_executor_free(&flow_executor_cfg);
         if (flow_model.projection.enabled) {
@@ -939,32 +937,6 @@ static int run_sparse_structure_image(
                 sin_phase,
                 &attention_policy);
         }
-        if (status == TRELLIS_STATUS_OK) {
-            if (flow_model.projection.enabled) {
-                status = trellis_dit_flow_executor_init_single_projected_with_policy(
-                    &flow_executor_uncond,
-                    backend,
-                    &flow_model,
-                    tokens,
-                    cond_tokens,
-                    neg_context,
-                    neg_projected_context,
-                    cos_phase,
-                    sin_phase,
-                    &attention_policy);
-            } else {
-                status = trellis_dit_flow_executor_init_single_with_policy(
-                    &flow_executor_uncond,
-                    backend,
-                    &flow,
-                    tokens,
-                    cond_tokens,
-                    neg_context,
-                    cos_phase,
-                    sin_phase,
-                    &attention_policy);
-            }
-        }
         if (status != TRELLIS_STATUS_OK) {
             fprintf(stderr, "sparse structure: flow executor init failed: %s\n", trellis_status_string(status));
             goto cleanup;
@@ -987,15 +959,27 @@ static int run_sparse_structure_image(
                 pred_pos,
                 pred_neg);
         } else {
-            TRELLIS_DEBUG("sparse structure: step %d/%d running separate cond/uncond flow graphs t=%.6g", step + 1, steps, t);
-            status = trellis_dit_flow_executor_run_single(
+            TRELLIS_DEBUG("sparse structure: step %d/%d reusing one cond/uncond flow graph t=%.6g", step + 1, steps, t);
+            status = trellis_dit_flow_executor_set_single_conditioning(
                 &flow_executor_cond,
-                latent,
-                t,
-                pred_pos);
+                context,
+                projected_context);
             if (status == TRELLIS_STATUS_OK) {
                 status = trellis_dit_flow_executor_run_single(
-                    &flow_executor_uncond,
+                    &flow_executor_cond,
+                    latent,
+                    t,
+                    pred_pos);
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_set_single_conditioning(
+                    &flow_executor_cond,
+                    neg_context,
+                    neg_projected_context);
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_run_single(
+                    &flow_executor_cond,
                     latent,
                     t,
                     pred_neg);
@@ -1142,7 +1126,6 @@ cleanup:
     free(sin_phase);
     trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
-    trellis_dit_flow_executor_free(&flow_executor_uncond);
     if (owns_decoder_store) {
         trellis_tensor_store_free(&decoder_store);
     }

@@ -408,10 +408,8 @@ trellis_status trellis_pipeline_run_structured_latent(
     int owns_flow_store = 0;
     trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
-    trellis_dit_flow_executor flow_executor_uncond;
     memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
     memset(&flow_executor_cond, 0, sizeof(flow_executor_cond));
-    memset(&flow_executor_uncond, 0, sizeof(flow_executor_uncond));
     int use_cfg_batch = 0;
 
     float * neg_cond = NULL;
@@ -679,7 +677,7 @@ trellis_status trellis_pipeline_run_structured_latent(
     }
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_WARN(
-            "structured latent %s: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
+            "structured latent %s: fused CFG executor init failed (%s); falling back to one reusable batch=1 graph",
             label,
             trellis_status_string(status));
         trellis_dit_flow_executor_free(&flow_executor_cfg);
@@ -707,36 +705,13 @@ trellis_status trellis_pipeline_run_structured_latent(
                 sin_phase,
                 &attention_policy);
         }
-        if (status == TRELLIS_STATUS_OK) {
-            if (flow_model.projection.enabled) {
-                status = trellis_dit_flow_executor_init_single_projected_with_policy(
-                    &flow_executor_uncond,
-                    backend,
-                    &flow_model,
-                    options->n_coords,
-                    options->cond_tokens,
-                    neg_context,
-                    neg_projected_context,
-                    cos_phase,
-                    sin_phase,
-                    &attention_policy);
-            } else {
-                status = trellis_dit_flow_executor_init_single_with_policy(
-                    &flow_executor_uncond,
-                    backend,
-                    &flow,
-                    options->n_coords,
-                    options->cond_tokens,
-                    neg_context,
-                    cos_phase,
-                    sin_phase,
-                    &attention_policy);
-            }
-        }
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("structured latent %s: flow executor init failed: %s", label, trellis_status_string(status));
             goto cleanup;
         }
+        TRELLIS_INFO(
+            "structured latent %s: reusing one batch=1 executor for cond/uncond",
+            label);
     } else {
         use_cfg_batch = 1;
     }
@@ -764,14 +739,26 @@ trellis_status trellis_pipeline_run_structured_latent(
                 pred_pos,
                 pred_neg);
         } else {
-            status = trellis_dit_flow_executor_run_single(
+            status = trellis_dit_flow_executor_set_single_conditioning(
                 &flow_executor_cond,
-                run_input,
-                t,
-                pred_pos);
+                options->cond,
+                options->projected_cond);
             if (status == TRELLIS_STATUS_OK) {
                 status = trellis_dit_flow_executor_run_single(
-                    &flow_executor_uncond,
+                    &flow_executor_cond,
+                    run_input,
+                    t,
+                    pred_pos);
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_set_single_conditioning(
+                    &flow_executor_cond,
+                    neg_context,
+                    neg_projected_context);
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_run_single(
+                    &flow_executor_cond,
                     run_input,
                     t,
                     pred_neg);
@@ -845,7 +832,6 @@ cleanup:
     free(sin_phase);
     trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
-    trellis_dit_flow_executor_free(&flow_executor_uncond);
     if (owns_flow_store) {
         trellis_tensor_store_free(&flow_store);
     }

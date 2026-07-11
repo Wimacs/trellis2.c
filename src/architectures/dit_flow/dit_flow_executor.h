@@ -63,6 +63,14 @@ trellis_status trellis_dit_flow_executor_run_single(
     float timestep,
     float * pred);
 
+/* Replaces the conditioning inputs of an initialized batch=1 executor while
+ * retaining its graph allocation. projected_context is required only for a
+ * projected DiT model. */
+trellis_status trellis_dit_flow_executor_set_single_conditioning(
+    trellis_dit_flow_executor * executor,
+    const float * context,
+    const float * projected_context);
+
 trellis_status trellis_dit_flow_executor_init_single_projected(
     trellis_dit_flow_executor * executor,
     const trellis_backend_context * backend,

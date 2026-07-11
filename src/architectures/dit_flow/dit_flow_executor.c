@@ -139,22 +139,13 @@ static int should_set_timestep(const trellis_dit_flow_weights * weights) {
     return weights != NULL && weights->n_blocks > 0;
 }
 
-static int set_static_inputs(
+static int set_conditioning_inputs(
     trellis_dit_flow_executor * executor,
     const float * context,
     const float * neg_context,
     const float * projected_context,
-    const float * neg_projected_context,
-    const float * cos_phase_data,
-    const float * sin_phase_data) {
+    const float * neg_projected_context) {
     const trellis_dit_flow_weights * weights = executor->weights;
-    if (should_set_rope(weights)) {
-        if (cos_phase_data == NULL || sin_phase_data == NULL) {
-            return 0;
-        }
-        ggml_backend_tensor_set(executor->cos_phase, cos_phase_data, 0, ggml_nbytes(executor->cos_phase));
-        ggml_backend_tensor_set(executor->sin_phase, sin_phase_data, 0, ggml_nbytes(executor->sin_phase));
-    }
     if (should_set_context(weights)) {
         if (context == NULL || executor->context_host == NULL) {
             return 0;
@@ -202,6 +193,30 @@ static int set_static_inputs(
             ggml_nbytes(executor->p));
     }
     return 1;
+}
+
+static int set_static_inputs(
+    trellis_dit_flow_executor * executor,
+    const float * context,
+    const float * neg_context,
+    const float * projected_context,
+    const float * neg_projected_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data) {
+    const trellis_dit_flow_weights * weights = executor->weights;
+    if (should_set_rope(weights)) {
+        if (cos_phase_data == NULL || sin_phase_data == NULL) {
+            return 0;
+        }
+        ggml_backend_tensor_set(executor->cos_phase, cos_phase_data, 0, ggml_nbytes(executor->cos_phase));
+        ggml_backend_tensor_set(executor->sin_phase, sin_phase_data, 0, ggml_nbytes(executor->sin_phase));
+    }
+    return set_conditioning_inputs(
+        executor,
+        context,
+        neg_context,
+        projected_context,
+        neg_projected_context);
 }
 
 static trellis_status init_executor(
@@ -534,6 +549,22 @@ trellis_status trellis_dit_flow_executor_run_single(
     ggml_backend_tensor_get(executor->y, executor->y_host, 0, ggml_nbytes(executor->y));
     memcpy(pred, executor->y_host, executor->output_count * sizeof(float));
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_dit_flow_executor_set_single_conditioning(
+    trellis_dit_flow_executor * executor,
+    const float * context,
+    const float * projected_context) {
+    if (executor == NULL || executor->backend == NULL || executor->weights == NULL ||
+        executor->graph == NULL || executor->batch != 1) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    return set_conditioning_inputs(
+        executor,
+        context,
+        NULL,
+        projected_context,
+        NULL) ? TRELLIS_STATUS_OK : TRELLIS_STATUS_INVALID_ARGUMENT;
 }
 
 trellis_status trellis_dit_flow_executor_init_cfg_batch(
