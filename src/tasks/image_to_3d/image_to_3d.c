@@ -1699,7 +1699,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         pipeline_attention_policy_name(&shape_flow_hr_attention),
         pipeline_attention_policy_name(&texture_flow_attention),
         projected_conditioning && !options->use_ggml_flash_attn ?
-            " (Pixal3D safe package defaults)" : "");
+            " (Pixal3D strict BF16 Flash package defaults)" : "");
 
     if (options->model_cache) {
         const size_t model_cache_budget_bytes = model_cache_budget_bytes_from_options(options);

@@ -11,7 +11,8 @@
       "weights": "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
       "execution": {
         "compute_dtype": "bf16",
-        "attention": "sdpa",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": true
       }
     },
@@ -30,7 +31,8 @@
       "weights": "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
       "execution": {
         "compute_dtype": "bf16",
-        "attention": "sdpa",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": true
       }
     },
@@ -40,7 +42,8 @@
       "weights": "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
       "execution": {
         "compute_dtype": "bf16",
-        "attention": "sdpa",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": true
       }
     },
@@ -50,7 +53,8 @@
       "weights": "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
       "execution": {
         "compute_dtype": "bf16",
-        "attention": "sdpa",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": true
       }
     },

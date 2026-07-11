@@ -155,7 +155,8 @@ static void test_pixal_repository_package(void) {
     CHECK_TRUE(flow != NULL);
     CHECK_TRUE(strcmp(flow->architecture, "pixal_dit_flow") == 0);
     CHECK_TRUE(flow->execution.compute_dtype == TRELLIS_DTYPE_BF16);
-    CHECK_TRUE(flow->execution.attention == TRELLIS_ATTENTION_SDPA);
+    CHECK_TRUE(flow->execution.attention == TRELLIS_ATTENTION_FLASH);
+    CHECK_TRUE(flow->execution.flash_kv_dtype == TRELLIS_DTYPE_BF16);
     CHECK_TRUE(flow->execution.emulate_bf16_blocks == 1);
     trellis_ggml_attention_policy attention =
         TRELLIS_GGML_ATTENTION_POLICY_INIT;
@@ -164,7 +165,7 @@ static void test_pixal_repository_package(void) {
         flow,
         &attention,
         &emulate_bf16_blocks) == TRELLIS_STATUS_OK);
-    CHECK_TRUE(attention.mode == TRELLIS_GGML_ATTENTION_MODE_EXPLICIT);
+    CHECK_TRUE(attention.mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16);
     CHECK_TRUE(emulate_bf16_blocks == 1);
 
     const trellis_model_component_instance * naf =

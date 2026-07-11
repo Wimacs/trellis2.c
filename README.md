@@ -143,14 +143,16 @@ C callers that need explicit Pixal3D overrides can initialize
 `trellis_pipeline_image_to_gltf_ex()`; the legacy entry point keeps the default
 camera and automatic NAF lookup.
 
-Pixal3D automatically uses BF16-style block rounding and the explicit SDPA
-path. This avoids FP16 overflow in the current ggml flash-attention K/V path on
-long 1024-resolution sparse sequences; TRELLIS.2 keeps its existing flash
-attention default. `--use-ggml-flash-attn` is retained as an explicit debug
-override. A package's `flash_kv_dtype` is carried in the instance-scoped
-attention policy (`f16` and `bf16` are distinct). The current ggml CUDA
-multi-token kernel may internally narrow BF16 K/V to F16, so BF16 Flash is not
-used as a Pixal3D overflow workaround; Vulkan can retain the BF16 graph path.
+Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
+On NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
+Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
+tail rows are bounds checked. This avoids the BF16-to-F16 narrowing and F16
+accumulator overflow of ggml's current MMA kernel. TRELLIS.2 remains on its
+existing F16 MMA Flash path, so its numerical and performance policy is
+unchanged. `--no-ggml-flash-attn` explicitly selects SDPA; that path can require
+quadratic score memory for long sparse sequences. The package-level policies
+are instance scoped, so loading Trellis2 and Pixal3D in one process does not
+change either model's attention mode.
 
 Windows:
 

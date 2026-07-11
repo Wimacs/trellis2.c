@@ -1,11 +1,11 @@
 #include "../adapter.h"
 
 static const trellis_image_to_3d_component_requirement g_pixal3d_components[] = {
-    { "sparse_structure_flow", "pixal_dit_flow", TRELLIS_ATTENTION_SDPA, TRELLIS_DTYPE_UNKNOWN, 1 },
+    { "sparse_structure_flow", "pixal_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 1 },
     { "sparse_structure_decoder", "sparse_structure_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
-    { "shape_flow_512", "pixal_dit_flow", TRELLIS_ATTENTION_SDPA, TRELLIS_DTYPE_UNKNOWN, 1 },
-    { "shape_flow_1024", "pixal_dit_flow", TRELLIS_ATTENTION_SDPA, TRELLIS_DTYPE_UNKNOWN, 1 },
-    { "texture_flow_1024", "pixal_dit_flow", TRELLIS_ATTENTION_SDPA, TRELLIS_DTYPE_UNKNOWN, 1 },
+    { "shape_flow_512", "pixal_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 1 },
+    { "shape_flow_1024", "pixal_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 1 },
+    { "texture_flow_1024", "pixal_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 1 },
     { "shape_decoder", "sparse_unet_vae_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "texture_decoder", "sparse_unet_vae_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "naf_encoder", "pixal_naf", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
