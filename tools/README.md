@@ -118,6 +118,26 @@ adds the generated skeleton and skin data, and rebuilds a default PBR material.
 It does not preserve source materials, UVs, textures, node structure, or
 animations.
 
+`gltfpack` is built from the pinned `3rd/meshoptimizer` submodule. It can make
+a simplified LOD before TokenSkin rigging; for example, this keeps regular
+float glTF attributes while targeting 10% of the source triangles:
+
+```sh
+./build-cuda/gltfpack \
+  -i outputs/vrm_trellis_cuda.glb \
+  -o outputs/vrm_meshopt_10pct.glb \
+  -si 0.1 -noq
+
+./build-cuda/tokenskin-rig \
+  --model models/tokenskin \
+  --input outputs/vrm_meshopt_10pct.glb \
+  --output outputs/vrm_meshopt_10pct_rigged.glb
+```
+
+Here `-si` is meshoptimizer's topology-aware simplification ratio. It is not a
+watertight voxel remesher like vkmesh; aggressive ratios trade geometric detail
+for much smaller meshes.
+
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and
 unwraps UVs by default. Pass an explicit simplify target when you want face

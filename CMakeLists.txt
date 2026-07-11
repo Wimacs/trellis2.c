@@ -84,6 +84,20 @@ endif()
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
+if (TRELLIS2_C_BUILD_TOOLS)
+    set(MESHOPT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+    set(MESHOPT_BUILD_GLTFPACK ON CACHE BOOL "" FORCE)
+    set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(MESHOPT_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory(
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/meshoptimizer"
+        "${CMAKE_CURRENT_BINARY_DIR}/meshoptimizer")
+    if (TARGET gltfpack)
+        set_target_properties(gltfpack PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+endif()
+
 add_library(xatlas STATIC
     3rd/xatlas/source/xatlas/xatlas.cpp
 )
@@ -762,6 +776,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 --pixal3d $<TARGET_FILE:pixal3d-image-to-gltf>
                 --tokenskin $<TARGET_FILE:tokenskin-rig>
                 --source-dir "${CMAKE_CURRENT_LIST_DIR}")
+    endif()
+
+    if (TRELLIS2_C_BUILD_TESTS AND TARGET gltfpack)
+        add_test(
+            NAME trellis2_c_meshoptimizer_cli_smoke
+            COMMAND $<TARGET_FILE:gltfpack> -v)
     endif()
 
     add_executable(trellis-rebake-gltf
