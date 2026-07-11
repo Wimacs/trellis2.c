@@ -828,6 +828,38 @@ trellis_status trellis_pipeline_pixal3d_image_to_gltf(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options);
 
+typedef struct trellis_tokenskin_rig_options {
+    size_t struct_size;              /* set to sizeof(trellis_tokenskin_rig_options) */
+    const char * model_dir;          /* TokenSkin model package root */
+    const char * input_path;         /* input .glb or .gltf mesh */
+    const char * output_path;        /* output self-contained rigged .glb */
+    const char * backend;            /* NULL uses the backend compiled into this binary */
+    int device;                      /* backend device index, default 0 */
+    uint32_t seed;                   /* preprocessing and autoregressive sampling seed */
+    int sample_count;                /* surface samples >=2048, reference default 54000 */
+    int max_length;                  /* Qwen total length including 512 mesh tokens, default 2048 */
+    int top_k;                       /* released checkpoint default 10 */
+    float top_p;                     /* reference demo default 0.95 */
+    float temperature;               /* released checkpoint default 1.5 */
+    float repetition_penalty;        /* reference demo default 2 */
+    int num_beams;                   /* reference demo default 10; supported range 1..16 */
+    int official_eos_compat;         /* reproduce the released SkinTokens EOS/FSQ alias */
+    int no_flash_attn;               /* debug fallback; model package defaults to FlashAttention */
+} trellis_tokenskin_rig_options;
+
+#define TRELLIS_TOKENSKIN_MAX_BEAMS 16
+
+#define TRELLIS_TOKENSKIN_RIG_OPTIONS_V1_SIZE \
+    (offsetof(trellis_tokenskin_rig_options, no_flash_attn) + sizeof(int))
+#define TRELLIS_TOKENSKIN_RIG_OPTIONS_INIT \
+    { sizeof(trellis_tokenskin_rig_options), NULL, NULL, NULL, NULL, 0, 1u, \
+      54000, 2048, 10, 0.95f, 1.5f, 2.0f, 10, 1, 0 }
+
+/* TokenSkin-only mesh rigging entry point. It rejects any other model family
+ * or task before parsing the input mesh or initializing a GPU backend. */
+trellis_status trellis_pipeline_tokenskin_rig(
+    const trellis_tokenskin_rig_options * options);
+
 #include "trellis_ggml_layers.h"
 #include "trellis_flow_sampler.h"
 

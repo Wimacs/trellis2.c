@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "tokenskin-tokenrig-0.6b",
+  "family": "tokenskin",
+  "task": "mesh_rigging",
+  "profile": "qwen3-0.6b-fsq",
+  "components": [
+    {
+      "role": "mesh_encoder",
+      "architecture": "tokenskin_michelangelo_encoder",
+      "weights": "ckpts/mesh_encoder-bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": false
+      }
+    },
+    {
+      "role": "rig_language_model",
+      "architecture": "tokenskin_qwen3",
+      "weights": "ckpts/qwen3-tokenrig-bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": false
+      }
+    },
+    {
+      "role": "skin_decoder",
+      "architecture": "tokenskin_fsq_cvae",
+      "weights": "ckpts/skin-fsq-cvae-bf16.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": false
+      }
+    }
+  ]
+}

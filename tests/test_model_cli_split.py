@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Fast contract checks for the model-pinned image-to-3D CLIs."""
+"""Fast contract checks for model-pinned, task-specific CLIs."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -30,6 +32,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trellis2", required=True, type=Path)
     parser.add_argument("--pixal3d", required=True, type=Path)
+    parser.add_argument("--tokenskin", required=True, type=Path)
     parser.add_argument("--source-dir", required=True, type=Path)
     args = parser.parse_args()
 
@@ -76,6 +79,67 @@ def main() -> int:
             "Pixal3D did not reject the TRELLIS.2 package", wrong_pixal_family.stdout)
     require("requires family 'pixal3d'" in wrong_pixal_family.stdout,
             "Pixal3D family error is unclear", wrong_pixal_family.stdout)
+
+    tokenskin_help = run(args.tokenskin, "--help")
+    require(tokenskin_help.returncode == 0,
+            "TokenSkin --help failed", tokenskin_help.stdout)
+    require("TokenSkin/TokenRig mesh rigging" in tokenskin_help.stdout,
+            "wrong TokenSkin task banner", tokenskin_help.stdout)
+    for required_flag in ("--input", "--num-beams", "--official-eos-compat"):
+        require(required_flag in tokenskin_help.stdout,
+                f"TokenSkin is missing {required_flag}", tokenskin_help.stdout)
+    for image_flag in ("--image", "--dino", "--naf", "--pipeline"):
+        require(image_flag not in tokenskin_help.stdout,
+                f"TokenSkin exposes image-to-3D flag {image_flag}", tokenskin_help.stdout)
+
+    wrong_tokenskin_family = run(
+        args.tokenskin,
+        "--model",
+        str(args.source_dir / "models" / "trellis2"),
+        "--input",
+        "must-not-be-opened.glb",
+        "--output",
+        "must-not-be-written.glb",
+    )
+    require(wrong_tokenskin_family.returncode == 1,
+            "TokenSkin did not reject the TRELLIS.2 package",
+            wrong_tokenskin_family.stdout)
+    require("requires family=tokenskin task=mesh_rigging" in wrong_tokenskin_family.stdout,
+            "TokenSkin family/task error is unclear", wrong_tokenskin_family.stdout)
+    require("must-not-be-opened" not in wrong_tokenskin_family.stdout and
+            "ggml_cuda_init" not in wrong_tokenskin_family.stdout and
+            "ggml_vulkan" not in wrong_tokenskin_family.stdout,
+            "TokenSkin parsed the mesh or initialized a GPU before family rejection",
+            wrong_tokenskin_family.stdout)
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        invalid_package = Path(temporary_directory)
+        manifest = json.loads(
+            (args.source_dir / "models" / "tokenskin" / "model.json").read_text()
+        )
+        manifest["components"][1]["execution"]["compute_dtype"] = "f16"
+        (invalid_package / "model.json").write_text(json.dumps(manifest))
+        wrong_tokenskin_policy = run(
+            args.tokenskin,
+            "--model",
+            str(invalid_package),
+            "--input",
+            "must-not-be-opened.glb",
+            "--output",
+            "must-not-be-written.glb",
+        )
+        require(wrong_tokenskin_policy.returncode == 1,
+                "TokenSkin accepted an incompatible execution policy",
+                wrong_tokenskin_policy.stdout)
+        require("declare compute_dtype=bf16 attention=flash flash_kv_dtype=bf16" in
+                wrong_tokenskin_policy.stdout,
+                "TokenSkin execution-policy error is unclear",
+                wrong_tokenskin_policy.stdout)
+        require("must-not-be-opened" not in wrong_tokenskin_policy.stdout and
+                "ggml_cuda_init" not in wrong_tokenskin_policy.stdout and
+                "ggml_vulkan" not in wrong_tokenskin_policy.stdout,
+                "TokenSkin initialized input/backend before policy rejection",
+                wrong_tokenskin_policy.stdout)
 
     print("model CLI split tests passed")
     return 0

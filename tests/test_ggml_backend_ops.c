@@ -760,6 +760,136 @@ static int test_flash_bf16_mixed_v_panels(trellis_backend_context * backend) {
     return ok;
 }
 
+static int test_flash_bf16_head128_causal_gqa(
+    trellis_backend_context * backend) {
+    enum {
+        HEAD_DIM = 128,
+        QUERY_HEADS = 16,
+        KV_HEADS = 8,
+        TOKENS = 17,
+    };
+    const int64_t q_nels =
+        (int64_t) HEAD_DIM * TOKENS * QUERY_HEADS;
+    const int64_t kv_nels =
+        (int64_t) HEAD_DIM * TOKENS * KV_HEADS;
+    const int64_t out_nels = q_nels;
+    float * q_data = (float *) malloc((size_t) q_nels * sizeof(float));
+    float * k_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * mask_data = (float *) malloc(
+        (size_t) TOKENS * TOKENS * sizeof(float));
+    float * output = (float *) malloc((size_t) out_nels * sizeof(float));
+    float * expected = (float *) malloc((size_t) out_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL &&
+        mask_data != NULL && output != NULL && expected != NULL);
+    for (int64_t i = 0; i < q_nels; ++i) {
+        q_data[i] = attention_input_value((int) i, 0.0073f, 0.0625f);
+    }
+    for (int64_t i = 0; i < kv_nels; ++i) {
+        k_data[i] = attention_input_value((int) i, 0.0091f, 0.0625f);
+        v_data[i] = attention_input_value((int) i, 0.0117f, 0.25f);
+    }
+    for (int query = 0; query < TOKENS; ++query) {
+        for (int key = 0; key < TOKENS; ++key) {
+            mask_data[(size_t) query * TOKENS + key] =
+                key <= query ? 0.0f : -INFINITY;
+        }
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, TOKENS, QUERY_HEADS, 1);
+    struct ggml_tensor * k_input = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, TOKENS, KV_HEADS, 1);
+    struct ggml_tensor * v_input = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, TOKENS, KV_HEADS, 1);
+    struct ggml_tensor * mask_input = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, TOKENS, TOKENS);
+    struct ggml_tensor * k = ggml_cast(ctx, k_input, GGML_TYPE_BF16);
+    struct ggml_tensor * v = ggml_cast(ctx, v_input, GGML_TYPE_BF16);
+    struct ggml_tensor * mask = ggml_cast(ctx, mask_input, GGML_TYPE_F16);
+    struct ggml_tensor * y = ggml_flash_attn_ext(
+        ctx,
+        q,
+        k,
+        v,
+        mask,
+        1.0f / sqrtf((float) HEAD_DIM),
+        0.0f,
+        0.0f);
+    CHECK_TRUE(y != NULL);
+    ggml_flash_attn_ext_set_prec(y, GGML_PREC_F32);
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL && ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k_input, k_data, 0, ggml_nbytes(k_input));
+    ggml_backend_tensor_set(v_input, v_data, 0, ggml_nbytes(v_input));
+    ggml_backend_tensor_set(mask_input, mask_data, 0, ggml_nbytes(mask_input));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    for (int query = 0; query < TOKENS; ++query) {
+        for (int head = 0; head < QUERY_HEADS; ++head) {
+            const int kv_head = head / (QUERY_HEADS / KV_HEADS);
+            float scores[TOKENS];
+            float maximum = -INFINITY;
+            for (int key = 0; key <= query; ++key) {
+                float dot = 0.0f;
+                for (int channel = 0; channel < HEAD_DIM; ++channel) {
+                    const size_t qi = (size_t) channel + HEAD_DIM *
+                        ((size_t) query + TOKENS * (size_t) head);
+                    const size_t ki = (size_t) channel + HEAD_DIM *
+                        ((size_t) key + TOKENS * (size_t) kv_head);
+                    const float rounded_k = ggml_bf16_to_fp32(
+                        ggml_fp32_to_bf16(k_data[ki]));
+                    dot += q_data[qi] * rounded_k;
+                }
+                scores[key] = dot * scale;
+                if (scores[key] > maximum) maximum = scores[key];
+            }
+            float denominator = 0.0f;
+            for (int key = 0; key <= query; ++key) {
+                scores[key] = expf(scores[key] - maximum);
+                denominator += scores[key];
+            }
+            for (int channel = 0; channel < HEAD_DIM; ++channel) {
+                float value_out = 0.0f;
+                for (int key = 0; key <= query; ++key) {
+                    const size_t vi = (size_t) channel + HEAD_DIM *
+                        ((size_t) key + TOKENS * (size_t) kv_head);
+                    const float rounded_v = ggml_bf16_to_fp32(
+                        ggml_fp32_to_bf16(v_data[vi]));
+                    value_out += scores[key] / denominator * rounded_v;
+                }
+                const size_t oi = (size_t) channel + HEAD_DIM *
+                    ((size_t) head + QUERY_HEADS * (size_t) query);
+                expected[oi] = value_out;
+            }
+        }
+    }
+    char name[128];
+    snprintf(
+        name,
+        sizeof(name),
+        "flash_bf16_head128_causal_gqa_%s",
+        trellis_backend_kind_name(backend->kind));
+    const int ok = check_attention_close(
+        output, expected, out_nels, 2.5e-2f, name);
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(expected);
+    free(output);
+    free(mask_data);
+    free(v_data);
+    free(k_data);
+    free(q_data);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * backend_name = argc > 1 ? argv[1] : TRELLIS_DEFAULT_GGML_BACKEND;
     trellis_backend_kind kind;
@@ -792,6 +922,7 @@ int main(int argc, char ** argv) {
         ok = ok && test_flash_constant_attention(&backend, 257, 257, 2, 70000.0f, 1, 1, 1);
         ok = ok && test_flash_constant_attention(&backend, 513, 5, 1, 70000.0f, 1, 1, 1);
         ok = ok && test_flash_bf16_mixed_v_panels(&backend);
+        ok = ok && test_flash_bf16_head128_causal_gqa(&backend);
         if (getenv("TRELLIS_LONG_ATTN_PERF") != NULL) {
             ok = ok && test_flash_constant_attention(&backend, 21775, 21775, 1, 1.0f, 1, 12, 5);
         }

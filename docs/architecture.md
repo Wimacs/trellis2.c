@@ -43,19 +43,19 @@ mode. Pixal3D requests strict BF16 Flash for every flow. Trellis2 keeps the
 faster F16 MMA lowering for sparse and 512-resolution components, but its 1024
 shape and texture components request BF16 after long-sequence functional tests
 proved that F16 accumulation can overflow there. Backend selection is driven
-by each component contract and must never silently narrow a strict BF16 request
-to F16.
+by each component contract. A strict BF16 request must not fall through to the
+ordinary unscaled F16 attention path.
 
-That rule also applies to backend-specific acceleration experiments. On a
-Vulkan implementation without native BF16 cooperative-matrix operands, strict
-BF16 Flash remains on the scalar-F32 streaming lowering unless the process
-explicitly opts into `GGML_VK_BF16_F16_MMA=1`. The opt-in lowering is
-capability-gated and isolated from package policy: it may stage BF16 K/V through
-scaled F16 cooperative-matrix operands with F32 QK/P×V accumulators, but it
-must not silently become the default or alter another model instance's F16
-attention path. New model families must validate their Q/K range, softmax-tail
-sensitivity, and the within-panel V exponent span before opting into that
-lowering; native BF16 cooperative-matrix operands remain the preferred path.
+On NVIDIA Vulkan devices without native BF16 cooperative-matrix operands, the
+backend automatically selects the validated D128 lowering when all required
+capabilities match. It stages BF16 K/V through F16 cooperative-matrix operands,
+keeps QK and P×V accumulation in F32, and applies an independent power-of-two V
+scale to every 16-channel panel. No model command requires an environment
+variable; `GGML_VK_BF16_F16_MMA=0` is only a backend-diagnostic opt-out. The
+dtype/head-size/capability gate leaves every ordinary F16 attention path
+unchanged. New model families still need to validate Q/K range, softmax-tail
+sensitivity, and within-panel V exponent span; native BF16 cooperative-matrix
+operands remain the preferred path.
 
 ## Adding another task
 
@@ -82,17 +82,21 @@ around the registered `image_to_3d` task.
 ## Model-pinned command line tools
 
 The library may host multiple families for the same task, but a user-facing
-inference executable belongs to exactly one model family.  The TRELLIS.2 and
-Pixal3D image-to-3D tools therefore use separate entry points:
+inference executable belongs to exactly one model family.  The current
+model-pinned entry points are:
 
 ```text
 trellis2-image-to-gltf  -> family=trellis2, profile=512
 pixal3d-image-to-gltf   -> family=pixal3d, profile=1024_cascade
+tokenskin-rig           -> family=tokenskin, task=mesh_rigging
 ```
 
-Both tools reuse the registered `image_to_3d` task and its operators.  They do
-not select a family from `argv[0]`, expose a `--family` switch, or silently
-dispatch from model metadata.  Their model-pinned library wrappers validate
-the package family before image loading or backend initialization.  A model
-for a different task, such as a future mesh-rigging model, receives another
-task-specific executable instead of adding modes to either image-to-3D tool.
+The two image-to-3D tools reuse the registered `image_to_3d` task and its
+operators.  They do not select a family from `argv[0]`, expose a `--family`
+switch, or silently dispatch from model metadata.  Their model-pinned library
+wrappers validate the package family before image loading or backend
+initialization.  A model for a different task receives another task-specific
+executable instead of adding modes to an existing tool.  TokenSkin follows
+this rule: it reuses the runtime and operators where appropriate, but its
+mesh-rigging pipeline and CLI remain separate from both image-to-3D
+executables.

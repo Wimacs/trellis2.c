@@ -14,9 +14,9 @@
   <img src="img.png" alt="trellis2.c local workspace">
 </p>
 
-Native TRELLIS.2 and Pixal3D image-to-3D inference tool with CUDA and Vulkan
-support. Each model has a family-pinned command: `trellis2-image-to-gltf` or
-`pixal3d-image-to-gltf`.
+Native TRELLIS.2 and Pixal3D image-to-3D inference plus TokenSkin mesh rigging,
+with CUDA and Vulkan support. Each model has one family-pinned executable:
+`trellis2-image-to-gltf`, `pixal3d-image-to-gltf`, or `tokenskin-rig`.
 
 ## Build
 
@@ -158,6 +158,43 @@ selects the same FOV/mesh-scale fit. TRELLIS.2 callers can use
 library compatibility APIs, but no command-line executable auto-dispatches
 between families.
 
+### TokenSkin mesh rigging
+
+TokenSkin has a separate `tokenskin-rig` executable and does not add a mode to
+either image-to-3D CLI. Convert the official TokenRig Lightning checkpoint once
+(this command needs Python `torch` and `safetensors`):
+
+```sh
+python3 tools/convert_tokenskin_weights.py \
+  /path/to/grpo_1400.ckpt \
+  models/tokenskin/ckpts
+```
+
+The same three-argument inference command works for a CUDA build:
+
+```sh
+./build/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-cuda.glb
+```
+
+and a Vulkan build:
+
+```sh
+./build-vulkan/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-vulkan.glb
+```
+
+No backend-specific environment variable or extra inference flag is required.
+The input may be GLB or glTF; the output is a self-contained rigged GLB with a
+generated skeleton, inverse bind matrices, joints, and skin weights. The
+current path preserves the flattened world-space mesh geometry and topology,
+but rebuilds a default PBR material. Source materials, UVs, textures, node
+structure, and animations are not preserved.
+
 Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
 On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
 Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
@@ -171,19 +208,14 @@ quadratic score memory for long sparse sequences. The package-level policies
 are instance scoped, so loading Trellis2 and Pixal3D in one process does not
 change either model's attention mode.
 
-On Vulkan devices that expose F16 KHR cooperative matrices with F32
-accumulators but do not expose native BF16 cooperative-matrix operands, the
-strict BF16 mode continues to use the range-safe scalar-F32 streaming kernel by
-default. `GGML_VK_BF16_F16_MMA=1` enables an NVIDIA-only D128 experiment that
-stages BF16 K/V as F16, uses F32 accumulation for both QK and P×V, and applies
-a power-of-two V scale independently to each 16-channel panel of every KV tile
-before restoring its F32 contribution. This avoids F16 V-staging overflow and
-does not change the ordinary Trellis2 F16 path. It is intentionally opt-in:
-Q/K still have F16 operand range, softmax probabilities are staged as F16, and
-very wide value ranges inside one V panel can underflow its smaller values.
-Consequently, this is not equivalent to native BF16 Tensor Core operands for
-arbitrary inputs and should be revalidated before enabling it for another model
-family.
+On supported NVIDIA Vulkan devices that expose F16 KHR cooperative matrices
+with F32 accumulators but do not expose native BF16 cooperative-matrix
+operands, strict BF16 attention automatically lowers BF16 K/V to the D128 F16
+MMA path. QK and P×V accumulate in F32, and a power-of-two V scale is applied
+independently to each 16-channel panel before restoring its F32 contribution.
+No model command needs an opt-in environment variable; set
+`GGML_VK_BF16_F16_MMA=0` only to disable this lowering for backend diagnostics.
+The capability-gated path does not change the ordinary Trellis2 F16 path.
 
 Windows:
 

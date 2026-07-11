@@ -110,6 +110,20 @@ set(TRELLIS2_C_SOURCES
     src/architectures/dinov3/dinov3.c
     src/architectures/pixal_naf/pixal_naf.c
     src/architectures/birefnet/birefnet.c
+    src/architectures/tokenskin/weights.c
+    src/architectures/tokenskin/attention.c
+    src/architectures/tokenskin/mesh_encoder.c
+    src/architectures/tokenskin/fsq_cvae.c
+    src/architectures/tokenskin/qwen3.c
+    src/tasks/mesh_rigging/gltf_io.c
+    src/tasks/mesh_rigging/preprocess.c
+    src/tasks/mesh_rigging/tokenizer.c
+    src/tasks/mesh_rigging/tokenskin_features.c
+    src/tasks/mesh_rigging/interpolate.c
+    src/tasks/mesh_rigging/sampler.c
+    src/tasks/mesh_rigging/generation.c
+    src/tasks/mesh_rigging/rigged_gltf.c
+    src/tasks/mesh_rigging/pipeline.c
     src/ops/mesh/flex_dual_grid.c
     src/architectures/dit_flow/dit_flow.c
     src/ops/ggml/ggml_layers.c
@@ -128,6 +142,7 @@ set(TRELLIS2_C_SOURCES
     src/ops/sparse/trellis_sparse_cpu.c
     src/ops/sparse/trellis_pixal_naf_backend.c
     src/weights/tensor_store.c
+    src/tasks/mesh_rigging/model.c
 )
 
 if (NOT TRELLIS2_C_HAS_VKMESH_C_API)
@@ -405,6 +420,8 @@ target_include_directories(trellis2_c
         "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/stages"
         "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
         "${CMAKE_CURRENT_LIST_DIR}/src/architectures/pixal_naf"
+        "${CMAKE_CURRENT_LIST_DIR}/src/architectures/tokenskin"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging"
         "${CMAKE_CURRENT_LIST_DIR}/src/ops/projected_attention"
         "${CMAKE_CURRENT_LIST_DIR}/src/ops/projection"
         "${CMAKE_CURRENT_LIST_DIR}/src/weights"
@@ -467,6 +484,11 @@ if (TRELLIS2_C_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_verify_glb.py)
         set_tests_properties(trellis2_c_glb_verifier_tests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+        add_test(
+            NAME trellis2_c_tokenskin_converter_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_convert_tokenskin_weights.py)
+        set_tests_properties(trellis2_c_tokenskin_converter_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
     endif()
 
     add_executable(trellis2_c_model_package_tests
@@ -486,6 +508,67 @@ if (TRELLIS2_C_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
     target_link_libraries(trellis2_c_model_registry_tests PRIVATE trellis2_c)
     add_test(NAME trellis2_c_model_registry_tests COMMAND trellis2_c_model_registry_tests)
+
+    add_executable(trellis2_c_tokenskin_tokenizer_tests
+        tests/test_tokenskin_tokenizer.c
+    )
+    target_include_directories(trellis2_c_tokenskin_tokenizer_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_tokenskin_tokenizer_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_tokenizer_tests
+        COMMAND trellis2_c_tokenskin_tokenizer_tests)
+
+    add_executable(trellis2_c_tokenskin_preprocess_tests
+        tests/test_tokenskin_preprocess.c
+    )
+    target_include_directories(trellis2_c_tokenskin_preprocess_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_tokenskin_preprocess_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_preprocess_tests
+        COMMAND trellis2_c_tokenskin_preprocess_tests)
+
+    add_executable(trellis2_c_tokenskin_features_tests
+        tests/test_tokenskin_features.c
+    )
+    target_include_directories(trellis2_c_tokenskin_features_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_tokenskin_features_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_features_tests
+        COMMAND trellis2_c_tokenskin_features_tests)
+
+    add_executable(trellis2_c_tokenskin_interpolate_tests
+        tests/test_tokenskin_interpolate.c
+    )
+    target_include_directories(trellis2_c_tokenskin_interpolate_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_tokenskin_interpolate_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_interpolate_tests
+        COMMAND trellis2_c_tokenskin_interpolate_tests)
+
+    add_executable(trellis2_c_tokenskin_sampler_tests
+        tests/test_tokenskin_sampler.c
+    )
+    target_include_directories(trellis2_c_tokenskin_sampler_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_tokenskin_sampler_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_sampler_tests
+        COMMAND trellis2_c_tokenskin_sampler_tests)
+
+    add_executable(trellis2_c_tokenskin_rigged_gltf_tests
+        tests/test_tokenskin_rigged_gltf.c
+    )
+    target_include_directories(trellis2_c_tokenskin_rigged_gltf_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf")
+    target_link_libraries(trellis2_c_tokenskin_rigged_gltf_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_tokenskin_rigged_gltf_tests
+        COMMAND trellis2_c_tokenskin_rigged_gltf_tests)
 
     add_executable(trellis2_c_attention_policy_tests
         tests/test_attention_policy.c
@@ -664,6 +747,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
         pixal3d-image-to-gltf
         tools/pixal3d_image_to_gltf.c)
 
+    add_executable(tokenskin-rig tools/tokenskin_rig.c)
+    target_link_libraries(tokenskin-rig PRIVATE trellis2_c ggml)
+    if (UNIX)
+        target_link_libraries(tokenskin-rig PRIVATE m)
+    endif()
+
     if (TRELLIS2_C_BUILD_TESTS AND Python3_Interpreter_FOUND)
         add_test(
             NAME trellis2_c_model_cli_split_tests
@@ -671,6 +760,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 "${CMAKE_CURRENT_LIST_DIR}/tests/test_model_cli_split.py"
                 --trellis2 $<TARGET_FILE:trellis2-image-to-gltf>
                 --pixal3d $<TARGET_FILE:pixal3d-image-to-gltf>
+                --tokenskin $<TARGET_FILE:tokenskin-rig>
                 --source-dir "${CMAKE_CURRENT_LIST_DIR}")
     endif()
 

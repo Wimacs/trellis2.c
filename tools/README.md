@@ -82,6 +82,42 @@ entry points over `image_to_gltf_cli.c`. They call
 entry points remain for source compatibility, but there is no generic CLI that
 auto-dispatches between model families.
 
+TokenSkin follows the same one-model/one-executable rule with the independent
+`tokenskin-rig` mesh-rigging CLI. Convert the official TokenRig checkpoint into
+the model package once from the repository root (Python `torch` and
+`safetensors` are required):
+
+```sh
+python3 tools/convert_tokenskin_weights.py \
+  /path/to/grpo_1400.ckpt \
+  models/tokenskin/ckpts
+```
+
+Run a CUDA build with:
+
+```sh
+./build/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-cuda.glb
+```
+
+Run a Vulkan build with the same CLI contract:
+
+```sh
+./build-vulkan/tokenskin-rig \
+  --model models/tokenskin \
+  --input input.glb \
+  --output rigged-vulkan.glb
+```
+
+No backend-specific environment variable or additional inference flag is
+needed. Input may be GLB or glTF; output is a self-contained rigged GLB. The
+current exporter preserves flattened world-space mesh geometry and topology,
+adds the generated skeleton and skin data, and rebuilds a default PBR material.
+It does not preserve source materials, UVs, textures, node structure, or
+animations.
+
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and
 unwraps UVs by default. Pass an explicit simplify target when you want face
@@ -170,6 +206,8 @@ Debug helpers:
 - `image_to_gltf_cli.c`: shared image-to-GLB/glTF CLI implementation.
 - `trellis2_image_to_gltf.c`: Trellis2-only CLI entry point.
 - `pixal3d_image_to_gltf.c`: Pixal3D-only CLI entry point.
+- `tokenskin_rig.c`: TokenSkin-only mesh-rigging CLI entry point.
+- `convert_tokenskin_weights.py`: official TokenRig checkpoint converter.
 - `debug/trellis_infer.c`: legacy/debug sparse-structure image/DINO/flow/voxel decode CLI.
 
 Standalone debug tools:

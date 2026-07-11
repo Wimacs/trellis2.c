@@ -22,6 +22,13 @@ static const trellis_model_family_descriptor g_families[] = {
     {
         TRELLIS_REGISTRY_ABI_VERSION,
         sizeof(trellis_model_family_descriptor),
+        "tokenskin",
+        "mesh_rigging",
+        "qwen3-0.6b-fsq",
+    },
+    {
+        TRELLIS_REGISTRY_ABI_VERSION,
+        sizeof(trellis_model_family_descriptor),
         "test_fixture",
         "test_weight_binding",
         "single_tensor",
@@ -36,6 +43,9 @@ static const trellis_architecture_descriptor g_architectures[] = {
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "pixal_naf", "pixal3d" },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "dinov3", NULL },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "birefnet", NULL },
+    { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "tokenskin_michelangelo_encoder", "tokenskin" },
+    { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "tokenskin_qwen3", "tokenskin" },
+    { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "tokenskin_fsq_cvae", "tokenskin" },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "test_linear", "test_fixture" },
 };
 
@@ -46,6 +56,14 @@ static const trellis_task_descriptor g_tasks[] = {
         "image_to_3d",
         "image",
         "gltf",
+        0,
+    },
+    {
+        TRELLIS_REGISTRY_ABI_VERSION,
+        sizeof(trellis_task_descriptor),
+        "mesh_rigging",
+        "mesh",
+        "rigged_mesh",
         0,
     },
     {
