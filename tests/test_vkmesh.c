@@ -6,6 +6,9 @@
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include <stdint.h>
 #include <limits.h>
@@ -72,6 +75,66 @@ static int read_gltf_position_bounds(
     }
     cgltf_free(data);
     return found;
+}
+
+typedef struct gltf_texture_stats {
+    int width;
+    int height;
+    size_t alpha_zero;
+    size_t alpha_full;
+    size_t alpha_partial;
+} gltf_texture_stats;
+
+static int read_gltf_texture_stats(
+    const char * path,
+    cgltf_size image_index,
+    gltf_texture_stats * stats) {
+    if (path == NULL || stats == NULL) return 0;
+    memset(stats, 0, sizeof(*stats));
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_data * data = NULL;
+    if (cgltf_parse_file(&options, path, &data) != cgltf_result_success || data == NULL ||
+        cgltf_load_buffers(&options, data, path) != cgltf_result_success ||
+        image_index >= data->images_count) {
+        cgltf_free(data);
+        return 0;
+    }
+    const cgltf_buffer_view * view = data->images[image_index].buffer_view;
+    if (view == NULL || view->buffer == NULL || view->buffer->data == NULL ||
+        view->size == 0 || view->size > INT_MAX || view->offset > view->buffer->size ||
+        view->size > view->buffer->size - view->offset) {
+        cgltf_free(data);
+        return 0;
+    }
+    const unsigned char * encoded =
+        (const unsigned char *) view->buffer->data + view->offset;
+    int channels = 0;
+    unsigned char * rgba = stbi_load_from_memory(
+        encoded,
+        (int) view->size,
+        &stats->width,
+        &stats->height,
+        &channels,
+        4);
+    cgltf_free(data);
+    if (rgba == NULL || stats->width <= 0 || stats->height <= 0) {
+        stbi_image_free(rgba);
+        return 0;
+    }
+    const size_t pixel_count = (size_t) stats->width * (size_t) stats->height;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const unsigned char alpha = rgba[i * 4u + 3u];
+        if (alpha == 0u) {
+            ++stats->alpha_zero;
+        } else if (alpha == 255u) {
+            ++stats->alpha_full;
+        } else {
+            ++stats->alpha_partial;
+        }
+    }
+    stbi_image_free(rgba);
+    return 1;
 }
 
 static void test_mesh_free(test_mesh * mesh) {
@@ -463,10 +526,13 @@ static int test_gltf_bake(void) {
     voxels.resolution = 4;
     char trellis_output[PATH_MAX];
     char pixal_output[PATH_MAX];
+    char fragmented_output[PATH_MAX];
     CHECK_TRUE(trellis_make_temp_path(
         trellis_output, sizeof(trellis_output), "vkmesh_bake_trellis", ".glb"));
     CHECK_TRUE(trellis_make_temp_path(
         pixal_output, sizeof(pixal_output), "vkmesh_bake_pixal", ".glb"));
+    CHECK_TRUE(trellis_make_temp_path(
+        fragmented_output, sizeof(fragmented_output), "vkmesh_bake_fragmented", ".glb"));
     trellis_status trellis_write_status = trellis_pipeline_write_gltf(
         trellis_output, &mesh, NULL, &voxels, 64, 0);
     trellis_status pixal_status = trellis_pipeline_write_gltf_ex(
@@ -477,6 +543,22 @@ static int test_gltf_bake(void) {
         64,
         0,
         TRELLIS_PIPELINE_GLTF_COORDINATE_TRANSFORM_PIXAL3D);
+    float fragmented_vertices[100u * 9u];
+    int32_t fragmented_faces[100u * 3u];
+    for (uint32_t face = 0; face < 100u; ++face) {
+        memcpy(fragmented_vertices + (size_t) face * 9u, vertices, 9u * sizeof(float));
+        fragmented_faces[(size_t) face * 3u + 0u] = (int32_t) (face * 3u + 0u);
+        fragmented_faces[(size_t) face * 3u + 1u] = (int32_t) (face * 3u + 1u);
+        fragmented_faces[(size_t) face * 3u + 2u] = (int32_t) (face * 3u + 2u);
+    }
+    trellis_mesh_host fragmented_mesh;
+    memset(&fragmented_mesh, 0, sizeof(fragmented_mesh));
+    fragmented_mesh.vertices = fragmented_vertices;
+    fragmented_mesh.faces = fragmented_faces;
+    fragmented_mesh.n_vertices = 300;
+    fragmented_mesh.n_faces = 100;
+    trellis_status fragmented_status = trellis_pipeline_write_gltf(
+        fragmented_output, &fragmented_mesh, NULL, &voxels, 64, 0);
     FILE * f = trellis_write_status == TRELLIS_STATUS_OK ? fopen(trellis_output, "rb") : NULL;
     char magic[4] = {0, 0, 0, 0};
     int valid = f != NULL && fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
@@ -490,12 +572,30 @@ static int test_gltf_bake(void) {
         trellis_output, trellis_min, trellis_max);
     const int pixal_bounds_ok = read_gltf_position_bounds(
         pixal_output, pixal_min, pixal_max);
+    gltf_texture_stats base_stats;
+    gltf_texture_stats mr_stats;
+    gltf_texture_stats fragmented_mr_stats;
+    const int base_texture_ok = read_gltf_texture_stats(trellis_output, 0, &base_stats);
+    const int mr_texture_ok = read_gltf_texture_stats(trellis_output, 1, &mr_stats);
+    const int fragmented_texture_ok =
+        read_gltf_texture_stats(fragmented_output, 1, &fragmented_mr_stats);
     trellis_unlink(trellis_output);
     trellis_unlink(pixal_output);
+    trellis_unlink(fragmented_output);
     CHECK_TRUE(trellis_write_status == TRELLIS_STATUS_OK);
     CHECK_TRUE(pixal_status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(fragmented_status == TRELLIS_STATUS_OK);
     CHECK_TRUE(valid);
     CHECK_TRUE(trellis_bounds_ok && pixal_bounds_ok);
+    CHECK_TRUE(base_texture_ok && mr_texture_ok);
+    CHECK_TRUE(base_stats.width == 64 && base_stats.height == 64);
+    CHECK_TRUE(mr_stats.width == 64 && mr_stats.height == 64);
+    CHECK_TRUE(base_stats.alpha_zero > 0 && base_stats.alpha_full > 0);
+    CHECK_TRUE(mr_stats.alpha_zero > 0 && mr_stats.alpha_full > 0);
+    CHECK_TRUE(mr_stats.alpha_partial == 0);
+    CHECK_TRUE(fragmented_texture_ok);
+    CHECK_TRUE(fragmented_mr_stats.width == 64 && fragmented_mr_stats.height == 64);
+    CHECK_TRUE(fragmented_mr_stats.alpha_zero > 0 && fragmented_mr_stats.alpha_full > 0);
     const float expected_trellis_min[3] = {-0.40f, -0.20f, -0.25f};
     const float expected_trellis_max[3] = {0.30f, 0.45f, 0.10f};
     const float expected_pixal_min[3] = {-0.30f, -0.10f, -0.45f};

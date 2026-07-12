@@ -2,6 +2,7 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+layout(std430, binding = 5) readonly buffer ChartMap { uint chart_map[]; };
 layout(std430, binding = 6) readonly buffer SrcBase { uint src_base[]; };
 layout(std430, binding = 7) readonly buffer SrcMr { uint src_mr[]; };
 layout(std430, binding = 8) buffer DstBase { uint dst_base[]; };
@@ -29,9 +30,15 @@ void main() {
     uint idx = y * pc.texture_size + x;
     uint b = src_base[idx];
     uint m = src_mr[idx];
+    uint chart = chart_map[idx];
+    if (chart == 0u) {
+        dst_base[idx] = 0u;
+        dst_mr[idx] = 0u;
+        return;
+    }
     if (alpha_of(m) != 0u) {
         dst_base[idx] = b;
-        dst_mr[idx] = m;
+        dst_mr[idx] = m | 0xff000000u;
         return;
     }
     int tex = int(pc.texture_size);
@@ -41,10 +48,11 @@ void main() {
             int ny = int(y) + dy;
             if (nx < 0 || ny < 0 || nx >= tex || ny >= tex) continue;
             uint nidx = uint(ny) * pc.texture_size + uint(nx);
+            if (chart_map[nidx] != chart) continue;
             uint nm = src_mr[nidx];
             if (alpha_of(nm) == 0u) continue;
             dst_base[idx] = src_base[nidx];
-            dst_mr[idx] = src_mr[nidx];
+            dst_mr[idx] = nm | 0xff000000u;
             return;
         }
     }

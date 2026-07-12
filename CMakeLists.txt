@@ -263,6 +263,8 @@ if (GGML_VULKAN)
     set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
     set(TRELLIS_GLTF_BAKE_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_frag.spv")
     set(TRELLIS_GLTF_BAKE_FRAG_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_frag_spv.h")
+    set(TRELLIS_GLTF_DOWNSAMPLE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_downsample.spv")
+    set(TRELLIS_GLTF_DOWNSAMPLE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_downsample_spv.h")
     set(TRELLIS_GLTF_DILATE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_dilate.spv")
     set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
     set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
@@ -281,6 +283,13 @@ if (GGML_VULKAN)
                 -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
         DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_downsample.comp"
+                -o "${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_downsample.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture downsample shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
@@ -315,6 +324,16 @@ if (GGML_VULKAN)
                 -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         DEPENDS "${TRELLIS_GLTF_BAKE_FRAG_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS glTF Vulkan texture bake fragment shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
+                -DSYMBOL=trellis_gltf_downsample_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_DOWNSAMPLE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture downsample shader header")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -340,6 +359,7 @@ if (GGML_VULKAN)
     add_custom_target(trellis_gltf_vk_shader DEPENDS
         "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+        "${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
         "${TRELLIS_GLTF_DILATE_HEADER}"
         "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
     add_dependencies(trellis2_c trellis_sparse_vk_shader)
@@ -351,6 +371,8 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
     set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
     set(TRELLIS_GLTF_BAKE_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_frag.spv")
     set(TRELLIS_GLTF_BAKE_FRAG_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_frag_spv.h")
+    set(TRELLIS_GLTF_DOWNSAMPLE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_downsample.spv")
+    set(TRELLIS_GLTF_DOWNSAMPLE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_downsample_spv.h")
     set(TRELLIS_GLTF_DILATE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_dilate.spv")
     set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
     set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
@@ -369,6 +391,13 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
                 -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
         DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_bake.frag"
         COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_downsample.comp"
+                -o "${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d/export/shaders/trellis_gltf_downsample.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture downsample shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
@@ -404,6 +433,16 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
         DEPENDS "${TRELLIS_GLTF_BAKE_FRAG_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS glTF Vulkan texture bake fragment shader header")
     add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_DOWNSAMPLE_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
+                -DSYMBOL=trellis_gltf_downsample_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_DOWNSAMPLE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture downsample shader header")
+    add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
         COMMAND "${CMAKE_COMMAND}"
@@ -426,6 +465,7 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
     add_custom_target(trellis_gltf_vk_shader DEPENDS
         "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+        "${TRELLIS_GLTF_DOWNSAMPLE_HEADER}"
         "${TRELLIS_GLTF_DILATE_HEADER}"
         "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
     add_dependencies(trellis2_c trellis_gltf_vk_shader)
@@ -954,7 +994,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 "${CMAKE_CURRENT_LIST_DIR}/src/ops"
                 "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
                 "${CMAKE_CURRENT_LIST_DIR}/src/architectures/dit_flow"
-                "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf")
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/ggml/examples")
             target_link_libraries(trellis2_c_vkmesh_tests PRIVATE
                 trellis2_c ggml Vulkan::Vulkan Threads::Threads)
             add_dependencies(trellis2_c_vkmesh_tests vkmesh)

@@ -18,6 +18,7 @@
 
 #include "trellis_gltf_bake_vert_spv.h"
 #include "trellis_gltf_bake_frag_spv.h"
+#include "trellis_gltf_downsample_spv.h"
 #include "trellis_gltf_dilate_spv.h"
 #include "trellis_gltf_fill_empty_spv.h"
 #endif
@@ -36,9 +37,16 @@ typedef struct trellis_gltf_mesh {
     float * normals;
     float * uvs;
     uint32_t * indices;
+    uint32_t * chart_map;
     uint32_t vertex_count;
     uint32_t index_count;
+    uint32_t chart_map_size;
 } trellis_gltf_mesh;
+
+#define TRELLIS_GLTF_UV_OUTPUT_PADDING 4u
+#define TRELLIS_GLTF_UV_PACK_MAX_PASSES 8u
+/* A 2x edge raster contains four coverage samples per output texel. */
+#define TRELLIS_GLTF_BAKE_SUPERSAMPLE_SCALE 2u
 
 typedef struct trellis_gltf_chart_record {
     uint32_t key;
@@ -191,6 +199,7 @@ static void gltf_mesh_free(trellis_gltf_mesh * mesh) {
     free(mesh->normals);
     free(mesh->uvs);
     free(mesh->indices);
+    free(mesh->chart_map);
     memset(mesh, 0, sizeof(*mesh));
 }
 
@@ -201,6 +210,180 @@ static void gltf_chart_input_free(trellis_gltf_chart_input * chart) {
     free(chart->indices);
     free(chart->vertex_map);
     memset(chart, 0, sizeof(*chart));
+}
+
+static trellis_status gltf_xatlas_pack_for_output(
+    xatlasAtlas * atlas,
+    int texture_size,
+    uint32_t * atlas_padding_out) {
+    if (atlas == NULL || texture_size <= 0 || atlas_padding_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    xatlasComputeCharts(atlas, NULL);
+
+    /* Probe without padding so fragmented meshes do not spend most texels on guards. */
+    xatlasPackOptions probe_options;
+    xatlasPackOptionsInit(&probe_options);
+    probe_options.resolution = (uint32_t) texture_size;
+    probe_options.padding = 0u;
+    probe_options.createImage = false;
+    xatlasPackCharts(atlas, &probe_options);
+    if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
+        atlas->chartCount == 0u || atlas->meshes == NULL) {
+        TRELLIS_ERROR(
+            "glTF export: xatlas probe pack failed (pages=%u atlas=%ux%u charts=%u)",
+            atlas->atlasCount,
+            atlas->width,
+            atlas->height,
+            atlas->chartCount);
+        return TRELLIS_STATUS_ERROR;
+    }
+    const uint32_t probe_max_dimension =
+        atlas->width > atlas->height ? atlas->width : atlas->height;
+
+    /* Keep at least half of the atlas budget for chart interiors and packing loss. */
+    const uint64_t output_texels = (uint64_t) (uint32_t) texture_size * (uint32_t) texture_size;
+    uint32_t target_output_padding = TRELLIS_GLTF_UV_OUTPUT_PADDING;
+    while (target_output_padding > 0u) {
+        const uint64_t footprint_side = (uint64_t) target_output_padding * 2u + 3u;
+        const uint64_t minimum_guard_texels =
+            (uint64_t) atlas->chartCount * footprint_side * footprint_side;
+        if (minimum_guard_texels <= output_texels / 2u) break;
+        --target_output_padding;
+    }
+    if (target_output_padding < TRELLIS_GLTF_UV_OUTPUT_PADDING) {
+        TRELLIS_INFO(
+            "glTF export: UV islands=%u exceed %upx guard capacity at %d; using target=%upx",
+            atlas->chartCount,
+            TRELLIS_GLTF_UV_OUTPUT_PADDING,
+            texture_size,
+            target_output_padding);
+    }
+
+    uint32_t best_atlas_padding = 0u;
+    uint32_t best_max_dimension = probe_max_dimension;
+    uint32_t pack_passes = 1u;
+    int reached_target = target_output_padding == 0u;
+    uint32_t atlas_padding = target_output_padding;
+    for (uint32_t pass = 0;
+         target_output_padding > 0u && pass < TRELLIS_GLTF_UV_PACK_MAX_PASSES;
+         ++pass) {
+        xatlasPackOptions pack_options;
+        xatlasPackOptionsInit(&pack_options);
+        pack_options.resolution = (uint32_t) texture_size;
+        pack_options.padding = atlas_padding;
+        pack_options.createImage = false;
+        xatlasPackCharts(atlas, &pack_options);
+        ++pack_passes;
+        if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
+            atlas->meshes == NULL) {
+            TRELLIS_ERROR(
+                "glTF export: xatlas candidate pack failed (pages=%u atlas=%ux%u)",
+                atlas->atlasCount,
+                atlas->width,
+                atlas->height);
+            return TRELLIS_STATUS_ERROR;
+        }
+
+        const uint32_t max_dimension = atlas->width > atlas->height ? atlas->width : atlas->height;
+        if ((uint64_t) max_dimension > (uint64_t) probe_max_dimension * 2u) break;
+        if ((uint64_t) atlas_padding * best_max_dimension >
+            (uint64_t) best_atlas_padding * max_dimension) {
+            best_atlas_padding = atlas_padding;
+            best_max_dimension = max_dimension;
+        }
+
+        /* xatlas resolution is a density target, so convert atlas pixels to output pixels. */
+        if ((uint64_t) atlas_padding * (uint32_t) texture_size >=
+            (uint64_t) target_output_padding * max_dimension) {
+            reached_target = 1;
+            break;
+        }
+        const uint64_t required_numerator =
+            (uint64_t) target_output_padding * max_dimension +
+            (uint32_t) texture_size - 1u;
+        uint64_t required = required_numerator / (uint32_t) texture_size;
+        if (required <= atlas_padding) required = (uint64_t) atlas_padding + 1u;
+        if (required > 256u) break;
+        atlas_padding = (uint32_t) required;
+    }
+
+    /* Repack the best candidate and build the potentially large owner map only once. */
+    xatlasPackOptions final_options;
+    xatlasPackOptionsInit(&final_options);
+    final_options.resolution = (uint32_t) texture_size;
+    final_options.padding = best_atlas_padding;
+    final_options.createImage = TRELLIS_HAS_GLTF_VULKAN_BAKE != 0;
+    xatlasPackCharts(atlas, &final_options);
+    ++pack_passes;
+    if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
+        atlas->meshes == NULL ||
+        (TRELLIS_HAS_GLTF_VULKAN_BAKE && atlas->image == NULL)) {
+        TRELLIS_ERROR(
+            "glTF export: xatlas final pack failed (pages=%u atlas=%ux%u)",
+            atlas->atlasCount,
+            atlas->width,
+            atlas->height);
+        return TRELLIS_STATUS_ERROR;
+    }
+
+    const float output_padding_x =
+        (float) best_atlas_padding * (float) texture_size / (float) atlas->width;
+    const float output_padding_y =
+        (float) best_atlas_padding * (float) texture_size / (float) atlas->height;
+    if (!reached_target) {
+        TRELLIS_INFO(
+            "glTF export: UV padding best-effort target=%u actual=%.2fx%.2f px",
+            target_output_padding,
+            output_padding_x,
+            output_padding_y);
+    }
+    *atlas_padding_out = best_atlas_padding;
+    TRELLIS_INFO(
+        "glTF export: xatlas padding atlas=%u output=%.2fx%.2f px target=%u passes=%u",
+        best_atlas_padding,
+        output_padding_x,
+        output_padding_y,
+        target_output_padding,
+        pack_passes);
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status gltf_copy_xatlas_chart_map(
+    const xatlasAtlas * atlas,
+    int texture_size,
+    trellis_gltf_mesh * out) {
+    if (atlas == NULL || out == NULL || texture_size <= 0 || atlas->atlasCount != 1u ||
+        atlas->width == 0u || atlas->height == 0u || atlas->image == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t map_size = (size_t) texture_size * (size_t) texture_size;
+    if (map_size > SIZE_MAX / sizeof(uint32_t)) return TRELLIS_STATUS_OUT_OF_MEMORY;
+    uint32_t * chart_map = (uint32_t *) malloc(map_size * sizeof(uint32_t));
+    if (chart_map == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
+
+    /* Sample at output texel centers to match the normalized UV raster transform. */
+    for (uint32_t y = 0; y < (uint32_t) texture_size; ++y) {
+        uint32_t sy = (uint32_t) (
+            ((uint64_t) y * 2u + 1u) * (uint64_t) atlas->height /
+            ((uint64_t) texture_size * 2u));
+        if (sy >= atlas->height) sy = atlas->height - 1u;
+        for (uint32_t x = 0; x < (uint32_t) texture_size; ++x) {
+            uint32_t sx = (uint32_t) (
+                ((uint64_t) x * 2u + 1u) * (uint64_t) atlas->width /
+                ((uint64_t) texture_size * 2u));
+            if (sx >= atlas->width) sx = atlas->width - 1u;
+            const uint32_t encoded = atlas->image[(size_t) sy * atlas->width + sx];
+            chart_map[(size_t) y * (uint32_t) texture_size + x] =
+                (encoded & xatlasImageHasChartIndexBit) != 0u
+                    ? (encoded & xatlasImageChartIndexMask) + 1u
+                    : 0u;
+        }
+    }
+    out->chart_map = chart_map;
+    out->chart_map_size = (uint32_t) texture_size;
+    return TRELLIS_STATUS_OK;
 }
 
 static trellis_status unwrap_mesh_xatlas_direct(
@@ -251,12 +434,14 @@ static trellis_status unwrap_mesh_xatlas_direct(
         free(input_indices);
         return TRELLIS_STATUS_ERROR;
     }
-    xatlasPackOptions pack_options;
-    xatlasPackOptionsInit(&pack_options);
-    pack_options.resolution = (uint32_t) texture_size;
-    pack_options.padding = 0;
-    pack_options.createImage = false;
-    xatlasGenerate(atlas, NULL, &pack_options);
+    uint32_t atlas_padding = 0;
+    trellis_status pack_status = gltf_xatlas_pack_for_output(atlas, texture_size, &atlas_padding);
+    if (pack_status != TRELLIS_STATUS_OK) {
+        xatlasDestroy(atlas);
+        free(input_normals);
+        free(input_indices);
+        return pack_status;
+    }
     if (atlas->meshCount != 1 || atlas->meshes == NULL || atlas->meshes[0].vertexCount == 0) {
         xatlasDestroy(atlas);
         free(input_normals);
@@ -288,13 +473,24 @@ static trellis_status unwrap_mesh_xatlas_direct(
         out->uvs[(size_t) i * 2u + 1u] = clamp01_export(v->uv[1] / atlas_h);
     }
     memcpy(out->indices, xm->indexArray, (size_t) out->index_count * sizeof(uint32_t));
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
+    trellis_status chart_map_status = gltf_copy_xatlas_chart_map(atlas, texture_size, out);
+    if (chart_map_status != TRELLIS_STATUS_OK) {
+        gltf_mesh_free(out);
+        xatlasDestroy(atlas);
+        free(input_normals);
+        free(input_indices);
+        return chart_map_status;
+    }
+#endif
     TRELLIS_INFO(
-        "glTF export: xatlas unwrap vertices=%u faces=%u atlas=%ux%u charts=%u",
+        "glTF export: xatlas unwrap vertices=%u faces=%u atlas=%ux%u charts=%u padding=%u",
         out->vertex_count,
         out->index_count / 3u,
         atlas->width,
         atlas->height,
-        atlas->chartCount);
+        atlas->chartCount,
+        atlas_padding);
     xatlasDestroy(atlas);
     free(input_normals);
     free(input_indices);
@@ -326,14 +522,15 @@ typedef struct trellis_gltf_vk {
     VkPipelineLayout pipeline_layout;
     VkRenderPass render_pass;
     VkPipeline graphics_pipeline;
-    VkPipeline compute_pipelines[2];
+    VkPipeline compute_pipelines[3];
     VkDescriptorPool descriptor_pool;
 } trellis_gltf_vk;
 
 typedef enum trellis_gltf_vk_compute_pipeline {
-    TRELLIS_GLTF_COMPUTE_DILATE = 0,
-    TRELLIS_GLTF_COMPUTE_FILL_EMPTY = 1,
-    TRELLIS_GLTF_COMPUTE_COUNT = 2,
+    TRELLIS_GLTF_COMPUTE_DOWNSAMPLE = 0,
+    TRELLIS_GLTF_COMPUTE_DILATE = 1,
+    TRELLIS_GLTF_COMPUTE_FILL_EMPTY = 2,
+    TRELLIS_GLTF_COMPUTE_COUNT = 3,
 } trellis_gltf_vk_compute_pipeline;
 
 typedef struct trellis_gltf_vk_shader {
@@ -357,6 +554,7 @@ static const trellis_gltf_vk_shader g_gltf_bake_frag_shader = {
 };
 
 static const trellis_gltf_vk_shader g_gltf_compute_shaders[TRELLIS_GLTF_COMPUTE_COUNT] = {
+    TRELLIS_GLTF_SHADER_DESC(trellis_gltf_downsample_spv, "gltf_downsample"),
     TRELLIS_GLTF_SHADER_DESC(trellis_gltf_dilate_spv, "gltf_dilate"),
     TRELLIS_GLTF_SHADER_DESC(trellis_gltf_fill_empty_spv, "gltf_fill_empty"),
 };
@@ -1163,10 +1361,13 @@ static int gltf_vk_allocate_descriptor_set(
 static int gltf_vk_texture_postprocess(
     trellis_gltf_vk * vk,
     trellis_gltf_vk_buffer * buffers[10],
+    trellis_gltf_vk_buffer * chart_map,
     const trellis_gltf_vk_push * initial_push,
+    uint32_t supersample_scale,
     trellis_gltf_vk_buffer ** base_out,
     trellis_gltf_vk_buffer ** mr_out) {
-    if (vk == NULL || buffers == NULL || initial_push == NULL || base_out == NULL || mr_out == NULL) return 0;
+    if (vk == NULL || buffers == NULL || chart_map == NULL || initial_push == NULL ||
+        base_out == NULL || mr_out == NULL) return 0;
     VkCommandBufferAllocateInfo cmd_alloc;
     memset(&cmd_alloc, 0, sizeof(cmd_alloc));
     cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1182,19 +1383,75 @@ static int gltf_vk_texture_postprocess(
     int ok = 0;
     if (vkBeginCommandBuffer(cmd, &begin_info) == VK_SUCCESS) {
         trellis_gltf_vk_push push = *initial_push;
-        trellis_gltf_vk_buffer * cur_base = buffers[6];
-        trellis_gltf_vk_buffer * cur_mr = buffers[7];
-        trellis_gltf_vk_buffer * next_base = buffers[8];
-        trellis_gltf_vk_buffer * next_mr = buffers[9];
         const uint32_t image_groups = (push.texture_size + 15u) / 16u;
+        const VkDeviceSize target_image_bytes =
+            (VkDeviceSize) push.texture_size * push.texture_size * sizeof(uint32_t);
         int recorded = 1;
-        uint32_t fill_step = 1u;
-        while (fill_step < push.texture_size) fill_step <<= 1u;
-        fill_step >>= 1u;
 
-        for (int pass = 0; pass < 32 && recorded; ++pass) {
+        /* Resolve the supersampled raster before any padding is generated. */
+        push.pad0 = supersample_scale;
+        VkDescriptorSet downsample_set = VK_NULL_HANDLE;
+        if (!gltf_vk_allocate_descriptor_set(vk, buffers, &downsample_set)) {
+            recorded = 0;
+        } else {
+            vkCmdBindPipeline(
+                cmd,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_DOWNSAMPLE]);
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                vk->pipeline_layout,
+                0,
+                1,
+                &downsample_set,
+                0,
+                NULL);
+            vkCmdPushConstants(
+                cmd,
+                vk->pipeline_layout,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                sizeof(push),
+                &push);
+            vkCmdDispatch(cmd, image_groups, image_groups, 1);
+
+            VkBufferMemoryBarrier barriers[2];
+            memset(barriers, 0, sizeof(barriers));
+            for (uint32_t i = 0; i < 2; ++i) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].buffer = buffers[8u + i]->buffer;
+                barriers[i].offset = 0;
+                barriers[i].size = target_image_bytes;
+            }
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                NULL,
+                2,
+                barriers,
+                0,
+                NULL);
+        }
+
+        trellis_gltf_vk_buffer * cur_base = buffers[8];
+        trellis_gltf_vk_buffer * cur_mr = buffers[9];
+        trellis_gltf_vk_buffer * next_base = buffers[6];
+        trellis_gltf_vk_buffer * next_mr = buffers[7];
+        push.pad0 = 0u;
+        /* Two extra passes cover xatlas' conservative/bilinear fringe; the chart map caps growth. */
+        const uint32_t dilation_passes = TRELLIS_GLTF_UV_OUTPUT_PADDING + 2u;
+        for (uint32_t pass = 0; pass < dilation_passes && recorded; ++pass) {
             trellis_gltf_vk_buffer * desc[10];
             for (int i = 0; i < 10; ++i) desc[i] = buffers[i];
+            desc[5] = chart_map;
             desc[6] = cur_base;
             desc[7] = cur_mr;
             desc[8] = next_base;
@@ -1223,7 +1480,7 @@ static int gltf_vk_texture_postprocess(
                 barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 barriers[i].buffer = written[i]->buffer;
                 barriers[i].offset = 0;
-                barriers[i].size = (VkDeviceSize) written[i]->bytes;
+                barriers[i].size = target_image_bytes;
             }
             vkCmdPipelineBarrier(
                 cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1236,50 +1493,32 @@ static int gltf_vk_texture_postprocess(
             next_mr = tmp;
         }
 
-        for (; fill_step > 0u && recorded; fill_step >>= 1u) {
-            push.pad0 = fill_step;
-            trellis_gltf_vk_buffer * desc[10];
-            for (int i = 0; i < 10; ++i) desc[i] = buffers[i];
-            desc[6] = cur_base;
-            desc[7] = cur_mr;
-            desc[8] = next_base;
-            desc[9] = next_mr;
-            VkDescriptorSet set = VK_NULL_HANDLE;
-            if (!gltf_vk_allocate_descriptor_set(vk, desc, &set)) {
-                recorded = 0;
-                break;
-            }
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_FILL_EMPTY]);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
-            vkCmdPushConstants(
-                cmd, vk->pipeline_layout,
-                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(push), &push);
-            vkCmdDispatch(cmd, image_groups, image_groups, 1);
-
-            VkBufferMemoryBarrier barriers[2];
-            memset(barriers, 0, sizeof(barriers));
-            trellis_gltf_vk_buffer * written[2] = { next_base, next_mr };
+        /* Unowned atlas space stays empty; global jump-fill can carry color across UV islands. */
+        if (recorded) {
+            VkBufferMemoryBarrier host_barriers[2];
+            memset(host_barriers, 0, sizeof(host_barriers));
+            trellis_gltf_vk_buffer * written[2] = { cur_base, cur_mr };
             for (uint32_t i = 0; i < 2; ++i) {
-                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].buffer = written[i]->buffer;
-                barriers[i].offset = 0;
-                barriers[i].size = (VkDeviceSize) written[i]->bytes;
+                host_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                host_barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                host_barriers[i].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                host_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                host_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                host_barriers[i].buffer = written[i]->buffer;
+                host_barriers[i].offset = 0;
+                host_barriers[i].size = target_image_bytes;
             }
             vkCmdPipelineBarrier(
-                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                0, 0, NULL, 2, barriers, 0, NULL);
-            trellis_gltf_vk_buffer * tmp = cur_base;
-            cur_base = next_base;
-            next_base = tmp;
-            tmp = cur_mr;
-            cur_mr = next_mr;
-            next_mr = tmp;
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                0,
+                NULL,
+                2,
+                host_barriers,
+                0,
+                NULL);
         }
 
         if (recorded && vkEndCommandBuffer(cmd) == VK_SUCCESS) {
@@ -1705,14 +1944,11 @@ static trellis_status unwrap_mesh_xatlas_charted(
         start = end;
     }
 
+    uint32_t atlas_padding = 0;
     if (status == TRELLIS_STATUS_OK) {
-        xatlasPackOptions pack_options;
-        xatlasPackOptionsInit(&pack_options);
-        pack_options.resolution = (uint32_t) texture_size;
-        pack_options.padding = 0;
-        pack_options.createImage = false;
-        xatlasGenerate(atlas, NULL, &pack_options);
-        if (atlas->meshCount != chart_count || atlas->meshes == NULL) {
+        status = gltf_xatlas_pack_for_output(atlas, texture_size, &atlas_padding);
+        if (status == TRELLIS_STATUS_OK &&
+            (atlas->meshCount != chart_count || atlas->meshes == NULL)) {
             status = TRELLIS_STATUS_ERROR;
         }
     }
@@ -1778,8 +2014,13 @@ static trellis_status unwrap_mesh_xatlas_charted(
             index_base += xm->indexCount;
         }
         if (status == TRELLIS_STATUS_OK) {
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
+            status = gltf_copy_xatlas_chart_map(atlas, texture_size, out);
+#endif
+        }
+        if (status == TRELLIS_STATUS_OK) {
             TRELLIS_INFO(
-                "glTF export: connected xatlas unwrap faces=%" PRId64 " target=%u clusters=%u max_cluster_faces=%u xatlas_charts=%u vertices=%u atlas=%ux%u",
+                "glTF export: connected xatlas unwrap faces=%" PRId64 " target=%u clusters=%u max_cluster_faces=%u xatlas_charts=%u vertices=%u atlas=%ux%u padding=%u",
                 mesh->n_faces,
                 target_faces,
                 chart_count,
@@ -1787,7 +2028,8 @@ static trellis_status unwrap_mesh_xatlas_charted(
                 atlas->chartCount,
                 out->vertex_count,
                 atlas->width,
-                atlas->height);
+                atlas->height,
+                atlas_padding);
         }
     }
 
@@ -1805,8 +2047,10 @@ static int gltf_vk_render_bake(
     trellis_gltf_vk * vk,
     trellis_gltf_vk_buffer * buffers[10],
     const trellis_gltf_vk_push * push,
+    uint32_t raster_size,
     trellis_gltf_vk_image * base_image,
     trellis_gltf_vk_image * mr_image) {
+    if (raster_size == 0u) return 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (!gltf_vk_allocate_descriptor_set(vk, buffers, &set)) return 0;
 
@@ -1817,8 +2061,8 @@ static int gltf_vk_render_bake(
     framebuffer_info.renderPass = vk->render_pass;
     framebuffer_info.attachmentCount = 2;
     framebuffer_info.pAttachments = attachments;
-    framebuffer_info.width = push->texture_size;
-    framebuffer_info.height = push->texture_size;
+    framebuffer_info.width = raster_size;
+    framebuffer_info.height = raster_size;
     framebuffer_info.layers = 1;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     if (vkCreateFramebuffer(vk->device, &framebuffer_info, NULL, &framebuffer) != VK_SUCCESS) {
@@ -1851,8 +2095,8 @@ static int gltf_vk_render_bake(
         render_begin.framebuffer = framebuffer;
         render_begin.renderArea.offset.x = 0;
         render_begin.renderArea.offset.y = 0;
-        render_begin.renderArea.extent.width = push->texture_size;
-        render_begin.renderArea.extent.height = push->texture_size;
+        render_begin.renderArea.extent.width = raster_size;
+        render_begin.renderArea.extent.height = raster_size;
         render_begin.clearValueCount = 2;
         render_begin.pClearValues = clears;
         vkCmdBeginRenderPass(cmd, &render_begin, VK_SUBPASS_CONTENTS_INLINE);
@@ -1861,14 +2105,14 @@ static int gltf_vk_render_bake(
         memset(&viewport, 0, sizeof(viewport));
         viewport.x = 0.0f;
         viewport.y = 0.0f;
-        viewport.width = (float) push->texture_size;
-        viewport.height = (float) push->texture_size;
+        viewport.width = (float) raster_size;
+        viewport.height = (float) raster_size;
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
         VkRect2D scissor;
         memset(&scissor, 0, sizeof(scissor));
-        scissor.extent.width = push->texture_size;
-        scissor.extent.height = push->texture_size;
+        scissor.extent.width = raster_size;
+        scissor.extent.height = raster_size;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->graphics_pipeline);
         vkCmdSetViewport(cmd, 0, 1, &viewport);
@@ -1900,8 +2144,8 @@ static int gltf_vk_render_bake(
         copy_region.imageOffset.x = 0;
         copy_region.imageOffset.y = 0;
         copy_region.imageOffset.z = 0;
-        copy_region.imageExtent.width = push->texture_size;
-        copy_region.imageExtent.height = push->texture_size;
+        copy_region.imageExtent.width = raster_size;
+        copy_region.imageExtent.height = raster_size;
         copy_region.imageExtent.depth = 1;
         vkCmdCopyImageToBuffer(
             cmd,
@@ -2004,6 +2248,7 @@ static trellis_status bake_textures_vulkan(
     uint8_t ** mr_out) {
     if (mesh == NULL || voxels == NULL || base_out == NULL || mr_out == NULL ||
         mesh->positions == NULL || mesh->uvs == NULL || mesh->indices == NULL ||
+        mesh->chart_map == NULL || mesh->chart_map_size != (uint32_t) texture_size ||
         voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->channels < 3 ||
         mesh->index_count / 3u > UINT32_MAX || voxels->n_coords > UINT32_MAX ||
         voxels->channels > UINT32_MAX) {
@@ -2013,6 +2258,16 @@ static trellis_status bake_textures_vulkan(
     *mr_out = NULL;
     const size_t pixel_count = (size_t) texture_size * (size_t) texture_size;
     const size_t image_bytes = pixel_count * sizeof(uint32_t);
+    if ((uint32_t) texture_size > UINT32_MAX / TRELLIS_GLTF_BAKE_SUPERSAMPLE_SCALE) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    uint32_t supersample_scale = TRELLIS_GLTF_BAKE_SUPERSAMPLE_SCALE;
+    uint32_t raster_size = (uint32_t) texture_size * supersample_scale;
+    size_t raster_pixel_count = (size_t) raster_size * (size_t) raster_size;
+    if (raster_pixel_count > SIZE_MAX / sizeof(uint32_t)) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    size_t raster_image_bytes = raster_pixel_count * sizeof(uint32_t);
     uint8_t * base = (uint8_t *) malloc(image_bytes);
     uint8_t * mr = (uint8_t *) malloc(image_bytes);
     if (base == NULL || mr == NULL) {
@@ -2059,10 +2314,12 @@ static trellis_status bake_textures_vulkan(
 
     trellis_gltf_vk vk;
     trellis_gltf_vk_buffer buffers[10];
+    trellis_gltf_vk_buffer chart_map_buffer;
     trellis_gltf_vk_image base_image;
     trellis_gltf_vk_image mr_image;
     memset(&vk, 0, sizeof(vk));
     memset(buffers, 0, sizeof(buffers));
+    memset(&chart_map_buffer, 0, sizeof(chart_map_buffer));
     memset(&base_image, 0, sizeof(base_image));
     memset(&mr_image, 0, sizeof(mr_image));
     if (!gltf_vk_init(&vk, device)) {
@@ -2071,6 +2328,34 @@ static trellis_status bake_textures_vulkan(
         free(base);
         free(mr);
         return TRELLIS_STATUS_ERROR;
+    }
+
+    VkPhysicalDeviceProperties physical_properties;
+    vkGetPhysicalDeviceProperties(vk.physical_device, &physical_properties);
+    if (raster_size > physical_properties.limits.maxImageDimension2D ||
+        raster_size > physical_properties.limits.maxFramebufferWidth ||
+        raster_size > physical_properties.limits.maxFramebufferHeight ||
+        raster_size > physical_properties.limits.maxViewportDimensions[0] ||
+        raster_size > physical_properties.limits.maxViewportDimensions[1] ||
+        raster_image_bytes > physical_properties.limits.maxStorageBufferRange) {
+        TRELLIS_INFO(
+            "glTF export: 4x texture supersampling at %ux%u exceeds Vulkan limits; using 1 sample",
+            raster_size,
+            raster_size);
+        supersample_scale = 1u;
+        raster_size = (uint32_t) texture_size;
+        raster_pixel_count = (size_t) raster_size * (size_t) raster_size;
+        raster_image_bytes = raster_pixel_count * sizeof(uint32_t);
+    }
+    if (raster_size > physical_properties.limits.maxImageDimension2D ||
+        raster_size > physical_properties.limits.maxFramebufferWidth ||
+        raster_size > physical_properties.limits.maxFramebufferHeight ||
+        raster_size > physical_properties.limits.maxViewportDimensions[0] ||
+        raster_size > physical_properties.limits.maxViewportDimensions[1] ||
+        raster_image_bytes > physical_properties.limits.maxStorageBufferRange) {
+        TRELLIS_ERROR("glTF export: texture=%ux%u exceeds Vulkan device limits", raster_size, raster_size);
+        status = TRELLIS_STATUS_INVALID_ARGUMENT;
+        goto cleanup;
     }
 
     const size_t positions_bytes = (size_t) mesh->vertex_count * 3u * sizeof(float);
@@ -2086,16 +2371,17 @@ static trellis_status bake_textures_vulkan(
         gltf_vk_buffer_create(&vk, hash_bytes, &buffers[3]) &&
         gltf_vk_buffer_create(&vk, attrs_bytes, &buffers[4]) &&
         gltf_vk_buffer_create(&vk, projection_bytes > 0 ? projection_bytes : 4u, &buffers[5]) &&
-        gltf_vk_buffer_create(&vk, image_bytes, &buffers[6]) &&
-        gltf_vk_buffer_create(&vk, image_bytes, &buffers[7]) &&
+        gltf_vk_buffer_create(&vk, raster_image_bytes, &buffers[6]) &&
+        gltf_vk_buffer_create(&vk, raster_image_bytes, &buffers[7]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[8]) &&
-        gltf_vk_buffer_create(&vk, image_bytes, &buffers[9]);
+        gltf_vk_buffer_create(&vk, image_bytes, &buffers[9]) &&
+        gltf_vk_buffer_create(&vk, image_bytes, &chart_map_buffer);
     if (!ok) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
         goto cleanup;
     }
-    if (!gltf_vk_image_create(&vk, (uint32_t) texture_size, (uint32_t) texture_size, &base_image) ||
-        !gltf_vk_image_create(&vk, (uint32_t) texture_size, (uint32_t) texture_size, &mr_image)) {
+    if (!gltf_vk_image_create(&vk, raster_size, raster_size, &base_image) ||
+        !gltf_vk_image_create(&vk, raster_size, raster_size, &mr_image)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
@@ -2107,13 +2393,8 @@ static trellis_status bake_textures_vulkan(
     memcpy(buffers[4].mapped, voxels->attrs, attrs_bytes);
     if (projection_bytes > 0) {
         memcpy(buffers[5].mapped, projection_words, projection_bytes);
-    } else {
-        memset(buffers[5].mapped, 0, buffers[5].bytes);
     }
-    memset(buffers[6].mapped, 0, image_bytes);
-    memset(buffers[7].mapped, 0, image_bytes);
-    memset(buffers[8].mapped, 0, image_bytes);
-    memset(buffers[9].mapped, 0, image_bytes);
+    memcpy(chart_map_buffer.mapped, mesh->chart_map, image_bytes);
 
     trellis_gltf_vk_push push;
     memset(&push, 0, sizeof(push));
@@ -2129,25 +2410,52 @@ static trellis_status bake_textures_vulkan(
     push.project_flags = projection_enabled ? 1u : 0u;
 
     TRELLIS_INFO(
-        "glTF export: Vulkan raster texture bake tris=%u voxels=%" PRId64 " texture=%d hash=%u projection_nodes=%u",
+        "glTF export: Vulkan raster texture bake tris=%u voxels=%" PRId64 " texture=%d raster=%ux%u samples=%u hash=%u projection_nodes=%u",
         push.triangle_count,
         voxels->n_coords,
         texture_size,
+        raster_size,
+        raster_size,
+        supersample_scale * supersample_scale,
         hash_size,
         push.project_node_count);
 
     trellis_gltf_vk_buffer * desc[10];
     for (int i = 0; i < 10; ++i) desc[i] = &buffers[i];
-    if (!gltf_vk_render_bake(&vk, desc, &push, &base_image, &mr_image)) {
+    if (!gltf_vk_render_bake(&vk, desc, &push, raster_size, &base_image, &mr_image)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
 
-    trellis_gltf_vk_buffer * cur_base = &buffers[6];
-    trellis_gltf_vk_buffer * cur_mr = &buffers[7];
-    if (!gltf_vk_texture_postprocess(&vk, desc, &push, &cur_base, &cur_mr)) {
+    trellis_gltf_vk_buffer * cur_base = &buffers[8];
+    trellis_gltf_vk_buffer * cur_mr = &buffers[9];
+    if (!gltf_vk_texture_postprocess(
+            &vk, desc, &chart_map_buffer, &push, supersample_scale, &cur_base, &cur_mr)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
+    }
+
+    const char * coverage_stats = getenv("TRELLIS_GLTF_BAKE_STATS");
+    if (coverage_stats != NULL && coverage_stats[0] != '\0' && strcmp(coverage_stats, "0") != 0) {
+        size_t valid_texels = 0;
+        size_t owned_texels = 0;
+        size_t owned_empty_texels = 0;
+        size_t valid_outside_chart = 0;
+        const uint32_t * baked_mr = (const uint32_t *) cur_mr->mapped;
+        for (size_t i = 0; i < pixel_count; ++i) {
+            const int valid = (baked_mr[i] >> 24u) != 0u;
+            const int owned = mesh->chart_map[i] != 0u;
+            valid_texels += valid ? 1u : 0u;
+            owned_texels += owned ? 1u : 0u;
+            owned_empty_texels += owned && !valid ? 1u : 0u;
+            valid_outside_chart += valid && !owned ? 1u : 0u;
+        }
+        TRELLIS_INFO(
+            "glTF export: texture coverage valid=%zu owned=%zu owned_empty=%zu valid_outside=%zu",
+            valid_texels,
+            owned_texels,
+            owned_empty_texels,
+            valid_outside_chart);
     }
 
     memcpy(base, cur_base->mapped, image_bytes);
@@ -2161,6 +2469,7 @@ static trellis_status bake_textures_vulkan(
 cleanup:
     gltf_vk_image_destroy(&vk, &mr_image);
     gltf_vk_image_destroy(&vk, &base_image);
+    gltf_vk_buffer_destroy(&vk, &chart_map_buffer);
     for (int i = 0; i < 10; ++i) gltf_vk_buffer_destroy(&vk, &buffers[i]);
     gltf_vk_destroy(&vk);
     free(projection_words);
@@ -2181,9 +2490,8 @@ static trellis_status unwrap_mesh_xatlas(
         if (status == TRELLIS_STATUS_OK) {
             return status;
         }
-        if (status != TRELLIS_STATUS_NOT_IMPLEMENTED) {
-            TRELLIS_INFO("glTF export: connected CPU charted UV unwrap failed, falling back to direct xatlas");
-        }
+        if (status != TRELLIS_STATUS_NOT_IMPLEMENTED) return status;
+        TRELLIS_INFO("glTF export: connected chart split unavailable, using direct xatlas");
     }
 #endif
     return unwrap_mesh_xatlas_direct(mesh, texture_size, out);

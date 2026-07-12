@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 6) readonly buffer SrcBase { uint src_base[]; };
+layout(std430, binding = 7) readonly buffer SrcMr { uint src_mr[]; };
+layout(std430, binding = 8) buffer DstBase { uint dst_base[]; };
+layout(std430, binding = 9) buffer DstMr { uint dst_mr[]; };
+
+layout(push_constant) uniform Push {
+    uint texture_size;
+    uint triangle_count;
+    uint voxel_count;
+    uint channels;
+    uint hash_size;
+    uint resolution;
+    uint supersample_scale;
+    uint pad1;
+} pc;
+
+uvec4 unpack_rgba8(uint p) {
+    return uvec4(
+        p & 0xffu,
+        (p >> 8u) & 0xffu,
+        (p >> 16u) & 0xffu,
+        p >> 24u);
+}
+
+uint pack_rgba8(uvec4 p) {
+    return p.x | (p.y << 8u) | (p.z << 16u) | (p.w << 24u);
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.texture_size || y >= pc.texture_size) return;
+
+    uint scale = max(pc.supersample_scale, 1u);
+    uint raster_size = pc.texture_size * scale;
+    uvec4 base_sum = uvec4(0u);
+    uvec4 mr_sum = uvec4(0u);
+    uint coverage = 0u;
+    for (uint dy = 0u; dy < scale; ++dy) {
+        for (uint dx = 0u; dx < scale; ++dx) {
+            uint sx = x * scale + dx;
+            uint sy = y * scale + dy;
+            uint src_idx = sy * raster_size + sx;
+            uint packed_mr = src_mr[src_idx];
+            if ((packed_mr >> 24u) == 0u) continue;
+            base_sum += unpack_rgba8(src_base[src_idx]);
+            mr_sum += unpack_rgba8(packed_mr);
+            ++coverage;
+        }
+    }
+
+    uint dst_idx = y * pc.texture_size + x;
+    if (coverage == 0u) {
+        dst_base[dst_idx] = 0u;
+        dst_mr[dst_idx] = 0u;
+        return;
+    }
+
+    uvec4 rounding = uvec4(coverage / 2u);
+    uvec4 base_value = (base_sum + rounding) / coverage;
+    uvec4 mr_value = (mr_sum + rounding) / coverage;
+    mr_value.w = 255u;
+    dst_base[dst_idx] = pack_rgba8(base_value);
+    dst_mr[dst_idx] = pack_rgba8(mr_value);
+}
