@@ -40,8 +40,11 @@ def main() -> int:
     trellis_help = run(args.trellis2, "--help")
     require(trellis_help.returncode == 0, "TRELLIS.2 --help failed", trellis_help.stdout)
     require("TRELLIS.2 image-to-3D" in trellis_help.stdout, "wrong TRELLIS.2 banner", trellis_help.stdout)
-    require("Profile: fixed 512." in trellis_help.stdout, "TRELLIS.2 profile is not fixed", trellis_help.stdout)
-    for pixal_flag in ("--naf", "--pipeline", "--fov", "--camera-distance", "--mesh-scale"):
+    require("Profile: 512 by default; --pipeline also accepts 1024." in trellis_help.stdout,
+            "TRELLIS.2 pipeline profiles are unclear", trellis_help.stdout)
+    require("--pipeline NAME         512 (default) or 1024" in trellis_help.stdout,
+            "TRELLIS.2 is missing its pipeline option", trellis_help.stdout)
+    for pixal_flag in ("--naf", "--fov", "--camera-distance", "--mesh-scale"):
         require(pixal_flag not in trellis_help.stdout, f"TRELLIS.2 exposes {pixal_flag}", trellis_help.stdout)
 
     pixal_help = run(args.pixal3d, "--help")
@@ -58,11 +61,19 @@ def main() -> int:
     require("must be 1024_cascade or 1536_cascade" in rejected_profile.stdout,
             "Pixal3D profile error is unclear", rejected_profile.stdout)
 
+    rejected_trellis_profile = run(args.trellis2, "--pipeline", "1024_cascade")
+    require(rejected_trellis_profile.returncode == 2,
+            "TRELLIS.2 accepted a cascade pipeline", rejected_trellis_profile.stdout)
+    require("must be 512 or 1024" in rejected_trellis_profile.stdout,
+            "TRELLIS.2 profile error is unclear", rejected_trellis_profile.stdout)
+
     common = ("--dino", "unused-dino", "--image", "unused.png")
     wrong_trellis_family = run(
         args.trellis2,
         "--model",
         str(args.source_dir / "models" / "pixal3d"),
+        "--pipeline",
+        "1024",
         *common,
     )
     require(wrong_trellis_family.returncode == 1,

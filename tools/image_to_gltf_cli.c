@@ -101,7 +101,7 @@ static void usage(
         cli_model_name(model),
         pixal3d ?
             "Profile: 1024_cascade by default; --pipeline also accepts 1536_cascade." :
-            "Profile: fixed 512.",
+            "Profile: 512 by default; --pipeline also accepts 1024.",
         cli_model_name(model));
     if (pixal3d) {
         fputs(
@@ -112,6 +112,11 @@ static void usage(
             "  --camera-distance X     Projection distance; 0 derives it from FOV and mesh scale\n"
             "  --mesh-scale X          Projection-space mesh scale, default 1\n"
             "  --max-num-tokens N      Cascade token budget hint, default 49152\n",
+            out);
+    } else {
+        fputs(
+            "\nTRELLIS.2 options:\n"
+            "  --pipeline NAME         512 (default) or 1024\n",
             out);
     }
 }
@@ -203,7 +208,7 @@ int trellis_image_to_gltf_cli_main(
     options.structured_latent_steps = 12;
     options.latent_size = 16;
     options.pipeline_type = pixal3d ? "1024_cascade" : "512";
-    options.resolution = 1024;
+    options.resolution = pixal3d ? 1024 : 512;
     options.cond_resolution = 512;
     options.sparse_resolution = 32;
     options.seed = 1u;
@@ -284,8 +289,9 @@ int trellis_image_to_gltf_cli_main(
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.model_cache_budget_mib)) goto bad_args;
         } else if (strcmp(argv[i], "--backend") == 0) {
             options.backend = arg_value(argc, argv, &i);
-        } else if (pixal3d && strcmp(argv[i], "--pipeline") == 0) {
+        } else if (strcmp(argv[i], "--pipeline") == 0) {
             options.pipeline_type = arg_value(argc, argv, &i);
+            if (options.pipeline_type == NULL) goto bad_args;
         } else if (strcmp(argv[i], "--ggml-backend") == 0 || strcmp(argv[i], "--sparse-backend") == 0 ||
                    strcmp(argv[i], "--ggml-device") == 0) {
             fprintf(stderr, "%s is no longer supported; use --backend with a binary built for cuda or vulkan\n", argv[i]);
@@ -369,6 +375,14 @@ int trellis_image_to_gltf_cli_main(
         strcmp(options.pipeline_type, "1536_cascade") != 0) {
         TRELLIS_ERROR(
             "Pixal3D --pipeline must be 1024_cascade or 1536_cascade, got '%s'",
+            options.pipeline_type);
+        goto bad_args;
+    }
+    if (!pixal3d &&
+        strcmp(options.pipeline_type, "512") != 0 &&
+        strcmp(options.pipeline_type, "1024") != 0) {
+        TRELLIS_ERROR(
+            "TRELLIS.2 --pipeline must be 512 or 1024, got '%s'",
             options.pipeline_type);
         goto bad_args;
     }

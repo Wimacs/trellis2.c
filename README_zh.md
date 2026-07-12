@@ -100,11 +100,13 @@ Linux：
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
   --image example_image/T.png \
+  --pipeline 1024 \
   --gltf output.glb
 ```
 
-TRELLIS.2 命令固定使用 512 profile，并会在读取图片和初始化 GPU 前拒绝
-Pixal3D 模型包。Pixal3D 默认使用 `1024_cascade`，命令为：
+TRELLIS.2 命令默认使用 512 profile，并支持通过 `--pipeline 1024` 直接进行
+1024 分辨率生成；它会在读取图片和初始化 GPU 前拒绝 Pixal3D 模型包。
+Pixal3D 默认使用 `1024_cascade`，命令为：
 
 ```sh
 ./build/pixal3d-image-to-gltf \
@@ -115,8 +117,8 @@ Pixal3D 模型包。Pixal3D 默认使用 `1024_cascade`，命令为：
 ```
 
 Pixal3D 专用命令提供 `--naf`、`--fov`、`--camera-distance`、
-`--mesh-scale` 和 `--pipeline 1536_cascade`；这些参数不会出现在 TRELLIS.2
-命令中。两个命令共享底层 task、算子、vkmesh 补洞和 remesh 实现。
+`--mesh-scale` 和 cascade pipeline；TRELLIS.2 的 `--pipeline` 仅接受
+`512` 或 `1024`。两个命令共享底层 task、算子、vkmesh 补洞和 remesh 实现。
 
 ### TokenSkin 网格权重绑定
 

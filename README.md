@@ -105,11 +105,13 @@ Linux:
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image example_image/T.png \
+  --pipeline 1024 \
   --gltf output.glb
 ```
 
-The TRELLIS.2 executable is fixed to the 512 profile. It rejects Pixal3D model
-packages before loading the image or initializing a GPU. Both model CLIs use
+The TRELLIS.2 executable defaults to the `512` profile and accepts
+`--pipeline 1024` for direct 1024-resolution generation. It rejects Pixal3D
+model packages before loading the image or initializing a GPU. Both model CLIs use
 vkmesh for hole filling and remeshing, with simplification disabled by default.
 For opaque input, both also use an auto-discovered BiRefNet model when available;
 Pixal3D requires it, while TRELLIS.2 can still run without it.

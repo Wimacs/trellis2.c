@@ -32,6 +32,7 @@ weights folder in the window, or pass it up front:
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image ../assets/example_image/T.png \
+  --pipeline 1024 \
   --gltf benchmark_outputs/output.glb
 ```
 
@@ -40,7 +41,8 @@ structured-latent shape flow, shape decode, texture decode, TRELLIS topology
 postprocess, and writes a GLB or glTF in one command. It does not open raylib.
 Sparse coords and DINO condition data are passed directly in memory, so no stage
 handoff files are written by default. This executable is pinned to the
-TRELLIS.2 family and the `512` profile; a Pixal3D package is rejected before
+TRELLIS.2 family, defaults to the `512` profile, and accepts `--pipeline 1024`
+for direct 1024-resolution generation; a Pixal3D package is rejected before
 image loading or GPU initialization. It uses vkmesh remesh postprocess without
 simplification. If no output path is passed, it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
