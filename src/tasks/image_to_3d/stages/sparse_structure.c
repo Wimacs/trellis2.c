@@ -23,27 +23,6 @@ static void trellis_perf_stage_log(const char * name, int64_t elapsed_us) {
         elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000.0);
 }
 
-static int choose_path(
-    const char * model_dir,
-    const char * rel,
-    char * dst,
-    size_t dst_size) {
-    trellis_status status = trellis_make_model_path(model_dir, rel, dst, dst_size);
-    if (status != TRELLIS_STATUS_OK) {
-        fprintf(stderr, "path: %s\n", trellis_status_string(status));
-        return 0;
-    }
-    return 1;
-}
-
-static int make_join_path(const char * dir, const char * file, char * dst, size_t dst_size) {
-    if (dir == NULL || file == NULL || dst == NULL || dst_size == 0) {
-        return 0;
-    }
-    int n = snprintf(dst, dst_size, "%s/%s", dir, file);
-    return n >= 0 && (size_t) n < dst_size;
-}
-
 static int collect_voxel_coords_xyz(
     const float * logits,
     int resolution,
@@ -208,118 +187,11 @@ static void token_channels_to_ncdhw(
     }
 }
 
-static int load_sparse_structure_flow(
-    const trellis_backend_context * backend,
-    const char * model_dir,
-    const char * override_path,
-    trellis_tensor_store * store,
-    trellis_dit_flow_model * model) {
-    char path[4096];
-    if (override_path != NULL && override_path[0] != '\0') {
-        const int length = snprintf(path, sizeof(path), "%s", override_path);
-        if (length < 0 || (size_t) length >= sizeof(path)) return 0;
-    } else if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
-        return 0;
-    }
-    if (!trellis_load_tensor_store(
-            backend,
-            "sparse-structure flow",
-            path,
-            true,
-            64,
-            store,
-            NULL)) {
-        return 0;
-    }
-    char issue[256];
-    trellis_status status = trellis_ss_flow_model_bind_weights(store, model, issue, sizeof(issue));
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("sparse-structure flow: bind failed: %s%s%s",
-            trellis_status_string(status), issue[0] == '\0' ? "" : " ", issue);
-        trellis_tensor_store_free(store);
-        return 0;
-    }
-    TRELLIS_INFO("sparse-structure flow: ready blocks=%d channels=%d",
-        model->base.n_blocks, model->base.in_channels);
-    if (model->projection.enabled) {
-        TRELLIS_INFO(
-            "sparse-structure flow: Pixal3D projection channels=%d",
-            model->projection.proj_channels);
-    }
-    return 1;
-}
-
-static int load_sparse_structure_decoder(
-    const trellis_backend_context * backend,
-    const char * model_dir,
-    const char * override_path,
-    trellis_tensor_store * store,
-    trellis_ss_decoder_weights * weights) {
-    char path[4096];
-    if (override_path != NULL && override_path[0] != '\0') {
-        const int length = snprintf(path, sizeof(path), "%s", override_path);
-        if (length < 0 || (size_t) length >= sizeof(path)) return 0;
-    } else if (!choose_path(model_dir, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path))) {
-        return 0;
-    }
-    if (!trellis_load_tensor_store(
-            backend,
-            "sparse-structure decoder",
-            path,
-            false,
-            64,
-            store,
-            NULL)) {
-        return 0;
-    }
-    char issue[256];
-    trellis_status status = trellis_ss_decoder_bind_weights(store, weights, issue, sizeof(issue));
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("sparse-structure decoder: bind failed: %s%s%s",
-            trellis_status_string(status), issue[0] == '\0' ? "" : " ", issue);
-        trellis_tensor_store_free(store);
-        return 0;
-    }
-    TRELLIS_INFO("sparse-structure decoder: ready");
-    return 1;
-}
-
-static int load_sparse_structure_dino(
-    const trellis_backend_context * backend,
-    const char * dino_dir,
-    trellis_tensor_store * store,
-    trellis_dino_vit_weights * weights);
-
 static int copy_tensor_f32(const struct ggml_tensor * tensor, float * dst, size_t count) {
     if (tensor == NULL || dst == NULL || count > (size_t) ggml_nelements(tensor)) {
         return 0;
     }
     ggml_backend_tensor_get(tensor, dst, 0, count * sizeof(float));
-    return 1;
-}
-
-static int load_sparse_structure_dino(
-    const trellis_backend_context * backend,
-    const char * dino_dir,
-    trellis_tensor_store * store,
-    trellis_dino_vit_weights * weights) {
-    char path[4096];
-    if (!make_join_path(dino_dir, "model.safetensors", path, sizeof(path))) {
-        TRELLIS_ERROR("sparse structure: invalid dino model path");
-        return 0;
-    }
-    if (!trellis_load_tensor_store(backend, "sparse-structure dino image encoder", path, true, 64, store, NULL)) {
-        return 0;
-    }
-    char issue[256];
-    trellis_status status = trellis_dino_vit_bind_weights(store, weights, issue, sizeof(issue));
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("sparse-structure dino image encoder: bind failed: %s%s%s",
-            trellis_status_string(status), issue[0] == '\0' ? "" : " ", issue);
-        trellis_tensor_store_free(store);
-        return 0;
-    }
-    TRELLIS_INFO("sparse-structure dino image encoder: ready");
     return 1;
 }
 
@@ -565,10 +437,9 @@ static int run_dino_condition(
     int foreground_alpha_threshold,
     float foreground_crop_scale,
     float ** guide_out,
-    const trellis_dino_vit_weights * preloaded_dino,
     float ** context_out,
     int * cond_tokens_out) {
-    if (backend == NULL || dino_dir == NULL || image_path == NULL ||
+    if (backend == NULL || cache == NULL || dino_dir == NULL || image_path == NULL ||
         cond_resolution <= 0 || context_out == NULL || cond_tokens_out == NULL) {
         return 0;
     }
@@ -576,31 +447,18 @@ static int run_dino_condition(
     *cond_tokens_out = 0;
     if (guide_out != NULL) *guide_out = NULL;
 
-    trellis_tensor_store dino_store;
-    memset(&dino_store, 0, sizeof(dino_store));
-    trellis_dino_vit_weights dino_local;
-    const trellis_dino_vit_weights * dino = preloaded_dino;
-    int owns_dino_store = 0;
+    const trellis_dino_vit_weights * dino = NULL;
     int rc = 0;
     float * image = NULL;
     float * output_tokens = NULL;
 
-    if (dino == NULL) {
-        if (cache != NULL) {
-            const trellis_dino_vit_weights * cached_dino = NULL;
-            trellis_status status = trellis_pipeline_model_cache_get_dino(cache, dino_dir, &cached_dino);
-            if (status != TRELLIS_STATUS_OK) {
-                TRELLIS_ERROR("sparse-structure dino image encoder: cache load failed: %s", trellis_status_string(status));
-                goto cleanup;
-            }
-            dino = cached_dino;
-        } else {
-            if (!load_sparse_structure_dino(backend, dino_dir, &dino_store, &dino_local)) {
-                goto cleanup;
-            }
-            dino = &dino_local;
-            owns_dino_store = 1;
-        }
+    trellis_status load_status =
+        trellis_pipeline_model_cache_get_dino(cache, dino_dir, &dino);
+    if (load_status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "sparse-structure dino image encoder: load failed: %s",
+            trellis_status_string(load_status));
+        goto cleanup;
     }
     if (cond_resolution % dino->patch_size != 0) {
         fprintf(stderr, "sparse structure: --cond-resolution must be divisible by DINO patch size %d\n", dino->patch_size);
@@ -654,9 +512,6 @@ cleanup:
     free(image);
     free(guide);
     free(output_tokens);
-    if (owns_dino_store) {
-        trellis_tensor_store_free(&dino_store);
-    }
     return rc;
 }
 
@@ -683,6 +538,7 @@ static int run_sparse_structure_image(
     float camera_distance,
     float mesh_scale,
     trellis_pipeline_model_cache * cache,
+    int transient_cache,
     trellis_sparse_structure_result * result) {
     if (result != NULL) {
         memset(result, 0, sizeof(*result));
@@ -715,7 +571,6 @@ static int run_sparse_structure_image(
             0,
             0.0f,
             NULL,
-            NULL,
             &context,
             &cond_tokens)) {
         free(context);
@@ -724,19 +579,19 @@ static int run_sparse_structure_image(
     char dino_perf_name[64];
     snprintf(dino_perf_name, sizeof(dino_perf_name), "dino_cond_%d", cond_resolution);
     trellis_perf_stage_log(dino_perf_name, ggml_time_us() - dino_start_us);
+    trellis_pipeline_model_cache_unpin_all(cache);
+    if (transient_cache) {
+        /* Keep the no-cache path's old peak: DINO is no longer needed once
+         * its host conditioning tensors have been produced. */
+        trellis_pipeline_model_cache_evict_unpinned(cache);
+    }
 
-    trellis_tensor_store flow_store;
-    trellis_tensor_store decoder_store;
-    memset(&flow_store, 0, sizeof(flow_store));
-    memset(&decoder_store, 0, sizeof(decoder_store));
     trellis_dit_flow_weights flow;
     trellis_dit_flow_model flow_model;
     trellis_ss_decoder_weights decoder;
     memset(&flow, 0, sizeof(flow));
     memset(&flow_model, 0, sizeof(flow_model));
     memset(&decoder, 0, sizeof(decoder));
-    int owns_flow_store = 0;
-    int owns_decoder_store = 0;
     trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
     memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
@@ -760,35 +615,23 @@ static int run_sparse_structure_image(
     int64_t voxel_decode_us = 0;
     trellis_status status = TRELLIS_STATUS_OK;
 
-    if (cache != NULL) {
-        const trellis_dit_flow_model * cached_flow = NULL;
-        const trellis_ss_decoder_weights * cached_decoder = NULL;
-        status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(
-            cache, model_dir, flow_path, &cached_flow);
-        if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("sparse-structure flow: cache load failed: %s", trellis_status_string(status));
-            goto cleanup;
-        }
-        status = trellis_pipeline_model_cache_get_sparse_structure_decoder(
-            cache, model_dir, decoder_path, &cached_decoder);
-        if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("sparse-structure decoder: cache load failed: %s", trellis_status_string(status));
-            goto cleanup;
-        }
-        flow_model = *cached_flow;
-        flow = flow_model.base;
-        decoder = *cached_decoder;
-    } else {
-        if (!load_sparse_structure_flow(backend, model_dir, flow_path, &flow_store, &flow_model)) {
-            goto cleanup;
-        }
-        flow = flow_model.base;
-        owns_flow_store = 1;
-        if (!load_sparse_structure_decoder(backend, model_dir, decoder_path, &decoder_store, &decoder)) {
-            goto cleanup;
-        }
-        owns_decoder_store = 1;
+    const trellis_dit_flow_model * cached_flow = NULL;
+    const trellis_ss_decoder_weights * cached_decoder = NULL;
+    status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(
+        cache, model_dir, flow_path, &cached_flow);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("sparse-structure flow: load failed: %s", trellis_status_string(status));
+        goto cleanup;
     }
+    status = trellis_pipeline_model_cache_get_sparse_structure_decoder(
+        cache, model_dir, decoder_path, &cached_decoder);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("sparse-structure decoder: load failed: %s", trellis_status_string(status));
+        goto cleanup;
+    }
+    flow_model = *cached_flow;
+    flow = flow_model.base;
+    decoder = *cached_decoder;
     if (flow_blocks_override >= 0) {
         if (flow_blocks_override > flow.n_blocks) {
             fprintf(stderr, "sparse structure: --flow-blocks %d exceeds checkpoint blocks %d\n",
@@ -1189,12 +1032,6 @@ cleanup:
     free(sin_phase);
     trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
-    if (owns_decoder_store) {
-        trellis_tensor_store_free(&decoder_store);
-    }
-    if (owns_flow_store) {
-        trellis_tensor_store_free(&flow_store);
-    }
     return rc;
 }
 
@@ -1207,6 +1044,19 @@ trellis_status trellis_pipeline_run_sparse_structure(
     const trellis_backend_context * backend = options->backend != NULL ? options->backend : options->cuda;
     if (backend == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_pipeline_model_cache local_cache;
+    memset(&local_cache, 0, sizeof(local_cache));
+    trellis_pipeline_model_cache * cache = options->cache;
+    int owns_cache = 0;
+    if (cache == NULL) {
+        trellis_status cache_status =
+            trellis_pipeline_model_cache_init(&local_cache, backend, 0, 0);
+        if (cache_status != TRELLIS_STATUS_OK) {
+            return cache_status;
+        }
+        cache = &local_cache;
+        owns_cache = 1;
     }
     trellis_ggml_attention_policy attention_policy = options->attention_policy;
     if (!trellis_ggml_attention_policy_is_valid(&attention_policy)) {
@@ -1238,8 +1088,10 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->camera_angle_x,
         options->camera_distance,
         options->mesh_scale,
-        options->cache,
+        cache,
+        owns_cache,
         result);
+    if (owns_cache) trellis_pipeline_model_cache_free(&local_cache);
     return rc == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
 }
 
@@ -1350,40 +1202,22 @@ static trellis_status run_pixal_naf_high_projection(
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
 
-    trellis_tensor_store naf_store;
-    trellis_pixal_naf_ggml_weights naf_weights;
-    memset(&naf_store, 0, sizeof(naf_store));
-    memset(&naf_weights, 0, sizeof(naf_weights));
     trellis_status status = TRELLIS_STATUS_ERROR;
-    if (!trellis_load_tensor_store_f32(
-            backend,
-            "Pixal3D NAF image encoder",
-            naf_path,
-            false,
-            16,
-            &naf_store,
-            NULL)) {
-        goto cleanup;
-    }
-    char issue[256];
-    issue[0] = '\0';
-    status = trellis_pixal_naf_bind_ggml_weights(
-        &naf_store,
-        &naf_weights,
-        issue,
-        sizeof(issue));
+    const trellis_pixal_naf_ggml_weights * naf_weights = NULL;
+    status = trellis_pipeline_model_cache_get_pixal_naf(
+        options->cache,
+        naf_path,
+        &naf_weights);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR(
-            "Pixal3D NAF: weight bind failed: %s%s%s",
-            trellis_status_string(status),
-            issue[0] == '\0' ? "" : " ",
-            issue);
+            "Pixal3D NAF: load failed: %s",
+            trellis_status_string(status));
         goto cleanup;
     }
 
     status = trellis_pixal_naf_query_key_forward_ggml_host(
         backend,
-        &naf_weights,
+        naf_weights,
         guide_nchw,
         1,
         options->cond_resolution,
@@ -1450,16 +1284,16 @@ static trellis_status run_pixal_naf_high_projection(
     high_projected = NULL;
 
 cleanup:
-    trellis_tensor_store_free(&naf_store);
     free(high_projected);
     free(keys);
     free(queries);
     return status;
 }
 
-trellis_status trellis_pipeline_run_image_condition(
+static trellis_status run_image_condition_cached(
     const trellis_image_condition_options * options,
-    trellis_image_condition_result * result) {
+    trellis_image_condition_result * result,
+    int transient_cache) {
     if (result != NULL) {
         memset(result, 0, sizeof(*result));
     }
@@ -1491,12 +1325,17 @@ trellis_status trellis_pipeline_run_image_condition(
             options->foreground_alpha_threshold,
             options->foreground_crop_scale,
             options->projection_channels == 2048 ? &guide : NULL,
-            NULL,
             &cond,
             &cond_tokens)) {
         free(cond);
         free(guide);
         return TRELLIS_STATUS_ERROR;
+    }
+    trellis_pipeline_model_cache_unpin_all(options->cache);
+    if (transient_cache) {
+        /* NAF consumes host DINO features, so transient callers can release
+         * the DINO weights before loading the NAF encoder. */
+        trellis_pipeline_model_cache_evict_unpinned(options->cache);
     }
     if (options->projection_channels > 0) {
         const int special_tokens = 5;
@@ -1644,4 +1483,35 @@ trellis_status trellis_pipeline_run_image_condition(
     result->cond_tokens = cond_tokens;
     result->resolution = options->cond_resolution;
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_pipeline_run_image_condition(
+    const trellis_image_condition_options * options,
+    trellis_image_condition_result * result) {
+    if (result != NULL) {
+        memset(result, 0, sizeof(*result));
+    }
+    if (options == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (options->cache != NULL) {
+        return run_image_condition_cached(options, result, 0);
+    }
+    const trellis_backend_context * backend =
+        options->backend != NULL ? options->backend : options->cuda;
+    if (backend == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_pipeline_model_cache local_cache;
+    memset(&local_cache, 0, sizeof(local_cache));
+    trellis_status status =
+        trellis_pipeline_model_cache_init(&local_cache, backend, 0, 0);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+    trellis_image_condition_options cached_options = *options;
+    cached_options.cache = &local_cache;
+    status = run_image_condition_cached(&cached_options, result, 1);
+    trellis_pipeline_model_cache_free(&local_cache);
+    return status;
 }

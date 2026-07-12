@@ -5,6 +5,7 @@
 #include "trellis_ggml_layers.h"
 #include "gltf_axes.h"
 #include "../../architectures/dit_flow/projected_dit_flow.h"
+#include "../../architectures/pixal_naf/pixal_naf.h"
 
 typedef struct trellis_prepared_condition_image {
     char source_path[4096];
@@ -22,6 +23,16 @@ trellis_status trellis_pipeline_prepare_condition_image(
     int require_foreground,
     trellis_prepared_condition_image * prepared_out);
 
+trellis_status trellis_pipeline_prepare_condition_image_for_image_to_gltf(
+    const char * model_dir,
+    const char * dino_dir,
+    const char * image_path,
+    const char * birefnet_path,
+    trellis_backend_kind backend_kind,
+    int device,
+    int require_foreground,
+    trellis_prepared_condition_image * prepared_out);
+
 void trellis_pipeline_prepared_condition_image_free(
     trellis_prepared_condition_image * prepared);
 
@@ -30,6 +41,7 @@ typedef enum trellis_pipeline_cache_entry_kind {
     TRELLIS_PIPELINE_CACHE_ENTRY_DIT_FLOW = 1,
     TRELLIS_PIPELINE_CACHE_ENTRY_SS_DECODER = 2,
     TRELLIS_PIPELINE_CACHE_ENTRY_SPARSE_UNET_DECODER = 3,
+    TRELLIS_PIPELINE_CACHE_ENTRY_PIXAL_NAF = 4,
 } trellis_pipeline_cache_entry_kind;
 
 typedef struct trellis_pipeline_cache_entry {
@@ -46,6 +58,7 @@ typedef struct trellis_pipeline_cache_entry {
         trellis_dit_flow_model flow_model;
         trellis_ss_decoder_weights ss_decoder;
         trellis_sparse_unet_vae_decoder_weights sparse_unet_decoder;
+        trellis_pixal_naf_ggml_weights pixal_naf;
     } weights;
 } trellis_pipeline_cache_entry;
 
@@ -67,6 +80,7 @@ typedef struct trellis_pipeline_model_cache {
     trellis_pipeline_cache_entry texture_flow_1024;
     trellis_pipeline_cache_entry shape_decoder;
     trellis_pipeline_cache_entry texture_decoder;
+    trellis_pipeline_cache_entry pixal_naf;
 } trellis_pipeline_model_cache;
 
 trellis_status trellis_pipeline_model_cache_init(
@@ -77,6 +91,7 @@ trellis_status trellis_pipeline_model_cache_init(
 
 void trellis_pipeline_model_cache_free(trellis_pipeline_model_cache * cache);
 void trellis_pipeline_model_cache_unpin_all(trellis_pipeline_model_cache * cache);
+void trellis_pipeline_model_cache_evict_unpinned(trellis_pipeline_model_cache * cache);
 
 trellis_status trellis_pipeline_model_cache_get_dino(
     trellis_pipeline_model_cache * cache,
@@ -129,6 +144,11 @@ trellis_status trellis_pipeline_model_cache_get_texture_decoder(
     const char * model_dir,
     const char * override_path,
     const trellis_sparse_unet_vae_decoder_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_pixal_naf(
+    trellis_pipeline_model_cache * cache,
+    const char * path,
+    const trellis_pixal_naf_ggml_weights ** weights_out);
 
 typedef struct trellis_sparse_structure_result {
     int32_t * coords_bxyz; /* [n_coords, 4] = batch, x, y, z */
@@ -302,6 +322,11 @@ trellis_status trellis_pipeline_decode_shape_latent_mesh(
     trellis_sparse_c2s_guides * subs_out,
     trellis_mesh_host * mesh_out);
 
+trellis_status trellis_pipeline_decode_shape_latent_decoder_coords(
+    const trellis_pipeline_mesh_options * options,
+    int32_t ** coords_out,
+    int64_t * n_out);
+
 typedef struct trellis_pbr_voxels {
     int32_t * coords_bxyz; /* [n_coords, 4] */
     float * attrs;         /* [n_coords, channels], usually RGB metallic roughness alpha */
@@ -329,6 +354,29 @@ typedef struct trellis_pipeline_texture_options {
 trellis_status trellis_pipeline_decode_texture_latent_voxels(
     const trellis_pipeline_texture_options * options,
     trellis_pbr_voxels * voxels_out);
+
+trellis_status trellis_pipeline_dump_raw_mesh_if_requested(
+    const char * dump_dir,
+    const trellis_mesh_host * mesh);
+
+trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
+    trellis_mesh_host * mesh,
+    trellis_mesh_host * projection_mesh_out,
+    const char * vkmesh_path,
+    int decimation_target,
+    int no_simplify,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project,
+    int device,
+    int gpu_workspace_budget_mib);
+
+trellis_status trellis_pipeline_dump_material_inputs_if_requested(
+    const char * dump_dir,
+    const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
+    const trellis_pbr_voxels * voxels);
 
 trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
     const trellis_pbr_voxels * voxels,

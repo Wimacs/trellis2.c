@@ -142,13 +142,18 @@ set(TRELLIS2_C_SOURCES
     src/ops/mesh/mesh_to_flexible_dual_grid.cpp
     src/architectures/dit_flow/dit_flow.c
     src/ops/ggml/ggml_layers.c
+    src/tasks/image_to_3d/component_status.c
     src/tasks/image_to_3d/image_to_3d.c
+    src/tasks/image_to_3d/image_prepare.c
+    src/tasks/image_to_3d/mesh_postprocess.c
     src/tasks/mesh_texturing/pipeline.c
     src/tasks/image_to_3d/model_cache.c
     src/architectures/dit_flow/dit_flow_executor.c
     src/ops/sampling/flow_sampler.c
     src/ops/projection/pixal_projection.c
     src/ops/projected_attention/projected_attention.c
+    src/tasks/image_to_3d/stages/cascade_coords.c
+    src/tasks/image_to_3d/stages/latent_decode.c
     src/tasks/image_to_3d/stages/sparse_structure.c
     src/tasks/image_to_3d/stages/structured_latent.c
     src/tasks/image_to_3d/export/gltf.c
@@ -608,6 +613,14 @@ if (TRELLIS2_C_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
     target_link_libraries(trellis2_c_image_to_3d_adapter_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_image_to_3d_adapter_tests COMMAND trellis2_c_image_to_3d_adapter_tests)
+
+    add_executable(trellis2_c_image_prepare_tests
+        tests/test_image_prepare.c
+    )
+    target_include_directories(trellis2_c_image_prepare_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_image_prepare_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_image_prepare_tests COMMAND trellis2_c_image_prepare_tests)
 
     add_executable(trellis2_c_gltf_axes_tests
         tests/test_gltf_axes.c

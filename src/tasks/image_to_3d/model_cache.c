@@ -18,7 +18,7 @@ static void cache_entry_init(
 }
 
 static size_t cache_entry_count(void) {
-    return 9;
+    return 10;
 }
 
 static trellis_pipeline_cache_entry * cache_entry_at(trellis_pipeline_model_cache * cache, size_t index) {
@@ -35,6 +35,7 @@ static trellis_pipeline_cache_entry * cache_entry_at(trellis_pipeline_model_cach
         case 6: return &cache->texture_flow_1024;
         case 7: return &cache->shape_decoder;
         case 8: return &cache->texture_decoder;
+        case 9: return &cache->pixal_naf;
         default: return NULL;
     }
 }
@@ -188,17 +189,22 @@ static trellis_status cache_prepare_load(
     if (entry->loaded) {
         cache_entry_release(cache, entry);
     }
-    size_t estimate = estimate_safetensors_data_bytes(path);
+    const size_t estimate = cache->budget_bytes > 0 ?
+        estimate_safetensors_data_bytes(path) :
+        0;
     cache_evict_to_fit(cache, estimate, entry);
     trellis_status status = copy_path(entry->path, sizeof(entry->path), path);
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
-    TRELLIS_INFO(
-        "model cache: load %s estimate=%.1f MiB budget=%s",
-        entry->name,
-        bytes_to_mib(estimate),
-        cache->budget_bytes == 0 ? "unlimited" : "limited");
+    if (cache->budget_bytes == 0) {
+        TRELLIS_INFO("model cache: load %s budget=unlimited", entry->name);
+    } else {
+        TRELLIS_INFO(
+            "model cache: load %s estimate=%.1f MiB budget=limited",
+            entry->name,
+            bytes_to_mib(estimate));
+    }
     return TRELLIS_STATUS_OK;
 }
 
@@ -238,6 +244,7 @@ trellis_status trellis_pipeline_model_cache_init(
     cache_entry_init(&cache->texture_flow_1024, "texture flow 1024", TRELLIS_PIPELINE_CACHE_ENTRY_DIT_FLOW);
     cache_entry_init(&cache->shape_decoder, "shape decoder", TRELLIS_PIPELINE_CACHE_ENTRY_SPARSE_UNET_DECODER);
     cache_entry_init(&cache->texture_decoder, "texture decoder", TRELLIS_PIPELINE_CACHE_ENTRY_SPARSE_UNET_DECODER);
+    cache_entry_init(&cache->pixal_naf, "Pixal3D NAF image encoder", TRELLIS_PIPELINE_CACHE_ENTRY_PIXAL_NAF);
 
     if (use_cpu_decoder_weight_backend) {
         trellis_status status = trellis_backend_init(&cache->cpu_decoder_weight_backend, TRELLIS_BACKEND_CPU, 0);
@@ -249,7 +256,7 @@ trellis_status trellis_pipeline_model_cache_init(
         cache->owns_cpu_decoder_weight_backend = 1;
     }
     TRELLIS_INFO(
-        "model cache: enabled budget=%s decoder_weights=%s",
+        "model cache: initialized budget=%s decoder_weights=%s",
         budget_bytes == 0 ? "unlimited" : "limited",
         trellis_backend_kind_name(cache->decoder_weight_backend->kind));
     return TRELLIS_STATUS_OK;
@@ -283,11 +290,25 @@ void trellis_pipeline_model_cache_unpin_all(trellis_pipeline_model_cache * cache
     }
 }
 
+void trellis_pipeline_model_cache_evict_unpinned(trellis_pipeline_model_cache * cache) {
+    if (cache == NULL) {
+        return;
+    }
+    const size_t count = cache_entry_count();
+    for (size_t i = 0; i < count; ++i) {
+        trellis_pipeline_cache_entry * entry = cache_entry_at(cache, i);
+        if (entry != NULL && entry->loaded && !entry->pinned) {
+            cache_entry_release(cache, entry);
+        }
+    }
+}
+
 trellis_status trellis_pipeline_model_cache_get_dino(
     trellis_pipeline_model_cache * cache,
     const char * dino_dir,
     const trellis_dino_vit_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || dino_dir == NULL || dino_dir[0] == '\0' ||
+        weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -325,7 +346,7 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow_model(
     const char * model_dir,
     const char * override_path,
     const trellis_dit_flow_model ** model_out) {
-    if (model_out == NULL) {
+    if (cache == NULL || model_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *model_out = NULL;
@@ -380,7 +401,7 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
     const trellis_dit_flow_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -398,7 +419,7 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
     const char * model_dir,
     const char * override_path,
     const trellis_ss_decoder_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -445,7 +466,7 @@ trellis_status trellis_pipeline_model_cache_get_slat_flow_model(
     int resolution,
     const char * label,
     const trellis_dit_flow_model ** model_out) {
-    if (model_out == NULL) {
+    if (cache == NULL || model_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *model_out = NULL;
@@ -512,7 +533,7 @@ trellis_status trellis_pipeline_model_cache_get_slat_flow(
     int resolution,
     const char * label,
     const trellis_dit_flow_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -536,7 +557,7 @@ trellis_status trellis_pipeline_model_cache_get_shape_decoder(
     const char * model_dir,
     const char * override_path,
     const trellis_sparse_unet_vae_decoder_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -580,7 +601,7 @@ trellis_status trellis_pipeline_model_cache_get_texture_decoder(
     const char * model_dir,
     const char * override_path,
     const trellis_sparse_unet_vae_decoder_weights ** weights_out) {
-    if (weights_out == NULL) {
+    if (cache == NULL || weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
@@ -620,5 +641,51 @@ trellis_status trellis_pipeline_model_cache_get_texture_decoder(
         cache_finish_load(cache, entry);
     }
     *weights_out = &entry->weights.sparse_unet_decoder;
+    return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_pipeline_model_cache_get_pixal_naf(
+    trellis_pipeline_model_cache * cache,
+    const char * path,
+    const trellis_pixal_naf_ggml_weights ** weights_out) {
+    if (cache == NULL || path == NULL || path[0] == '\0' || weights_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *weights_out = NULL;
+    trellis_pipeline_cache_entry * entry = &cache->pixal_naf;
+    trellis_status status = cache_prepare_load(cache, entry, path);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+    if (!entry->loaded) {
+        if (!trellis_load_tensor_store_f32(
+                cache->backend,
+                "Pixal3D NAF image encoder",
+                path,
+                false,
+                16,
+                &entry->store,
+                NULL)) {
+            return TRELLIS_STATUS_ERROR;
+        }
+        char issue[256] = {0};
+        status = trellis_pixal_naf_bind_ggml_weights(
+            &entry->store,
+            &entry->weights.pixal_naf,
+            issue,
+            sizeof(issue));
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "Pixal3D NAF: weight bind failed: %s%s%s",
+                trellis_status_string(status),
+                issue[0] == '\0' ? "" : " ",
+                issue);
+            trellis_tensor_store_free(&entry->store);
+            return status;
+        }
+        TRELLIS_INFO("Pixal3D NAF image encoder: ready");
+        cache_finish_load(cache, entry);
+    }
+    *weights_out = &entry->weights.pixal_naf;
     return TRELLIS_STATUS_OK;
 }

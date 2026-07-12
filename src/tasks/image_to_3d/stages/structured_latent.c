@@ -235,73 +235,6 @@ static void fill_gaussian_latent(float * dst, size_t count, uint32_t seed) {
     }
 }
 
-static int make_slat_flow_path(
-    const char * model_dir,
-    const char * override_path,
-    trellis_model_component component,
-    int resolution,
-    char * out,
-    size_t out_size) {
-    if (override_path != NULL && override_path[0] != '\0') {
-        int n = snprintf(out, out_size, "%s", override_path);
-        return n >= 0 && (size_t) n < out_size;
-    }
-    const char * rel = NULL;
-    if (component == TRELLIS_COMPONENT_TEX_SLAT_FLOW) {
-        rel = resolution >= 1024 ?
-            "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors" :
-            "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors";
-    } else {
-        rel = resolution >= 1024 ?
-            "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors" :
-            "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors";
-    }
-    return trellis_make_model_path(model_dir, rel, out, out_size) == TRELLIS_STATUS_OK;
-}
-
-static int load_slat_flow(
-    const trellis_backend_context * backend,
-    const char * path,
-    trellis_model_component component,
-    const char * label,
-    trellis_tensor_store * store,
-    trellis_dit_flow_model * model) {
-    char load_label[128];
-    snprintf(load_label, sizeof(load_label), "structured-latent %s flow", label);
-    if (!trellis_load_tensor_store(backend, load_label, path, true, 64, store, NULL)) {
-        return 0;
-    }
-    char issue[256];
-    trellis_status status = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
-        trellis_tex_slat_flow_model_bind_weights(store, model, issue, sizeof(issue)) :
-        trellis_shape_slat_flow_model_bind_weights(store, model, issue, sizeof(issue));
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("structured-latent %s flow: bind failed: %s%s%s",
-            label,
-            trellis_status_string(status),
-            issue[0] == '\0' ? "" : " ",
-            issue);
-        trellis_tensor_store_free(store);
-        return 0;
-    }
-    TRELLIS_INFO(
-        "structured-latent %s flow: ready blocks=%d in=%d out=%d cond=%d heads=%d head_dim=%d",
-        label,
-        model->base.n_blocks,
-        model->base.in_channels,
-        model->base.out_channels,
-        model->base.cond_channels,
-        model->base.heads,
-        model->base.head_dim);
-    if (model->projection.enabled) {
-        TRELLIS_INFO(
-            "structured-latent %s flow: Pixal3D projection channels=%d",
-            label,
-            model->projection.proj_channels);
-    }
-    return 1;
-}
-
 static void cfg_rescale_combine_population_f32(
     const float * x_t,
     const float * pred_pos,
@@ -384,6 +317,18 @@ trellis_status trellis_pipeline_run_structured_latent(
     }
 
     trellis_status status = TRELLIS_STATUS_ERROR;
+    trellis_pipeline_model_cache local_cache;
+    memset(&local_cache, 0, sizeof(local_cache));
+    trellis_pipeline_model_cache * cache = options->cache;
+    int owns_cache = 0;
+    if (cache == NULL) {
+        status = trellis_pipeline_model_cache_init(&local_cache, backend, 0, 0);
+        if (status != TRELLIS_STATUS_OK) {
+            return status;
+        }
+        cache = &local_cache;
+        owns_cache = 1;
+    }
     int resolution = options->resolution > 0 ? options->resolution : 512;
     int steps = options->steps > 0 ? options->steps : 12;
     float rescale_t = options->rescale_t > 0.0f ? options->rescale_t : 3.0f;
@@ -398,14 +343,10 @@ trellis_status trellis_pipeline_run_structured_latent(
         options->normalization_key :
         (component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ? "tex_slat_normalization" : "shape_slat_normalization");
 
-    char flow_path[4096];
-    trellis_tensor_store flow_store;
     trellis_dit_flow_model flow_model;
     trellis_dit_flow_weights flow;
-    memset(&flow_store, 0, sizeof(flow_store));
     memset(&flow_model, 0, sizeof(flow_model));
     memset(&flow, 0, sizeof(flow));
-    int owns_flow_store = 0;
     trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
     memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
@@ -433,11 +374,6 @@ trellis_status trellis_pipeline_run_structured_latent(
     const float * concat_mean = options->concat_mean;
     const float * concat_std = options->concat_std;
 
-    if (!make_slat_flow_path(options->model_dir, options->flow_override_path, component, resolution, flow_path, sizeof(flow_path))) {
-        TRELLIS_ERROR("structured latent %s: failed to build flow path", label);
-        goto cleanup;
-    }
-
     TRELLIS_INFO(
         "structured latent %s: pipeline inference resolution=%d steps=%d tokens=%lld noise_seed=%u",
         label,
@@ -446,29 +382,21 @@ trellis_status trellis_pipeline_run_structured_latent(
         (long long) options->n_coords,
         (unsigned) options->noise_seed);
 
-    if (options->cache != NULL) {
-        const trellis_dit_flow_model * cached_flow = NULL;
-        status = trellis_pipeline_model_cache_get_slat_flow_model(
-            options->cache,
-            options->model_dir,
-            options->flow_override_path,
-            component,
-            resolution,
-            label,
-            &cached_flow);
-        if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("structured latent %s: cache flow load failed: %s", label, trellis_status_string(status));
-            goto cleanup;
-        }
-        flow_model = *cached_flow;
-        flow = flow_model.base;
-    } else {
-        if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow_model)) {
-            goto cleanup;
-        }
-        flow = flow_model.base;
-        owns_flow_store = 1;
+    const trellis_dit_flow_model * cached_flow = NULL;
+    status = trellis_pipeline_model_cache_get_slat_flow_model(
+        cache,
+        options->model_dir,
+        options->flow_override_path,
+        component,
+        resolution,
+        label,
+        &cached_flow);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("structured latent %s: flow load failed: %s", label, trellis_status_string(status));
+        goto cleanup;
     }
+    flow_model = *cached_flow;
+    flow = flow_model.base;
     const int state_channels = flow.out_channels;
     if (state_channels != 32 || flow.cond_channels != 1024) {
         TRELLIS_ERROR(
@@ -884,8 +812,6 @@ cleanup:
     free(sin_phase);
     trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
-    if (owns_flow_store) {
-        trellis_tensor_store_free(&flow_store);
-    }
+    if (owns_cache) trellis_pipeline_model_cache_free(&local_cache);
     return status;
 }
