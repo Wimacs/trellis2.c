@@ -57,6 +57,11 @@ static void test_descriptor_headers_and_lookup(void) {
     CHECK_TRUE(rigging != NULL);
     CHECK_TRUE(strcmp(rigging->input_kind, "mesh") == 0);
     CHECK_TRUE(strcmp(rigging->output_kind, "rigged_mesh") == 0);
+    const trellis_task_descriptor * texturing =
+        trellis_registry_find_task("mesh_texturing");
+    CHECK_TRUE(texturing != NULL);
+    CHECK_TRUE(strcmp(texturing->input_kind, "mesh+image") == 0);
+    CHECK_TRUE(strcmp(texturing->output_kind, "textured_mesh") == 0);
 }
 
 static void test_non_3d_task_fixture(void) {
@@ -110,10 +115,39 @@ static void test_tokenskin_public_options_contract(void) {
         TRELLIS_STATUS_INVALID_ARGUMENT);
 }
 
+static void test_mesh_texturing_public_options_contract(void) {
+    trellis_mesh_texturing_options options = TRELLIS_MESH_TEXTURING_OPTIONS_INIT;
+    CHECK_TRUE(options.struct_size == sizeof(options));
+    CHECK_TRUE(options.resolution == 512);
+    CHECK_TRUE(options.texture_size == 1024);
+    CHECK_TRUE(options.steps == 12);
+    CHECK_TRUE(options.seed == 42u);
+    options.model_dir = "must-not-be-opened";
+    options.dino_dir = "must-not-be-opened";
+    options.input_path = "must-not-be-opened.glb";
+    options.image_path = "must-not-be-opened.png";
+    options.output_path = "must-not-be-written.glb";
+    options.struct_size = TRELLIS_MESH_TEXTURING_OPTIONS_V1_SIZE - 1u;
+    CHECK_TRUE(trellis_pipeline_trellis2_texture_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.struct_size = TRELLIS_MESH_TEXTURING_OPTIONS_V1_SIZE;
+    options.resolution = 768;
+    CHECK_TRUE(trellis_pipeline_trellis2_texture_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.resolution = 512;
+    options.texture_size = 63;
+    CHECK_TRUE(trellis_pipeline_trellis2_texture_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.texture_size = 8193;
+    CHECK_TRUE(trellis_pipeline_trellis2_texture_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+}
+
 int main(void) {
     test_descriptor_headers_and_lookup();
     test_non_3d_task_fixture();
     test_tokenskin_public_options_contract();
+    test_mesh_texturing_public_options_contract();
     if (g_failures != 0) {
         fprintf(stderr, "%d model registry test(s) failed\n", g_failures);
         return 1;

@@ -191,6 +191,30 @@ trellis_status sparse_c2s_skip_repeat_device(
     int in_channels,
     int out_channels);
 
+/* Sparse-to-channel is the inverse layout of C2S.  Each fine row is written
+ * into the sub-voxel channel slice of its coarse parent; missing children stay
+ * zero.  The output is [n_out, 8 * in_channels]. */
+trellis_status sparse_s2c_scatter_device(
+    const float * x_dev,
+    const int32_t * parent_dev,
+    const int32_t * subidx_dev,
+    float * y_dev,
+    int64_t n_in,
+    int64_t n_out,
+    int in_channels);
+
+/* Implements S2C(x).reshape(n_out, out_channels, -1).mean(-1) without
+ * materializing the intermediate 8 * in_channels tensor. */
+trellis_status sparse_s2c_skip_mean_device(
+    const float * x_dev,
+    const int32_t * parent_dev,
+    const int32_t * subidx_dev,
+    float * y_dev,
+    int64_t n_in,
+    int64_t n_out,
+    int in_channels,
+    int out_channels);
+
 #ifdef __cplusplus
 }
 #endif

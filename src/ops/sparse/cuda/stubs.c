@@ -30,6 +30,34 @@ trellis_status trellis_sparse_unet_vae_decoder_forward_f32_host(
     return TRELLIS_STATUS_CUDA_UNAVAILABLE;
 }
 
+trellis_status trellis_sparse_unet_vae_encoder_forward_f32_host(
+    const trellis_sparse_unet_vae_encoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    int device,
+    int max_levels,
+    trellis_sparse_c2s_guides * return_subs,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out) {
+    (void) weights;
+    (void) coords;
+    (void) feats;
+    (void) n;
+    (void) device;
+    (void) max_levels;
+    if (return_subs != NULL) {
+        *return_subs = (trellis_sparse_c2s_guides) {0};
+    }
+    if (coords_out != NULL) *coords_out = NULL;
+    if (feats_out != NULL) *feats_out = NULL;
+    if (n_out != NULL) *n_out = 0;
+    if (channels_out != NULL) *channels_out = 0;
+    return TRELLIS_STATUS_CUDA_UNAVAILABLE;
+}
+
 trellis_status trellis_shape_decoder_forward_f32_host_debug(
     const trellis_shape_decoder_weights * weights,
     const int32_t * coords,

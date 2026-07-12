@@ -87,6 +87,7 @@ model-pinned entry points are:
 
 ```text
 trellis2-image-to-gltf  -> family=trellis2, profile=512
+trellis2-texture-mesh   -> family=trellis2, task=mesh_texturing
 pixal3d-image-to-gltf   -> family=pixal3d, profile=1024_cascade
 tokenskin-rig           -> family=tokenskin, task=mesh_rigging
 ```
@@ -96,7 +97,8 @@ operators.  They do not select a family from `argv[0]`, expose a `--family`
 switch, or silently dispatch from model metadata.  Their model-pinned library
 wrappers validate the package family before image loading or backend
 initialization.  A model for a different task receives another task-specific
-executable instead of adding modes to an existing tool.  TokenSkin follows
-this rule: it reuses the runtime and operators where appropriate, but its
-mesh-rigging pipeline and CLI remain separate from both image-to-3D
-executables.
+executable instead of adding modes to an existing tool. Existing-mesh
+texturing follows that rule even though it reuses TRELLIS.2 image conditioning,
+texture flow, texture decoding, and PBR export. TokenSkin likewise reuses the
+runtime and operators where appropriate, but its mesh-rigging pipeline and CLI
+remain separate from the image-to-3D and mesh-texturing executables.

@@ -82,6 +82,31 @@ entry points over `image_to_gltf_cli.c`. They call
 entry points remain for source compatibility, but there is no generic CLI that
 auto-dispatches between model families.
 
+`trellis2-texture-mesh` is the independent TRELLIS.2 existing-mesh material
+generator. It does not add a mode to either image-to-3D executable:
+
+```sh
+./build-cuda/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input outputs/vrm_meshopt_10pct.glb \
+  --image example_image/vrm.png \
+  --output outputs/vrm_textured_cuda.glb
+
+./build-vulkan/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input outputs/vrm_meshopt_10pct.glb \
+  --image example_image/vrm.png \
+  --output outputs/vrm_textured_vulkan.glb
+```
+
+Both commands default to resolution 512, 12 texture-flow steps, and 1024 PBR
+textures. Opaque images automatically run the discovered BiRefNet checkpoint;
+no backend-specific flag or foreground-preprocessing command is needed. The
+pipeline creates a new static textured GLB and therefore does not retain source
+materials, UVs, node structure, skinning, animations, or VRM extensions.
+
 TokenSkin follows the same one-model/one-executable rule with the independent
 `tokenskin-rig` mesh-rigging CLI. Convert the official TokenRig checkpoint into
 the model package once from the repository root (Python `torch` and
@@ -212,10 +237,13 @@ Pipeline code lives under `src/`:
 - `src/architectures/dit_flow/dit_flow.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition.
 - `src/architectures/sparse_structure_decoder/decoder.c`: sparse-structure VAE decoder weight binding.
 - `src/architectures/sparse_unet_decoder/decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders.
+- `src/architectures/sparse_unet_encoder/`: reusable FlexiDualGridVaeEncoder binding and CPU/Vulkan executor.
+- `src/ops/mesh/mesh_to_flexible_dual_grid.cpp`: deterministic mesh-to-Flexible-Dual-Grid conversion.
 - `src/ops/sparse/cuda/kernels.cu`: internal CUDA kernels for sparse shape decoding.
 - `src/tasks/image_to_3d/stages/sparse_structure.c`: image -> sparse coords + DINO condition.
 - `src/tasks/image_to_3d/stages/structured_latent.c`: sparse coords + condition -> shape/texture SLat.
 - `src/tasks/image_to_3d/image_to_3d.c`: image -> textured GLB/glTF orchestration.
+- `src/tasks/mesh_texturing/pipeline.c`: existing mesh + reference image -> TRELLIS.2 PBR GLB orchestration.
 - `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests.
 - `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug.
 
@@ -226,6 +254,7 @@ Debug helpers:
 - `image_to_gltf_cli.c`: shared image-to-GLB/glTF CLI implementation.
 - `trellis2_image_to_gltf.c`: Trellis2-only CLI entry point.
 - `pixal3d_image_to_gltf.c`: Pixal3D-only CLI entry point.
+- `trellis2_texture_mesh.c`: TRELLIS.2-only existing-mesh material CLI.
 - `tokenskin_rig.c`: TokenSkin-only mesh-rigging CLI entry point.
 - `convert_tokenskin_weights.py`: official TokenRig checkpoint converter.
 - `debug/trellis_infer.c`: legacy/debug sparse-structure image/DINO/flow/voxel decode CLI.

@@ -6,6 +6,25 @@
 #include "gltf_axes.h"
 #include "../../architectures/dit_flow/projected_dit_flow.h"
 
+typedef struct trellis_prepared_condition_image {
+    char source_path[4096];
+    char converted_path[4096];
+    char foreground_path[4096];
+} trellis_prepared_condition_image;
+
+trellis_status trellis_pipeline_prepare_condition_image(
+    const char * model_dir,
+    const char * dino_dir,
+    const char * image_path,
+    const char * birefnet_path,
+    trellis_backend_kind backend_kind,
+    int device,
+    int require_foreground,
+    trellis_prepared_condition_image * prepared_out);
+
+void trellis_pipeline_prepared_condition_image_free(
+    trellis_prepared_condition_image * prepared);
+
 typedef enum trellis_pipeline_cache_entry_kind {
     TRELLIS_PIPELINE_CACHE_ENTRY_DINO = 0,
     TRELLIS_PIPELINE_CACHE_ENTRY_DIT_FLOW = 1,
@@ -169,6 +188,10 @@ typedef struct trellis_image_condition_options {
     const char * image_path;
     const char * naf_path;
     int cond_resolution;
+    /* Zero keeps the image-to-3D family default. Mesh texturing uses the
+     * released pipeline's alpha > 204, crop scale 1.0 profile. */
+    int foreground_alpha_threshold;
+    float foreground_crop_scale;
     int projection_grid_resolution;
     int projection_channels;
     int naf_target_resolution;

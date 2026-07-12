@@ -123,6 +123,11 @@ static void test_repository_templates(void) {
     CHECK_TRUE(trellis_model_package_load(root, &package) == TRELLIS_STATUS_OK);
     CHECK_TRUE(strcmp(package.family, "trellis2") == 0);
     CHECK_TRUE(strcmp(package.profile, "512") == 0);
+    const trellis_model_component_instance * shape_encoder =
+        trellis_model_package_find_component(&package, "shape_encoder");
+    CHECK_TRUE(shape_encoder != NULL);
+    CHECK_TRUE(strcmp(shape_encoder->architecture, "sparse_unet_vae_encoder") == 0);
+    CHECK_TRUE(shape_encoder->execution.compute_dtype == TRELLIS_DTYPE_F32);
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "shape_flow_1024");
     CHECK_TRUE(flow != NULL && flow->execution.attention == TRELLIS_ATTENTION_FLASH);
@@ -176,6 +181,8 @@ static void test_legacy_fallback(int pixal) {
     CHECK_TRUE(package.legacy_pixal_marker_probes == 1);
     CHECK_TRUE(strcmp(package.family, pixal ? "pixal3d" : "trellis2") == 0);
     CHECK_TRUE(strcmp(package.profile, pixal ? "1024_cascade" : "512") == 0);
+    CHECK_TRUE((trellis_model_package_find_component(
+        &package, "shape_encoder") != NULL) == !pixal);
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "sparse_structure_flow");
     CHECK_TRUE(flow != NULL);

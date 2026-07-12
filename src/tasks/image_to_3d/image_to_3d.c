@@ -385,6 +385,121 @@ static trellis_status apply_birefnet_background_removal(
     return status;
 }
 
+void trellis_pipeline_prepared_condition_image_free(
+    trellis_prepared_condition_image * prepared) {
+    if (prepared == NULL) {
+        return;
+    }
+    unlink_if_set(prepared->foreground_path);
+    unlink_if_set(prepared->converted_path);
+    memset(prepared, 0, sizeof(*prepared));
+}
+
+trellis_status trellis_pipeline_prepare_condition_image(
+    const char * model_dir,
+    const char * dino_dir,
+    const char * image_path,
+    const char * birefnet_path,
+    trellis_backend_kind backend_kind,
+    int device,
+    int require_foreground,
+    trellis_prepared_condition_image * prepared_out) {
+    if (model_dir == NULL || model_dir[0] == '\0' ||
+        image_path == NULL || image_path[0] == '\0' ||
+        device < 0 || prepared_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    trellis_prepared_condition_image prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    const char * current_path = image_path;
+    trellis_status status = TRELLIS_STATUS_OK;
+
+    if (path_has_ext(image_path, "webp")) {
+        if (!trellis_make_temp_path(
+                prepared.converted_path,
+                sizeof(prepared.converted_path),
+                "trellis2_condition",
+                ".png")) {
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        TRELLIS_INFO(
+            "image prep: converting WebP -> PNG via ffmpeg: %s",
+            prepared.converted_path);
+        if (!convert_webp_to_png_ffmpeg(image_path, prepared.converted_path)) {
+            TRELLIS_ERROR(
+                "image prep: WebP conversion failed; install ffmpeg or convert the image to PNG/JPEG first");
+            trellis_pipeline_prepared_condition_image_free(&prepared);
+            return TRELLIS_STATUS_IO_ERROR;
+        }
+        current_path = prepared.converted_path;
+    }
+
+    int has_transparent_alpha = 0;
+    status = image_has_transparent_alpha(current_path, &has_transparent_alpha);
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_pipeline_prepared_condition_image_free(&prepared);
+        return status;
+    }
+
+    char discovered_birefnet[4096];
+    discovered_birefnet[0] = '\0';
+    const char * effective_birefnet =
+        birefnet_path != NULL && birefnet_path[0] != '\0' ? birefnet_path : NULL;
+    if (!has_transparent_alpha && effective_birefnet == NULL &&
+        resolve_packaged_birefnet_path(
+            model_dir,
+            dino_dir,
+            discovered_birefnet,
+            sizeof(discovered_birefnet))) {
+        effective_birefnet = discovered_birefnet;
+        TRELLIS_INFO("image prep: auto-discovered BiRefNet %s", effective_birefnet);
+    }
+    if (!has_transparent_alpha && effective_birefnet == NULL && require_foreground) {
+        TRELLIS_ERROR(
+            "image prep: opaque input requires BiRefNet; pass --birefnet FILE or set TRELLIS_BIREFNET_PATH");
+        trellis_pipeline_prepared_condition_image_free(&prepared);
+        return TRELLIS_STATUS_NOT_FOUND;
+    }
+
+    if (effective_birefnet != NULL) {
+        if (!trellis_make_temp_path(
+                prepared.foreground_path,
+                sizeof(prepared.foreground_path),
+                "trellis2_birefnet",
+                ".png")) {
+            trellis_pipeline_prepared_condition_image_free(&prepared);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        TRELLIS_INFO(
+            "image prep: running BiRefNet background removal -> %s",
+            prepared.foreground_path);
+        status = apply_birefnet_background_removal(
+            current_path,
+            effective_birefnet,
+            prepared.foreground_path,
+            backend_kind,
+            device);
+        if (status != TRELLIS_STATUS_OK) {
+            trellis_pipeline_prepared_condition_image_free(&prepared);
+            return status;
+        }
+        current_path = prepared.foreground_path;
+    }
+
+    const int n = snprintf(
+        prepared.source_path,
+        sizeof(prepared.source_path),
+        "%s",
+        current_path);
+    if (n < 0 || (size_t) n >= sizeof(prepared.source_path)) {
+        trellis_pipeline_prepared_condition_image_free(&prepared);
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *prepared_out = prepared;
+    return TRELLIS_STATUS_OK;
+}
+
 static int mkdir_p(const char * path) {
     return trellis_mkdir_p(path);
 }

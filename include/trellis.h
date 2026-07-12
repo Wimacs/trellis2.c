@@ -436,6 +436,9 @@ typedef struct trellis_sparse_unet_vae_decoder_convnext_block_weights {
     int channels;
 } trellis_sparse_unet_vae_decoder_convnext_block_weights;
 
+typedef trellis_sparse_unet_vae_decoder_convnext_block_weights
+    trellis_sparse_unet_convnext_block_weights;
+
 typedef struct trellis_sparse_unet_vae_decoder_c2s_block_weights {
     const float * norm1_gamma;
     const float * norm1_beta;
@@ -549,6 +552,79 @@ trellis_status trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
     const float * feats,
     int64_t n,
     const trellis_sparse_unet_vae_decoder_forward_options * options,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out);
+
+#define TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS 5
+#define TRELLIS_SPARSE_UNET_VAE_ENCODER_MAX_BLOCKS 16
+#define TRELLIS_SPARSE_UNET_VAE_ENCODER_DOWN_LEVELS (TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS - 1)
+
+typedef trellis_sparse_unet_convnext_block_weights
+    trellis_sparse_unet_vae_encoder_convnext_block_weights;
+
+typedef struct trellis_sparse_unet_vae_encoder_s2c_block_weights {
+    const float * norm1_gamma;
+    const float * norm1_beta;
+    const float * conv1_w;
+    const float * conv1_b;
+    const float * conv2_w;
+    const float * conv2_b;
+    int in_channels;
+    int out_channels;
+} trellis_sparse_unet_vae_encoder_s2c_block_weights;
+
+typedef struct trellis_sparse_unet_vae_encoder_weights {
+    const float * input_w;
+    const float * input_b;
+    const float * to_latent_w;
+    const float * to_latent_b;
+    int in_channels;
+    int latent_channels;
+    int levels;
+    int channels[TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS];
+    int blocks_per_level[TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS];
+    trellis_sparse_unet_vae_encoder_convnext_block_weights
+        blocks[TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS][TRELLIS_SPARSE_UNET_VAE_ENCODER_MAX_BLOCKS];
+    trellis_sparse_unet_vae_encoder_s2c_block_weights
+        down_blocks[TRELLIS_SPARSE_UNET_VAE_ENCODER_DOWN_LEVELS];
+} trellis_sparse_unet_vae_encoder_weights;
+
+trellis_status trellis_sparse_unet_vae_encoder_bind_weights(
+    trellis_tensor_store * store,
+    trellis_sparse_unet_vae_encoder_weights * weights,
+    char * first_issue,
+    size_t first_issue_size);
+
+typedef struct trellis_sparse_unet_vae_encoder_forward_options {
+    trellis_sparse_backend_kind backend_kind;
+    int device;
+    int max_levels;
+    void * sparse_backend;
+    trellis_sparse_c2s_guides * return_subs;
+} trellis_sparse_unet_vae_encoder_forward_options;
+
+trellis_status trellis_sparse_unet_vae_encoder_forward_backend_f32_host(
+    const trellis_sparse_unet_vae_encoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    const trellis_sparse_unet_vae_encoder_forward_options * options,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out);
+
+/* CUDA implementation is provided by the CUDA sparse backend. */
+trellis_status trellis_sparse_unet_vae_encoder_forward_f32_host(
+    const trellis_sparse_unet_vae_encoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    int device,
+    int max_levels,
+    trellis_sparse_c2s_guides * return_subs,
     int32_t ** coords_out,
     float ** feats_out,
     int64_t * n_out,
@@ -716,6 +792,43 @@ typedef struct trellis_mesh_host {
 
 void trellis_mesh_free(trellis_mesh_host * mesh);
 
+/* Options matching o-voxel's mesh_to_flexible_dual_grid conversion. The
+ * input mesh is expressed in the same coordinate system as the AABB. */
+typedef struct trellis_flexible_dual_grid_options {
+    int32_t grid_size[3];
+    float aabb_min[3];
+    float aabb_max[3];
+    float face_weight;
+    float boundary_weight;
+    float regularization_weight;
+} trellis_flexible_dual_grid_options;
+
+typedef struct trellis_flexible_dual_grid {
+    int32_t * coords;         /* [n, 4] batch,x,y,z; batch is zero */
+    float * dual_vertices;    /* [n, 3], relative to aabb_min */
+    uint8_t * intersected;    /* [n, 3] x/y/z edge-intersection flags */
+    int64_t n;
+} trellis_flexible_dual_grid;
+
+/* Initializes the TRELLIS.2 texturing defaults: a 512^3 grid over
+ * [-0.5, 0.5]^3 with QEF weights 1.0, 0.2 and 0.01. */
+void trellis_flexible_dual_grid_options_default(
+    trellis_flexible_dual_grid_options * options);
+
+/* Converts a raw triangle mesh to the Flexible Dual Grid representation used
+ * by FlexiDualGridVaeEncoder. dual_vertices use AABB-relative coordinates, so
+ * the encoder-local feature for axis a is
+ * dual_vertices[a] / voxel_size[a] - coords[a + 1]. */
+trellis_status trellis_mesh_to_flexible_dual_grid_host(
+    const float * vertices,
+    int64_t n_vertices,
+    const int32_t * faces,
+    int64_t n_faces,
+    const trellis_flexible_dual_grid_options * options,
+    trellis_flexible_dual_grid * grid_out);
+
+void trellis_flexible_dual_grid_free(trellis_flexible_dual_grid * grid);
+
 typedef struct trellis_vkmesh_postprocess_options {
     int decimation_target;       /* default 1000000 */
     int no_simplify;             /* skip simplify passes, matching vkmesh --no-simplify */
@@ -827,6 +940,42 @@ trellis_status trellis_pipeline_trellis2_image_to_gltf(
 trellis_status trellis_pipeline_pixal3d_image_to_gltf(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options);
+
+typedef struct trellis_mesh_texturing_options {
+    size_t struct_size;              /* set to sizeof(trellis_mesh_texturing_options) */
+    const char * model_dir;          /* TRELLIS.2 model package root */
+    const char * dino_dir;           /* DINOv3 image encoder directory */
+    const char * input_path;         /* source .glb/.gltf triangle mesh */
+    const char * image_path;         /* material reference image */
+    const char * output_path;        /* self-contained textured .glb */
+    const char * birefnet_path;      /* optional opaque-image foreground model override */
+    const char * encoder_path;       /* optional shape encoder checkpoint override */
+    const char * texture_flow_path;  /* optional texture SLat flow override */
+    const char * texture_decoder_path; /* optional texture decoder override */
+    const char * backend;            /* NULL uses the backend compiled into this binary */
+    int device;                      /* backend device index, default 0 */
+    int resolution;                  /* Flexible Dual Grid resolution: 512 or 1024 */
+    int texture_size;                /* output PBR texture edge, default 1024 */
+    int steps;                       /* texture flow Euler steps, default 12 */
+    uint32_t seed;                   /* texture latent noise seed, default 42 */
+    int flow_blocks_override;        /* debug: -1 runs all texture flow blocks */
+    int flow_block_parts_override;   /* debug: -1 runs each complete block */
+    int flow_no_rope;                /* debug sparse-RoPE bypass */
+    int emulate_bf16_blocks;         /* debug explicit BF16 activation round trips */
+    int no_flash_attn;               /* debug explicit-attention fallback */
+} trellis_mesh_texturing_options;
+
+#define TRELLIS_MESH_TEXTURING_OPTIONS_V1_SIZE \
+    (offsetof(trellis_mesh_texturing_options, no_flash_attn) + sizeof(int))
+#define TRELLIS_MESH_TEXTURING_OPTIONS_INIT \
+    { sizeof(trellis_mesh_texturing_options), NULL, NULL, NULL, NULL, NULL, \
+      NULL, NULL, NULL, NULL, NULL, 0, 512, 1024, 12, 42u, -1, -1, 0, 0, 0 }
+
+/* TRELLIS.2-only existing-mesh material generation. The input geometry is
+ * normalized and converted to a Flexible Dual Grid, encoded into shape SLat,
+ * then used as the concat condition for the released texture flow/decoder. */
+trellis_status trellis_pipeline_trellis2_texture_mesh(
+    const trellis_mesh_texturing_options * options);
 
 typedef struct trellis_tokenskin_rig_options {
     size_t struct_size;              /* set to sizeof(trellis_tokenskin_rig_options) */

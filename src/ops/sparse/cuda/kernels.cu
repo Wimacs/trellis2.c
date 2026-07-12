@@ -726,6 +726,61 @@ __global__ void trellis_sparse_c2s_skip_repeat_f32_kernel(
     y[row * (int64_t) out_channels + c] = x[(int64_t) p * in_channels + ic];
 }
 
+__global__ void trellis_sparse_s2c_scatter_f32_kernel(
+    const float * __restrict__ x,
+    const int32_t * __restrict__ parent,
+    const int32_t * __restrict__ subidx,
+    float * __restrict__ y,
+    int64_t n_out,
+    int in_channels,
+    int64_t total) {
+    const int64_t linear =
+        (int64_t) blockIdx.x * (int64_t) blockDim.x + (int64_t) threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+    const int channel = (int) (linear % in_channels);
+    const int64_t row = linear / in_channels;
+    const int32_t p = parent[row];
+    const int32_t s = subidx[row];
+    if (p < 0 || (int64_t) p >= n_out || s < 0 || s >= 8) {
+        return;
+    }
+    y[((int64_t) p * 8 + s) * (int64_t) in_channels + channel] = x[linear];
+}
+
+__global__ void trellis_sparse_s2c_skip_mean_f32_kernel(
+    const float * __restrict__ x,
+    const int32_t * __restrict__ parent,
+    const int32_t * __restrict__ subidx,
+    float * __restrict__ y,
+    int64_t n_out,
+    int in_channels,
+    int out_channels,
+    int reduction,
+    int groups_per_child,
+    int64_t total_groups) {
+    const int64_t linear =
+        (int64_t) blockIdx.x * (int64_t) blockDim.x + (int64_t) threadIdx.x;
+    if (linear >= total_groups) {
+        return;
+    }
+    const int group = (int) (linear % groups_per_child);
+    const int64_t row = linear / groups_per_child;
+    const int32_t p = parent[row];
+    const int32_t s = subidx[row];
+    if (p < 0 || (int64_t) p >= n_out || s < 0 || s >= 8) {
+        return;
+    }
+    const int input_base = group * reduction;
+    float sum = 0.0f;
+    for (int i = 0; i < reduction; ++i) {
+        sum += x[row * (int64_t) in_channels + input_base + i];
+    }
+    const int output_channel = s * groups_per_child + group;
+    y[(int64_t) p * out_channels + output_channel] = sum / (float) reduction;
+}
+
 __global__ void trellis_sparse_c2s_count_kernel(
     const float * __restrict__ subdiv_logits,
     int32_t * __restrict__ counts,
@@ -946,6 +1001,93 @@ trellis_status sparse_c2s_skip_repeat_device(
         out_channels,
         repeat,
         total);
+    return cuda_status_to_trellis(cudaGetLastError());
+}
+
+trellis_status sparse_s2c_scatter_device(
+    const float * x_dev,
+    const int32_t * parent_dev,
+    const int32_t * subidx_dev,
+    float * y_dev,
+    int64_t n_in,
+    int64_t n_out,
+    int in_channels) {
+    if (x_dev == NULL || parent_dev == NULL || subidx_dev == NULL || y_dev == NULL ||
+        n_in <= 0 || n_out <= 0 || in_channels <= 0 ||
+        n_in > INT64_MAX / in_channels ||
+        (uint64_t) n_out > SIZE_MAX / (8u * (size_t) in_channels * sizeof(float))) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t output_bytes =
+        (size_t) n_out * 8u * (size_t) in_channels * sizeof(float);
+    cudaError_t err = cudaMemset(y_dev, 0, output_bytes);
+    if (err != cudaSuccess) {
+        return cuda_status_to_trellis(err);
+    }
+    const int64_t total = n_in * (int64_t) in_channels;
+    const int block = 256;
+    const int64_t grid64 = (total + block - 1) / block;
+    if (grid64 > INT_MAX) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_sparse_s2c_scatter_f32_kernel<<<(int) grid64, block>>>(
+        x_dev,
+        parent_dev,
+        subidx_dev,
+        y_dev,
+        n_out,
+        in_channels,
+        total);
+    return cuda_status_to_trellis(cudaGetLastError());
+}
+
+trellis_status sparse_s2c_skip_mean_device(
+    const float * x_dev,
+    const int32_t * parent_dev,
+    const int32_t * subidx_dev,
+    float * y_dev,
+    int64_t n_in,
+    int64_t n_out,
+    int in_channels,
+    int out_channels) {
+    if (x_dev == NULL || parent_dev == NULL || subidx_dev == NULL || y_dev == NULL ||
+        n_in <= 0 || n_out <= 0 || in_channels <= 0 || out_channels <= 0 ||
+        in_channels > INT_MAX / 8 ||
+        (8 * in_channels) % out_channels != 0 ||
+        (uint64_t) n_out > SIZE_MAX / ((size_t) out_channels * sizeof(float))) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int reduction = (8 * in_channels) / out_channels;
+    if (reduction <= 0 || in_channels % reduction != 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int groups_per_child = in_channels / reduction;
+    if (groups_per_child <= 0 || n_in > INT64_MAX / groups_per_child) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t output_bytes =
+        (size_t) n_out * (size_t) out_channels * sizeof(float);
+    cudaError_t err = cudaMemset(y_dev, 0, output_bytes);
+    if (err != cudaSuccess) {
+        return cuda_status_to_trellis(err);
+    }
+    const int64_t total_groups = n_in * (int64_t) groups_per_child;
+    const int block = 256;
+    const int64_t grid64 = (total_groups + block - 1) / block;
+    if (grid64 > INT_MAX) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_sparse_s2c_skip_mean_f32_kernel<<<(int) grid64, block>>>(
+        x_dev,
+        parent_dev,
+        subidx_dev,
+        y_dev,
+        n_out,
+        in_channels,
+        out_channels,
+        reduction,
+        groups_per_child,
+        total_groups);
     return cuda_status_to_trellis(cudaGetLastError());
 }
 

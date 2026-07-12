@@ -32,6 +32,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trellis2", required=True, type=Path)
     parser.add_argument("--pixal3d", required=True, type=Path)
+    parser.add_argument("--texturing", required=True, type=Path)
     parser.add_argument("--tokenskin", required=True, type=Path)
     parser.add_argument("--source-dir", required=True, type=Path)
     args = parser.parse_args()
@@ -79,6 +80,44 @@ def main() -> int:
             "Pixal3D did not reject the TRELLIS.2 package", wrong_pixal_family.stdout)
     require("requires family 'pixal3d'" in wrong_pixal_family.stdout,
             "Pixal3D family error is unclear", wrong_pixal_family.stdout)
+
+    texturing_help = run(args.texturing, "--help")
+    require(texturing_help.returncode == 0,
+            "TRELLIS.2 mesh texturing --help failed", texturing_help.stdout)
+    require("TRELLIS.2 shape-conditioned material pipeline" in texturing_help.stdout,
+            "wrong TRELLIS.2 mesh texturing task banner", texturing_help.stdout)
+    for required_flag in ("--input", "--image", "--shape-encoder", "--texture-flow"):
+        require(required_flag in texturing_help.stdout,
+                f"TRELLIS.2 mesh texturing is missing {required_flag}",
+                texturing_help.stdout)
+    for unrelated_flag in ("--naf", "--num-beams", "--mesh-remesh"):
+        require(unrelated_flag not in texturing_help.stdout,
+                f"TRELLIS.2 mesh texturing exposes {unrelated_flag}",
+                texturing_help.stdout)
+
+    wrong_texturing_family = run(
+        args.texturing,
+        "--model",
+        str(args.source_dir / "models" / "pixal3d"),
+        "--dino",
+        "must-not-be-opened-dino",
+        "--input",
+        "must-not-be-opened.glb",
+        "--image",
+        "must-not-be-opened.png",
+        "--output",
+        "must-not-be-written.glb",
+    )
+    require(wrong_texturing_family.returncode == 1,
+            "TRELLIS.2 mesh texturing accepted the Pixal3D package",
+            wrong_texturing_family.stdout)
+    require("is not trellis2" in wrong_texturing_family.stdout,
+            "TRELLIS.2 mesh texturing family error is unclear",
+            wrong_texturing_family.stdout)
+    require("ggml_cuda_init" not in wrong_texturing_family.stdout and
+            "ggml_vulkan" not in wrong_texturing_family.stdout,
+            "TRELLIS.2 mesh texturing initialized a GPU before family rejection",
+            wrong_texturing_family.stdout)
 
     tokenskin_help = run(args.tokenskin, "--help")
     require(tokenskin_help.returncode == 0,

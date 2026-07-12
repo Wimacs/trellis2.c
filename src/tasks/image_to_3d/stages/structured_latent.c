@@ -579,16 +579,19 @@ trellis_status trellis_pipeline_run_structured_latent(
     const size_t concat_count = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
         (size_t) options->n_coords * (size_t) options->concat_channels :
         0u;
+    const int cond_only =
+        options->guidance_strength == 1.0f && options->guidance_rescale <= 0.0f;
 
-    if (options->neg_cond == NULL) {
+    if (!cond_only && options->neg_cond == NULL) {
         neg_cond = (float *) calloc(context_count, sizeof(float));
     }
-    if (flow_model.projection.enabled && options->neg_projected_cond == NULL) {
+    if (!cond_only && flow_model.projection.enabled &&
+        options->neg_projected_cond == NULL) {
         neg_projected_cond = (float *) calloc(projected_count, sizeof(float));
     }
     latent = (float *) malloc(state_count * sizeof(float));
     pred_pos = (float *) malloc(state_count * sizeof(float));
-    pred_neg = (float *) malloc(state_count * sizeof(float));
+    if (!cond_only) pred_neg = (float *) malloc(state_count * sizeof(float));
     pred = (float *) malloc(state_count * sizeof(float));
     next = (float *) malloc(state_count * sizeof(float));
     x0 = (float *) malloc(state_count * sizeof(float));
@@ -601,10 +604,12 @@ trellis_status trellis_pipeline_run_structured_latent(
     cos_phase = (float *) malloc(phase_count * sizeof(float));
     sin_phase = (float *) malloc(phase_count * sizeof(float));
     latent_out->coords_bxyz = (int32_t *) malloc((size_t) options->n_coords * 4u * sizeof(int32_t));
-    if ((options->neg_cond == NULL && neg_cond == NULL) ||
-        (flow_model.projection.enabled && options->neg_projected_cond == NULL && neg_projected_cond == NULL) ||
+    if ((!cond_only && options->neg_cond == NULL && neg_cond == NULL) ||
+        (!cond_only && flow_model.projection.enabled &&
+         options->neg_projected_cond == NULL && neg_projected_cond == NULL) ||
         latent == NULL || pred_pos == NULL ||
-        pred_neg == NULL || pred == NULL || next == NULL || x0 == NULL || denorm == NULL ||
+        (!cond_only && pred_neg == NULL) || pred == NULL || next == NULL ||
+        x0 == NULL || denorm == NULL ||
         run_input == NULL || (concat_count > 0 && concat_norm == NULL) ||
         pairs == NULL || cos_phase == NULL || sin_phase == NULL || latent_out->coords_bxyz == NULL) {
         TRELLIS_ERROR("structured latent %s: host allocation failed", label);
@@ -648,7 +653,42 @@ trellis_status trellis_pipeline_run_structured_latent(
     const float * neg_context = options->neg_cond != NULL ? options->neg_cond : neg_cond;
     const float * neg_projected_context = options->neg_projected_cond != NULL ?
         options->neg_projected_cond : neg_projected_cond;
-    if (flow_model.projection.enabled) {
+    if (cond_only) {
+        if (flow_model.projection.enabled) {
+            status = trellis_dit_flow_executor_init_single_projected_with_policy(
+                &flow_executor_cond,
+                backend,
+                &flow_model,
+                options->n_coords,
+                options->cond_tokens,
+                options->cond,
+                options->projected_cond,
+                cos_phase,
+                sin_phase,
+                &attention_policy);
+        } else {
+            status = trellis_dit_flow_executor_init_single_with_policy(
+                &flow_executor_cond,
+                backend,
+                &flow,
+                options->n_coords,
+                options->cond_tokens,
+                options->cond,
+                cos_phase,
+                sin_phase,
+                &attention_policy);
+        }
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "structured latent %s: conditional flow executor init failed: %s",
+                label,
+                trellis_status_string(status));
+            goto cleanup;
+        }
+        TRELLIS_INFO(
+            "structured latent %s: guidance=1 uses one conditional branch",
+            label);
+    } else if (flow_model.projection.enabled) {
         status = trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
             &flow_executor_cfg,
             backend,
@@ -675,45 +715,50 @@ trellis_status trellis_pipeline_run_structured_latent(
             sin_phase,
             &attention_policy);
     }
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_WARN(
-            "structured latent %s: fused CFG executor init failed (%s); falling back to one reusable batch=1 graph",
-            label,
-            trellis_status_string(status));
-        trellis_dit_flow_executor_free(&flow_executor_cfg);
-        if (flow_model.projection.enabled) {
-            status = trellis_dit_flow_executor_init_single_projected_with_policy(
-                &flow_executor_cond,
-                backend,
-                &flow_model,
-                options->n_coords,
-                options->cond_tokens,
-                options->cond,
-                options->projected_cond,
-                cos_phase,
-                sin_phase,
-                &attention_policy);
-        } else {
-            status = trellis_dit_flow_executor_init_single_with_policy(
-                &flow_executor_cond,
-                backend,
-                &flow,
-                options->n_coords,
-                options->cond_tokens,
-                options->cond,
-                cos_phase,
-                sin_phase,
-                &attention_policy);
-        }
+    if (!cond_only) {
         if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("structured latent %s: flow executor init failed: %s", label, trellis_status_string(status));
-            goto cleanup;
+            TRELLIS_WARN(
+                "structured latent %s: fused CFG executor init failed (%s); falling back to one reusable batch=1 graph",
+                label,
+                trellis_status_string(status));
+            trellis_dit_flow_executor_free(&flow_executor_cfg);
+            if (flow_model.projection.enabled) {
+                status = trellis_dit_flow_executor_init_single_projected_with_policy(
+                    &flow_executor_cond,
+                    backend,
+                    &flow_model,
+                    options->n_coords,
+                    options->cond_tokens,
+                    options->cond,
+                    options->projected_cond,
+                    cos_phase,
+                    sin_phase,
+                    &attention_policy);
+            } else {
+                status = trellis_dit_flow_executor_init_single_with_policy(
+                    &flow_executor_cond,
+                    backend,
+                    &flow,
+                    options->n_coords,
+                    options->cond_tokens,
+                    options->cond,
+                    cos_phase,
+                    sin_phase,
+                    &attention_policy);
+            }
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR(
+                    "structured latent %s: flow executor init failed: %s",
+                    label,
+                    trellis_status_string(status));
+                goto cleanup;
+            }
+            TRELLIS_INFO(
+                "structured latent %s: reusing one batch=1 executor for cond/uncond",
+                label);
+        } else {
+            use_cfg_batch = 1;
         }
-        TRELLIS_INFO(
-            "structured latent %s: reusing one batch=1 executor for cond/uncond",
-            label);
-    } else {
-        use_cfg_batch = 1;
     }
     for (int step = 0; step < steps; ++step) {
         const int64_t step_start_us = ggml_time_us();
@@ -731,7 +776,13 @@ trellis_status trellis_pipeline_run_structured_latent(
         } else {
             memcpy(run_input, latent, state_count * sizeof(float));
         }
-        if (use_cfg_batch) {
+        if (cond_only) {
+            status = trellis_dit_flow_executor_run_single(
+                &flow_executor_cond,
+                run_input,
+                t,
+                pred_pos);
+        } else if (use_cfg_batch) {
             status = trellis_dit_flow_executor_run_cfg_batch(
                 &flow_executor_cfg,
                 run_input,
@@ -769,7 +820,8 @@ trellis_status trellis_pipeline_run_structured_latent(
             goto cleanup;
         }
 
-        if (t >= options->guidance_min && t <= options->guidance_max) {
+        if (!cond_only && t >= options->guidance_min &&
+            t <= options->guidance_max) {
             cfg_rescale_combine_population_f32(
                 latent,
                 pred_pos,

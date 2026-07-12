@@ -139,9 +139,11 @@ set(TRELLIS2_C_SOURCES
     src/tasks/mesh_rigging/rigged_gltf.c
     src/tasks/mesh_rigging/pipeline.c
     src/ops/mesh/flex_dual_grid.c
+    src/ops/mesh/mesh_to_flexible_dual_grid.cpp
     src/architectures/dit_flow/dit_flow.c
     src/ops/ggml/ggml_layers.c
     src/tasks/image_to_3d/image_to_3d.c
+    src/tasks/mesh_texturing/pipeline.c
     src/tasks/image_to_3d/model_cache.c
     src/architectures/dit_flow/dit_flow_executor.c
     src/ops/sampling/flow_sampler.c
@@ -153,6 +155,9 @@ set(TRELLIS2_C_SOURCES
     src/weights/safetensors.c
     src/architectures/sparse_unet_decoder/decoder.c
     src/architectures/sparse_unet_decoder/executor.c
+    src/architectures/sparse_unet_encoder/weights.c
+    src/architectures/sparse_unet_encoder/s2c_host.c
+    src/architectures/sparse_unet_encoder/executor.c
     src/ops/sparse/trellis_sparse_cpu.c
     src/ops/sparse/trellis_pixal_naf_backend.c
     src/weights/tensor_store.c
@@ -443,8 +448,11 @@ target_include_directories(trellis2_c
         "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/stb"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/raylib/src/external"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/eigen"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
 )
+
+target_compile_features(trellis2_c PRIVATE cxx_std_17)
 
 target_link_libraries(trellis2_c PUBLIC ggml xatlas)
 if (TRELLIS2_C_BACKEND STREQUAL "cuda")
@@ -609,6 +617,14 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_gltf_axes_tests PRIVATE trellis2_c)
     add_test(NAME trellis2_c_gltf_axes_tests COMMAND trellis2_c_gltf_axes_tests)
 
+    add_executable(trellis2_c_mesh_to_flexible_dual_grid_tests
+        tests/test_mesh_to_flexible_dual_grid.c
+    )
+    target_link_libraries(trellis2_c_mesh_to_flexible_dual_grid_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_to_flexible_dual_grid_tests
+        COMMAND trellis2_c_mesh_to_flexible_dual_grid_tests)
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests
             tests/test_trellis.c
@@ -703,6 +719,19 @@ if (TRELLIS2_C_BUILD_TESTS)
         add_test(NAME trellis2_c_sparse_decoder_backend_vulkan_tests COMMAND trellis2_c_sparse_decoder_backend_tests vulkan)
         set_tests_properties(trellis2_c_sparse_decoder_backend_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
+    add_executable(trellis2_c_sparse_encoder_backend_tests
+        tests/test_sparse_encoder_backend.c
+    )
+    target_include_directories(trellis2_c_sparse_encoder_backend_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/ops")
+    target_link_libraries(trellis2_c_sparse_encoder_backend_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_sparse_encoder_backend_cpu_tests COMMAND trellis2_c_sparse_encoder_backend_tests cpu)
+    set_tests_properties(trellis2_c_sparse_encoder_backend_cpu_tests PROPERTIES SKIP_RETURN_CODE 77)
+    if (TRELLIS2_C_BACKEND STREQUAL "vulkan")
+        add_test(NAME trellis2_c_sparse_encoder_backend_vulkan_tests COMMAND trellis2_c_sparse_encoder_backend_tests vulkan)
+        set_tests_properties(trellis2_c_sparse_encoder_backend_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 if (TRELLIS2_C_BUILD_TOOLS)
@@ -761,6 +790,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
         pixal3d-image-to-gltf
         tools/pixal3d_image_to_gltf.c)
 
+    add_executable(trellis2-texture-mesh tools/trellis2_texture_mesh.c)
+    target_link_libraries(trellis2-texture-mesh PRIVATE trellis2_c ggml)
+    if (UNIX)
+        target_link_libraries(trellis2-texture-mesh PRIVATE m)
+    endif()
+
     add_executable(tokenskin-rig tools/tokenskin_rig.c)
     target_link_libraries(tokenskin-rig PRIVATE trellis2_c ggml)
     if (UNIX)
@@ -774,6 +809,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 "${CMAKE_CURRENT_LIST_DIR}/tests/test_model_cli_split.py"
                 --trellis2 $<TARGET_FILE:trellis2-image-to-gltf>
                 --pixal3d $<TARGET_FILE:pixal3d-image-to-gltf>
+                --texturing $<TARGET_FILE:trellis2-texture-mesh>
                 --tokenskin $<TARGET_FILE:tokenskin-rig>
                 --source-dir "${CMAKE_CURRENT_LIST_DIR}")
     endif()

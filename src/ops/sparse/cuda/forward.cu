@@ -1,9 +1,13 @@
 #include "trellis.h"
 #include "trellis_platform.h"
 #include "kernels.h"
+extern "C" {
+#include "../../../architectures/sparse_unet_encoder/s2c_host.h"
+}
 
 #include <cuda_runtime.h>
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,10 +15,10 @@
 
 /*
  * Network execution lives here; CUDA kernels and reusable op wrappers live in
- * src/ops/sparse/cuda/kernels.cu. The SparseUnetVaeDecoder entry point copies slat+coords
- * to CUDA, projects features, builds sparse neighbor maps, runs ConvNeXt/C2S levels,
- * then applies the final norm+linear head. The SS decoder entry point runs the
- * dense 3D VAE decode blocks and pixel-shuffle upsampling.
+ * src/ops/sparse/cuda/kernels.cu. SparseUnetVae encoder/decoder entry points copy
+ * features+coords to CUDA, build sparse neighbor maps, run ConvNeXt plus S2C/C2S
+ * levels, then apply their norm+linear heads. The SS decoder entry point runs
+ * the dense 3D VAE decode blocks and pixel-shuffle upsampling.
  */
 
 static trellis_status cuda_status_to_trellis(cudaError_t err) {
@@ -349,6 +353,200 @@ static trellis_status shape_convnext_block_device(
         *out_dev = out;
     } else {
         cudaFree(out);
+    }
+    return status;
+}
+
+static trellis_status encoder_s2c_block_device(
+    const trellis_sparse_unet_vae_encoder_s2c_block_weights * block,
+    const sparse_subm_conv3d_device * cur_conv3d,
+    const float * h_dev,
+    const int32_t * fine_coords_host,
+    int64_t n,
+    trellis_sparse_c2s_guide_level * guide_out,
+    int32_t ** coarse_coords_host_out,
+    int32_t ** coarse_coords_dev_out,
+    float ** h_dev_out,
+    sparse_subm_conv3d_device * next_conv3d_out,
+    int64_t * n_out) {
+    if (block == NULL || cur_conv3d == NULL || h_dev == NULL || fine_coords_host == NULL ||
+        coarse_coords_host_out == NULL || coarse_coords_dev_out == NULL || h_dev_out == NULL ||
+        next_conv3d_out == NULL || n_out == NULL || n <= 0 ||
+        block->in_channels <= 0 || block->out_channels <= 0 ||
+        block->in_channels > INT_MAX / 8 ||
+        block->out_channels % 8 != 0 ||
+        (8 * block->in_channels) % block->out_channels != 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *coarse_coords_host_out = NULL;
+    *coarse_coords_dev_out = NULL;
+    *h_dev_out = NULL;
+    *n_out = 0;
+    memset(next_conv3d_out, 0, sizeof(*next_conv3d_out));
+    if (guide_out != NULL) {
+        memset(guide_out, 0, sizeof(*guide_out));
+    }
+
+    const int ci = block->in_channels;
+    const int co = block->out_channels;
+    const int conv1_channels = co / 8;
+    int32_t * coarse_coords_host = NULL;
+    int32_t * parent_host = NULL;
+    int32_t * subidx_host = NULL;
+    int32_t * coarse_coords_dev = NULL;
+    int32_t * parent_dev = NULL;
+    int32_t * subidx_dev = NULL;
+    float * norm1 = NULL;
+    float * conv1 = NULL;
+    float * h_down = NULL;
+    float * skip = NULL;
+    float * norm2 = NULL;
+    float * conv2 = NULL;
+    float * out = NULL;
+    int64_t m = 0;
+    sparse_subm_conv3d_device next_conv3d;
+    memset(&next_conv3d, 0, sizeof(next_conv3d));
+
+    trellis_status status = trellis_sparse_s2c_host_build(
+        fine_coords_host,
+        n,
+        &coarse_coords_host,
+        &m,
+        &parent_host,
+        &subidx_host);
+    if (status == TRELLIS_STATUS_OK) {
+        status = malloc_copy_i32_to_device(
+            coarse_coords_host, (size_t) m * 4u, &coarse_coords_dev);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = malloc_copy_i32_to_device(parent_host, (size_t) n, &parent_dev);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = malloc_copy_i32_to_device(subidx_host, (size_t) n, &subidx_dev);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_subm_conv3d_device_build(
+            coarse_coords_dev, m, 3, 3, 3, 1, 1, 1, &next_conv3d);
+    }
+
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) n * (size_t) ci, &norm1);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) n * (size_t) conv1_channels, &conv1);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) m * (size_t) co, &h_down);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) m * (size_t) co, &skip);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) m * (size_t) co, &norm2);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) m * (size_t) co, &conv2);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) m * (size_t) co, &out);
+    }
+
+    if (status == TRELLIS_STATUS_OK) {
+        status = row_layer_norm_device(
+            h_dev, block->norm1_gamma, block->norm1_beta, norm1, n, ci, 1e-6f);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = trellis_cuda_silu_f32(norm1, norm1, (size_t) n * (size_t) ci);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_subm_conv3d_device_forward_f32(
+            cur_conv3d,
+            norm1,
+            block->conv1_w,
+            block->conv1_b,
+            conv1,
+            n,
+            ci,
+            conv1_channels);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_s2c_scatter_device(
+            conv1, parent_dev, subidx_dev, h_down, n, m, conv1_channels);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_s2c_skip_mean_device(
+            h_dev, parent_dev, subidx_dev, skip, n, m, ci, co);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = row_layer_norm_device(h_down, NULL, NULL, norm2, m, co, 1e-6f);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = trellis_cuda_silu_f32(norm2, norm2, (size_t) m * (size_t) co);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_subm_conv3d_device_forward_f32(
+            &next_conv3d,
+            norm2,
+            block->conv2_w,
+            block->conv2_b,
+            conv2,
+            m,
+            co,
+            co);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = trellis_cuda_add_f32(conv2, skip, out, (size_t) m * (size_t) co);
+    }
+
+    if (status == TRELLIS_STATUS_OK && guide_out != NULL) {
+        guide_out->coords_bxyz = (int32_t *) malloc((size_t) n * 4u * sizeof(int32_t));
+        if (guide_out->coords_bxyz == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        } else {
+            memcpy(
+                guide_out->coords_bxyz,
+                fine_coords_host,
+                (size_t) n * 4u * sizeof(int32_t));
+        }
+    }
+
+    cudaFree(parent_dev);
+    cudaFree(subidx_dev);
+    cudaFree(norm1);
+    cudaFree(conv1);
+    cudaFree(h_down);
+    cudaFree(skip);
+    cudaFree(norm2);
+    cudaFree(conv2);
+    if (status == TRELLIS_STATUS_OK) {
+        if (guide_out != NULL) {
+            guide_out->parent = parent_host;
+            guide_out->subidx = subidx_host;
+            guide_out->n_coords = n;
+            parent_host = NULL;
+            subidx_host = NULL;
+        }
+        *coarse_coords_host_out = coarse_coords_host;
+        coarse_coords_host = NULL;
+        *coarse_coords_dev_out = coarse_coords_dev;
+        coarse_coords_dev = NULL;
+        *h_dev_out = out;
+        out = NULL;
+        *next_conv3d_out = next_conv3d;
+        memset(&next_conv3d, 0, sizeof(next_conv3d));
+        *n_out = m;
+    }
+    free(coarse_coords_host);
+    free(parent_host);
+    free(subidx_host);
+    cudaFree(coarse_coords_dev);
+    cudaFree(out);
+    sparse_subm_conv3d_device_free(&next_conv3d);
+    if (status != TRELLIS_STATUS_OK && guide_out != NULL) {
+        free(guide_out->coords_bxyz);
+        free(guide_out->parent);
+        free(guide_out->subidx);
+        memset(guide_out, 0, sizeof(*guide_out));
     }
     return status;
 }
@@ -985,6 +1183,269 @@ static trellis_status sparse_unet_vae_decoder_forward_f32_host_debug(
     if (debug.manifest != NULL) {
         fclose(debug.manifest);
     }
+    if (status != TRELLIS_STATUS_OK && return_subs != NULL) {
+        trellis_sparse_c2s_guides_free(return_subs);
+    }
+    return status;
+}
+
+extern "C" trellis_status trellis_sparse_unet_vae_encoder_forward_f32_host(
+    const trellis_sparse_unet_vae_encoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    int device,
+    int max_levels,
+    trellis_sparse_c2s_guides * return_subs,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out) {
+    if (weights == NULL || coords == NULL || feats == NULL || coords_out == NULL ||
+        feats_out == NULL || n_out == NULL || channels_out == NULL || n <= 0 || device < 0 ||
+        weights->in_channels <= 0 || weights->latent_channels <= 0 ||
+        weights->input_w == NULL || weights->input_b == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *coords_out = NULL;
+    *feats_out = NULL;
+    *n_out = 0;
+    *channels_out = 0;
+    if (return_subs != NULL) {
+        memset(return_subs, 0, sizeof(*return_subs));
+    }
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        return TRELLIS_STATUS_CUDA_UNAVAILABLE;
+    }
+    const int levels = weights->levels <= 0
+        ? TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS
+        : weights->levels;
+    const int levels_to_run = max_levels <= 0 || max_levels > levels ? levels : max_levels;
+    if (levels <= 0 || levels > TRELLIS_SPARSE_UNET_VAE_ENCODER_LEVELS ||
+        levels_to_run <= 0 || levels_to_run > levels) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int down_levels_to_run = levels_to_run - 1;
+
+    const int32_t * cur_coords_host = coords;
+    int cur_coords_host_owned = 0;
+    int32_t * cur_coords_dev = NULL;
+    float * input_dev = NULL;
+    float * cur_h = NULL;
+    int64_t cur_n = n;
+    int cur_channels = weights->channels[0];
+    int output_is_posterior = 0;
+    sparse_subm_conv3d_device cur_conv3d;
+    memset(&cur_conv3d, 0, sizeof(cur_conv3d));
+
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (cur_channels <= 0) {
+        status = TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = malloc_copy_i32_to_device(coords, (size_t) n * 4u, &cur_coords_dev);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = malloc_copy_to_device(
+            feats, (size_t) n * (size_t) weights->in_channels, &input_dev);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = cuda_malloc_f32((size_t) n * (size_t) cur_channels, &cur_h);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_linear_device_cublas(
+            input_dev,
+            weights->input_w,
+            weights->input_b,
+            cur_h,
+            n,
+            weights->in_channels,
+            cur_channels);
+    }
+    cudaFree(input_dev);
+    input_dev = NULL;
+    if (status == TRELLIS_STATUS_OK) {
+        status = sparse_subm_conv3d_device_build(
+            cur_coords_dev, cur_n, 3, 3, 3, 1, 1, 1, &cur_conv3d);
+    }
+
+    for (int level = 0; status == TRELLIS_STATUS_OK && level < levels_to_run; ++level) {
+        const int level_channels = weights->channels[level];
+        const int block_count = weights->blocks_per_level[level];
+        if (level_channels <= 0 || level_channels != cur_channels ||
+            block_count < 0 || block_count > TRELLIS_SPARSE_UNET_VAE_ENCODER_MAX_BLOCKS) {
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        for (int block_index = 0;
+             status == TRELLIS_STATUS_OK && block_index < block_count;
+             ++block_index) {
+            float * next_h = NULL;
+            status = shape_convnext_block_device(
+                &weights->blocks[level][block_index],
+                &cur_conv3d,
+                cur_h,
+                cur_n,
+                NULL,
+                level,
+                block_index,
+                &next_h);
+            if (status == TRELLIS_STATUS_OK) {
+                cudaFree(cur_h);
+                cur_h = next_h;
+            }
+        }
+        if (status != TRELLIS_STATUS_OK || level >= levels_to_run - 1) {
+            break;
+        }
+
+        const trellis_sparse_unet_vae_encoder_s2c_block_weights * down =
+            &weights->down_blocks[level];
+        if (down->in_channels != cur_channels ||
+            down->out_channels != weights->channels[level + 1]) {
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        int32_t * next_coords_host = NULL;
+        int32_t * next_coords_dev = NULL;
+        float * next_h = NULL;
+        int64_t next_n = 0;
+        sparse_subm_conv3d_device next_conv3d;
+        memset(&next_conv3d, 0, sizeof(next_conv3d));
+        trellis_sparse_c2s_guide_level * guide_out = NULL;
+        if (return_subs != NULL) {
+            const int guide_level = down_levels_to_run - 1 - level;
+            guide_out = &return_subs->levels[guide_level];
+        }
+        status = encoder_s2c_block_device(
+            down,
+            &cur_conv3d,
+            cur_h,
+            cur_coords_host,
+            cur_n,
+            guide_out,
+            &next_coords_host,
+            &next_coords_dev,
+            &next_h,
+            &next_conv3d,
+            &next_n);
+        if (status == TRELLIS_STATUS_OK) {
+            if (cur_coords_host_owned) {
+                free((void *) cur_coords_host);
+            }
+            cudaFree(cur_coords_dev);
+            cudaFree(cur_h);
+            sparse_subm_conv3d_device_free(&cur_conv3d);
+            cur_coords_host = next_coords_host;
+            cur_coords_host_owned = 1;
+            cur_coords_dev = next_coords_dev;
+            cur_h = next_h;
+            cur_conv3d = next_conv3d;
+            memset(&next_conv3d, 0, sizeof(next_conv3d));
+            cur_n = next_n;
+            cur_channels = down->out_channels;
+        } else {
+            free(next_coords_host);
+            cudaFree(next_coords_dev);
+            cudaFree(next_h);
+            sparse_subm_conv3d_device_free(&next_conv3d);
+        }
+    }
+
+    if (status == TRELLIS_STATUS_OK && levels_to_run == levels) {
+        int posterior_channels = 0;
+        float * norm = NULL;
+        float * posterior = NULL;
+        if (weights->to_latent_w == NULL || weights->to_latent_b == NULL ||
+            weights->latent_channels > INT_MAX / 2) {
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+        } else {
+            posterior_channels = 2 * weights->latent_channels;
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            status = cuda_malloc_f32((size_t) cur_n * (size_t) cur_channels, &norm);
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            status = cuda_malloc_f32((size_t) cur_n * (size_t) posterior_channels, &posterior);
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            status = row_layer_norm_device(
+                cur_h, NULL, NULL, norm, cur_n, cur_channels, 1e-5f);
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            status = sparse_linear_device_cublas(
+                norm,
+                weights->to_latent_w,
+                weights->to_latent_b,
+                posterior,
+                cur_n,
+                cur_channels,
+                posterior_channels);
+        }
+        cudaFree(norm);
+        if (status == TRELLIS_STATUS_OK) {
+            cudaFree(cur_h);
+            cur_h = posterior;
+            posterior = NULL;
+            cur_channels = posterior_channels;
+            output_is_posterior = 1;
+        }
+        cudaFree(posterior);
+    }
+
+    int32_t * host_coords = NULL;
+    float * host_feats = NULL;
+    const int host_channels = output_is_posterior ? weights->latent_channels : cur_channels;
+    if (status == TRELLIS_STATUS_OK) {
+        host_coords = (int32_t *) malloc((size_t) cur_n * 4u * sizeof(int32_t));
+        host_feats = (float *) malloc(
+            (size_t) cur_n * (size_t) host_channels * sizeof(float));
+        if (host_coords == NULL || host_feats == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        memcpy(host_coords, cur_coords_host, (size_t) cur_n * 4u * sizeof(int32_t));
+        if (output_is_posterior) {
+            err = cudaMemcpy2D(
+                host_feats,
+                (size_t) host_channels * sizeof(float),
+                cur_h,
+                (size_t) cur_channels * sizeof(float),
+                (size_t) host_channels * sizeof(float),
+                (size_t) cur_n,
+                cudaMemcpyDeviceToHost);
+        } else {
+            err = cudaMemcpy(
+                host_feats,
+                cur_h,
+                (size_t) cur_n * (size_t) host_channels * sizeof(float),
+                cudaMemcpyDeviceToHost);
+        }
+        status = cuda_status_to_trellis(err);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        *coords_out = host_coords;
+        *feats_out = host_feats;
+        *n_out = cur_n;
+        *channels_out = host_channels;
+        host_coords = NULL;
+        host_feats = NULL;
+        if (return_subs != NULL) {
+            return_subs->n_levels = down_levels_to_run;
+        }
+    }
+
+    free(host_coords);
+    free(host_feats);
+    if (cur_coords_host_owned) {
+        free((void *) cur_coords_host);
+    }
+    sparse_subm_conv3d_device_free(&cur_conv3d);
+    cudaFree(cur_coords_dev);
+    cudaFree(cur_h);
     if (status != TRELLIS_STATUS_OK && return_subs != NULL) {
         trellis_sparse_c2s_guides_free(return_subs);
     }

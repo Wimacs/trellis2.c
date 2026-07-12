@@ -369,9 +369,22 @@ static float lanczos3_f32(float x) {
     return sinc_f32(x) * sinc_f32(x / 3.0f);
 }
 
+/* Pillow rounds half-integer crop coordinates to the nearest even integer.
+ * Expressing a half-integer as value / 2 keeps the texturing crop deterministic
+ * without depending on the process floating-point rounding mode. */
+static int round_half_to_even_div2(int value) {
+    int quotient = value / 2;
+    const int remainder = value % 2;
+    if (remainder != 0 && quotient % 2 != 0) {
+        quotient += remainder > 0 ? 1 : -1;
+    }
+    return quotient;
+}
+
 static int preprocess_image_for_dino(
     const char * image_path,
     int edge,
+    int foreground_alpha_threshold,
     float foreground_crop_scale,
     float ** image_out,
     float ** guide_out,
@@ -407,7 +420,11 @@ static int preprocess_image_for_dino(
 
     const float mean[3] = {0.485f, 0.456f, 0.406f};
     const float std[3] = {0.229f, 0.224f, 0.225f};
-    const int pixal_preprocess = foreground_crop_scale > 0.0f && foreground_crop_scale < 1.13f;
+    const int pixal_preprocess =
+        foreground_crop_scale > 0.0f && foreground_crop_scale < 1.13f;
+    const int reference_texturing_crop = foreground_alpha_threshold > 0;
+    const int alpha_threshold = foreground_alpha_threshold > 0 ?
+        foreground_alpha_threshold : (pixal_preprocess ? 204 : 8);
     int crop_left = 0;
     int crop_top = 0;
     int crop_w = src_w > src_h ? src_w : src_h;
@@ -420,27 +437,42 @@ static int preprocess_image_for_dino(
             if (p[3] != 255) {
                 use_alpha_composite = 1;
             }
-            if (p[3] > (pixal_preprocess ? 204 : 8)) {
+            if (p[3] > alpha_threshold) {
                 if (xx < min_x) min_x = xx;
                 if (yy < min_y) min_y = yy;
-                if (xx + 1 > max_x) max_x = xx + 1;
-                if (yy + 1 > max_y) max_y = yy + 1;
+                const int bound_x = reference_texturing_crop ? xx : xx + 1;
+                const int bound_y = reference_texturing_crop ? yy : yy + 1;
+                if (bound_x > max_x) max_x = bound_x;
+                if (bound_y > max_y) max_y = bound_y;
             }
         }
     }
     if (use_alpha_composite && max_x > min_x && max_y > min_y) {
-        const float center_x = 0.5f * (float) (min_x + max_x);
-        const float center_y = 0.5f * (float) (min_y + max_y);
         int side = max_x - min_x > max_y - min_y ? max_x - min_x : max_y - min_y;
         const float crop_scale = foreground_crop_scale > 0.0f ? foreground_crop_scale : 1.16f;
-        side = (int) floorf((float) side * crop_scale + 0.5f);
-        if (side < 1) side = 1;
         const int max_side = 2 * (src_w > src_h ? src_w : src_h);
-        if (side > max_side) side = max_side;
-        crop_left = (int) floorf(center_x - 0.5f * (float) side + 0.5f);
-        crop_top = (int) floorf(center_y - 0.5f * (float) side + 0.5f);
-        crop_w = side;
-        crop_h = side;
+        if (reference_texturing_crop) {
+            /* Match trellis2_texturing.py: inclusive max bounds, int(size),
+             * integer half-size, then Pillow's crop-coordinate rounding. */
+            side = (int) ((float) side * crop_scale);
+            if (side < 2) side = 2;
+            if (side > max_side) side = max_side;
+            side = 2 * (side / 2);
+            crop_left = round_half_to_even_div2(min_x + max_x - side);
+            crop_top = round_half_to_even_div2(min_y + max_y - side);
+            crop_w = side;
+            crop_h = side;
+        } else {
+            const float center_x = 0.5f * (float) (min_x + max_x);
+            const float center_y = 0.5f * (float) (min_y + max_y);
+            side = (int) floorf((float) side * crop_scale + 0.5f);
+            if (side < 1) side = 1;
+            if (side > max_side) side = max_side;
+            crop_left = (int) floorf(center_x - 0.5f * (float) side + 0.5f);
+            crop_top = (int) floorf(center_y - 0.5f * (float) side + 0.5f);
+            crop_w = side;
+            crop_h = side;
+        }
     } else {
         crop_left = 0;
         crop_top = 0;
@@ -451,6 +483,17 @@ static int preprocess_image_for_dino(
             crop_w = src_w > src_h ? src_w : src_h;
             crop_h = crop_w;
         }
+    }
+    if (foreground_alpha_threshold > 0 || foreground_crop_scale > 0.0f) {
+        TRELLIS_INFO(
+            "image condition: foreground crop alpha_threshold=%d scale=%.4g "
+            "rect=%d,%d %dx%d",
+            alpha_threshold,
+            foreground_crop_scale,
+            crop_left,
+            crop_top,
+            crop_w,
+            crop_h);
     }
     for (int y = 0; y < edge; ++y) {
         for (int x = 0; x < edge; ++x) {
@@ -519,6 +562,8 @@ static int run_dino_condition(
     const char * image_path,
     int cond_resolution,
     int pixal_preprocess,
+    int foreground_alpha_threshold,
+    float foreground_crop_scale,
     float ** guide_out,
     const trellis_dino_vit_weights * preloaded_dino,
     float ** context_out,
@@ -568,7 +613,9 @@ static int run_dino_condition(
     if (!preprocess_image_for_dino(
             image_path,
             cond_resolution,
-            pixal_preprocess ? 1.1f : 1.16f,
+            foreground_alpha_threshold,
+            foreground_crop_scale > 0.0f ?
+                foreground_crop_scale : (pixal_preprocess ? 1.1f : 1.16f),
             &image,
             guide_out != NULL ? &guide : NULL,
             &src_w,
@@ -665,6 +712,8 @@ static int run_sparse_structure_image(
             image_path,
             cond_resolution,
             projected_conditioning,
+            0,
+            0.0f,
             NULL,
             NULL,
             &context,
@@ -1416,6 +1465,10 @@ trellis_status trellis_pipeline_run_image_condition(
     }
     if (options == NULL || result == NULL || options->dino_dir == NULL ||
         options->image_path == NULL || options->cond_resolution <= 0 ||
+        options->foreground_alpha_threshold < 0 ||
+        options->foreground_alpha_threshold > 254 ||
+        !isfinite(options->foreground_crop_scale) ||
+        options->foreground_crop_scale < 0.0f ||
         (options->projection_channels != 0 && options->projection_channels != 1024 &&
          options->projection_channels != 2048)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1435,6 +1488,8 @@ trellis_status trellis_pipeline_run_image_condition(
             options->image_path,
             options->cond_resolution,
             options->projection_channels > 0,
+            options->foreground_alpha_threshold,
+            options->foreground_crop_scale,
             options->projection_channels == 2048 ? &guide : NULL,
             NULL,
             &cond,

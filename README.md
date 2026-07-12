@@ -16,7 +16,8 @@
 
 Native TRELLIS.2 and Pixal3D image-to-3D inference plus TokenSkin mesh rigging,
 with CUDA and Vulkan support. Each model has one family-pinned executable:
-`trellis2-image-to-gltf`, `pixal3d-image-to-gltf`, or `tokenskin-rig`.
+`trellis2-image-to-gltf`, `trellis2-texture-mesh`,
+`pixal3d-image-to-gltf`, or `tokenskin-rig`.
 
 ## Build
 
@@ -112,6 +113,40 @@ packages before loading the image or initializing a GPU. Both model CLIs use
 vkmesh for hole filling and remeshing, with simplification disabled by default.
 For opaque input, both also use an auto-discovered BiRefNet model when available;
 Pixal3D requires it, while TRELLIS.2 can still run without it.
+
+### TRELLIS.2 existing-mesh material generation
+
+`trellis2-texture-mesh` applies the released TRELLIS.2 material pipeline to an
+existing triangle mesh. It normalizes the mesh, converts it to a Flexible Dual
+Grid, runs `FlexiDualGridVaeEncoder`, conditions the texture flow on the
+resulting shape latent and reference image, then bakes base-color and metallic-
+roughness textures into a self-contained GLB.
+
+CUDA and Vulkan use the same command contract; select the executable from the
+corresponding build directory:
+
+```sh
+./build/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input input.glb \
+  --image reference.png \
+  --output textured-cuda.glb
+
+./build-vulkan/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input input.glb \
+  --image reference.png \
+  --output textured-vulkan.glb
+```
+
+The standard TRELLIS.2 download contains the shape encoder checkpoint. Opaque
+images use the same automatic BiRefNet discovery as image-to-3D, so neither a
+backend flag nor an extra preprocessing command is required. The tested default
+uses a 512 Flexible Dual Grid, 12 texture-flow steps, and 1024-pixel PBR maps.
+This task rebuilds a static textured mesh: source nodes, materials, UVs, skins,
+animations, and VRM extensions are not preserved.
 
 ### Pixal3D
 

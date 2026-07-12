@@ -40,6 +40,7 @@ static const trellis_architecture_descriptor g_architectures[] = {
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "pixal_dit_flow", "pixal3d" },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "sparse_structure_decoder", NULL },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "sparse_unet_vae_decoder", NULL },
+    { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "sparse_unet_vae_encoder", "trellis2" },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "pixal_naf", "pixal3d" },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "dinov3", NULL },
     { TRELLIS_REGISTRY_ABI_VERSION, sizeof(trellis_architecture_descriptor), "birefnet", NULL },
@@ -64,6 +65,14 @@ static const trellis_task_descriptor g_tasks[] = {
         "mesh_rigging",
         "mesh",
         "rigged_mesh",
+        0,
+    },
+    {
+        TRELLIS_REGISTRY_ABI_VERSION,
+        sizeof(trellis_task_descriptor),
+        "mesh_texturing",
+        "mesh+image",
+        "textured_mesh",
         0,
     },
     {

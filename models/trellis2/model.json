@@ -6,6 +6,15 @@
   "profile": "512",
   "components": [
     {
+      "role": "shape_encoder",
+      "architecture": "sparse_unet_vae_encoder",
+      "weights": "ckpts/shape_enc_next_dc_f16c32_fp16.safetensors",
+      "execution": {
+        "compute_dtype": "f32",
+        "attention": "none"
+      }
+    },
+    {
       "role": "sparse_structure_flow",
       "architecture": "trellis_dit_flow",
       "weights": "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
