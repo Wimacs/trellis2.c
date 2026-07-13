@@ -1196,6 +1196,28 @@ static size_t next_power_of_two_size(size_t n) {
     return p;
 }
 
+/* Bitonic sort passes recorded per submission. The full ladder is O(log2(n)^2)
+   dependent dispatches -- ~250 of them for a few million edge records -- and
+   recording all of them into one command buffer makes a single GPU job long
+   enough to overrun the kernel's compute-ring lockup timeout on a slow device,
+   which wedges the GPU and kills the display along with it. 0 keeps the whole
+   ladder in one submission. */
+#define VKMESH_DEFAULT_SORT_FLUSH_PASSES 8u
+
+static uint32_t vkmesh_resolve_sort_flush_passes(void) {
+    const char * env = getenv("TRELLIS_VKMESH_SORT_FLUSH_PASSES");
+    if (env != NULL && env[0] != '\0') {
+        int parsed = 0;
+        if (parse_int_arg(env, &parsed) && parsed >= 0) {
+            return (uint32_t) parsed;
+        }
+        fprintf(stderr,
+            "vkmesh: ignoring invalid TRELLIS_VKMESH_SORT_FLUSH_PASSES='%s'\n",
+            env);
+    }
+    return VKMESH_DEFAULT_SORT_FLUSH_PASSES;
+}
+
 static int vkmesh_sort_records_vulkan(
     vkmesh_vk * vk,
     vkmesh_vk_buffer * records,
@@ -1226,6 +1248,15 @@ static int vkmesh_sort_records_vulkan(
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     uint32_t groups = (uint32_t) ((record_count + 255u) / 256u);
+    const uint32_t flush_every = vkmesh_resolve_sort_flush_passes();
+    uint32_t recorded = 0;
+
+    VkSubmitInfo submit;
+    memset(&submit, 0, sizeof(submit));
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &vk->command_buffer;
+
     for (size_t k = 2u; k <= record_count; k <<= 1u) {
         for (size_t j = k >> 1u; j > 0u; j >>= 1u) {
             vkmesh_push push;
@@ -1240,15 +1271,20 @@ static int vkmesh_sort_records_vulkan(
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                 0, 1, &barrier, 0, NULL, 0, NULL);
+            ++recorded;
+            if (flush_every == 0 || (recorded % flush_every) != 0) continue;
+
+            /* Each pass depends on the previous one, so submitting here and
+               waiting preserves the ordering the barrier gave us. */
+            if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
+            if (!vkmesh_submit_and_wait(vk, &submit)) return 0;
+            if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
+            if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
+            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
+            vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
         }
     }
     if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
-
-    VkSubmitInfo submit;
-    memset(&submit, 0, sizeof(submit));
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &vk->command_buffer;
     return vkmesh_submit_and_wait(vk, &submit);
 }
 
@@ -5320,6 +5356,28 @@ static void vkmesh_distance_query_destroy(vkmesh_distance_query * query) {
     memset(query, 0, sizeof(*query));
 }
 
+/* The unsigned-distance shader walks the whole BVH once per query point, so a
+   batch sized only against memory (256 MiB of scratch = 13.4M points) becomes a
+   single GPU job lasting minutes on a slow device. That overruns the kernel's
+   compute-ring lockup timeout and wedges the GPU, taking the display with it on
+   a card that also drives the desktop. Bound the batch by point count as well;
+   the work is unchanged, it is just spread over more submissions. */
+#define VKMESH_DEFAULT_MAX_BATCH_POINTS (1u << 20)
+
+static size_t vkmesh_resolve_max_batch_points(void) {
+    const char * env = getenv("TRELLIS_VKMESH_MAX_BATCH_POINTS");
+    if (env != NULL && env[0] != '\0') {
+        int parsed = 0;
+        if (parse_int_arg(env, &parsed) && parsed > 0) {
+            return (size_t) parsed;
+        }
+        fprintf(stderr,
+            "vkmesh: ignoring invalid TRELLIS_VKMESH_MAX_BATCH_POINTS='%s'\n",
+            env);
+    }
+    return VKMESH_DEFAULT_MAX_BATCH_POINTS;
+}
+
 static int vkmesh_distance_query_init(
     vkmesh_distance_query * query,
     vkmesh_vk * vk,
@@ -5401,6 +5459,8 @@ static int vkmesh_distance_query_init(
     if ((uint64_t) capacity > max_dispatch_points) capacity = (size_t) max_dispatch_points;
     if (capacity > UINT32_MAX / 5u) capacity = UINT32_MAX / 5u;
     if ((uint64_t) capacity > (uint64_t) max_point_count) capacity = (size_t) max_point_count;
+    const size_t max_batch_points = vkmesh_resolve_max_batch_points();
+    if (capacity > max_batch_points) capacity = max_batch_points;
     if (capacity > 128u) capacity &= ~(size_t) 127u;
     if (capacity == 0) {
         fprintf(stderr, "vkmesh: GPU workspace budget leaves no room for distance-query batches\n");

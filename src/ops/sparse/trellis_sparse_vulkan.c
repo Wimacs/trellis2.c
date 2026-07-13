@@ -225,6 +225,19 @@ static int vk_env_disabled(const char * name) {
     return value != NULL && strcmp(value, "0") == 0;
 }
 
+static int vk_env_int(const char * name, int fallback) {
+    const char * value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
+        return fallback;
+    }
+    return (int) parsed;
+}
+
 static int vk_physical_device_has_extension(VkPhysicalDevice physical_device, const char * name) {
     if (physical_device == VK_NULL_HANDLE || name == NULL) {
         return 0;
@@ -2352,6 +2365,45 @@ static trellis_status vk_build_rulebook(
     return TRELLIS_STATUS_OK;
 }
 
+/* Submit what has been recorded so far and start a fresh command buffer.
+   Splitting one long submission into several shorter ones keeps each GPU job
+   under the kernel's per-ring lockup timeout */
+static trellis_status vk_flush_command_buffer(
+    trellis_sparse_vk_backend * vk,
+    VkCommandBuffer * command) {
+    VkResult result = vkEndCommandBuffer(*command);
+    trellis_status status = vk_status(result);
+    if (status == TRELLIS_STATUS_OK) {
+        VkSubmitInfo submit;
+        memset(&submit, 0, sizeof(submit));
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = command;
+        result = vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE);
+        status = vk_status(result);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        result = vkQueueWaitIdle(vk->queue);
+        status = vk_status(result);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        vk_reclaim_pending(vk);
+    }
+    vk_release_command_buffer(vk, *command);
+    *command = VK_NULL_HANDLE;
+    if (status == TRELLIS_STATUS_OK) {
+        status = vk_acquire_command_buffer(vk, command);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        VkCommandBufferBeginInfo begin;
+        memset(&begin, 0, sizeof(begin));
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        result = vkBeginCommandBuffer(*command, &begin);
+        status = vk_status(result);
+    }
+    return status;
+}
+
 static trellis_status vk_sparse_conv3d(
     trellis_sparse_backend * backend,
     const trellis_sparse_rulebook * rulebook,
@@ -2391,6 +2443,8 @@ static trellis_status vk_sparse_conv3d(
         vk->pipelines[SPARSE_VK_PIPE_SPARSE_CONV_OFFSET_COOP] != VK_NULL_HANDLE;
     VkPipeline conv_pipeline = vk->pipelines[
         use_coopmat ? SPARSE_VK_PIPE_SPARSE_CONV_OFFSET_COOP : SPARSE_VK_PIPE_SPARSE_CONV_OFFSET_MAT];
+    /* Kernel offsets recorded per submission; 0 keeps all 27 in one submission. */
+    const int conv_flush_every = vk_env_int("TRELLIS_VK_SPARSE_CONV_FLUSH", 0);
     trellis_status status = vk_get_weight(vk, weight, (size_t) out_channels * 27u * (size_t) in_channels, &w);
     if (status == TRELLIS_STATUS_OK) status = vk_get_weight(vk, bias, (size_t) out_channels, &b);
     if (status == TRELLIS_STATUS_OK && !use_masked_sorted && !use_masked_implicit && !use_coopmat && vk->use_sparse_conv_indirect) {
@@ -2636,6 +2690,10 @@ static trellis_status vk_sparse_conv3d(
                     &descriptor_sets[descriptor_count]);
                 if (status == TRELLIS_STATUS_OK) ++descriptor_count;
             }
+        }
+        if (status == TRELLIS_STATUS_OK && conv_flush_every > 0 && offset + 1 < 27 &&
+            (offset + 1) % conv_flush_every == 0) {
+            status = vk_flush_command_buffer(vk, &command);
         }
     }
     if (status == TRELLIS_STATUS_OK) {
