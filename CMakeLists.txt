@@ -145,6 +145,7 @@ set(TRELLIS2_C_SOURCES
     src/tasks/image_to_3d/component_status.c
     src/tasks/image_to_3d/image_to_3d.c
     src/tasks/image_to_3d/image_prepare.c
+    src/tasks/image_to_3d/shape_latent_cache.c
     src/tasks/image_to_3d/mesh_postprocess.c
     src/tasks/mesh_texturing/pipeline.c
     src/tasks/image_to_3d/model_cache.c
@@ -661,6 +662,16 @@ if (TRELLIS2_C_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
     target_link_libraries(trellis2_c_image_prepare_tests PRIVATE trellis2_c)
     add_test(NAME trellis2_c_image_prepare_tests COMMAND trellis2_c_image_prepare_tests)
+
+    add_executable(trellis2_c_shape_latent_cache_tests
+        tests/test_shape_latent_cache.c
+    )
+    target_include_directories(trellis2_c_shape_latent_cache_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_shape_latent_cache_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_shape_latent_cache_tests
+        COMMAND trellis2_c_shape_latent_cache_tests)
 
     add_executable(trellis2_c_gltf_axes_tests
         tests/test_gltf_axes.c

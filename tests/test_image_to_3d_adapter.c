@@ -239,12 +239,32 @@ static void test_model_pinned_entrypoints_reject_wrong_family(void) {
     CHECK_TRUE(
         trellis_pipeline_trellis2_image_to_gltf(&options) ==
         TRELLIS_STATUS_PARSE_ERROR);
+    trellis_image_to_gltf_feature_options feature_options =
+        TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_INIT;
+    feature_options.shape_only = 1;
+    feature_options.prepared_image_output_path = "must-not-be-written.png";
+    CHECK_TRUE(
+        trellis_pipeline_trellis2_image_to_gltf_ex(
+            &options, &feature_options) == TRELLIS_STATUS_PARSE_ERROR);
 
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
     options.model_dir = trellis_root;
     CHECK_TRUE(
         trellis_pipeline_pixal3d_image_to_gltf(&options, &pixal_options) ==
         TRELLIS_STATUS_PARSE_ERROR);
+    CHECK_TRUE(
+        trellis_pipeline_pixal3d_image_to_gltf_ex(
+            &options, &pixal_options, &feature_options) ==
+        TRELLIS_STATUS_PARSE_ERROR);
+
+    /* Pixal supports the shared shape-only and prepared-image features, but
+     * the TRELLIS.2 shape SLat cache format must still be rejected. */
+    options.model_dir = pixal_root;
+    feature_options.shape_latent_output_path = "must-not-be-written.tslat";
+    CHECK_TRUE(
+        trellis_pipeline_pixal3d_image_to_gltf_ex(
+            &options, &pixal_options, &feature_options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
 }
 
 int main(void) {

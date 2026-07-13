@@ -38,11 +38,16 @@ typedef struct trellis_mesh_rigging_dense_skin_weights {
  * reduced to its four strongest non-negative influences and renormalized;
  * an all-zero row deterministically falls back to joint zero with weight one.
  *
- * Texture coordinates, source materials/textures, morph targets, animation,
- * and arbitrary source-node properties are not present in the flattened
- * inference asset and therefore cannot be reproduced by this writer.  Every
- * primitive receives a shared opaque white, non-metallic default PBR material
- * so the resulting asset remains immediately renderable and spec-complete. */
+ * Source TEXCOORD attributes and primitive material assignments are retained.
+ * Standard glTF material, texture, sampler, and image records are copied from
+ * the source document, with image payloads embedded into the output GLB.  If
+ * the source appearance cannot be reopened or copied, the rig is still written
+ * with a shared opaque white, non-metallic material; source TEXCOORD attributes
+ * already present in the flattened asset remain intact.  Out-of-memory and
+ * core GLB output failures remain fatal.  On success error_out is empty when
+ * appearance was preserved and contains a warning when this fallback was used.
+ * Morph targets, animations, and arbitrary source-node properties are not
+ * reproduced by this flattened exporter. */
 trellis_status trellis_mesh_rigging_write_rigged_glb(
     const char * path,
     const trellis_mesh_rigging_asset * asset,

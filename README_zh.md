@@ -106,6 +106,45 @@ Linux：
 
 TRELLIS.2 命令默认使用 512 profile，并支持通过 `--pipeline 1024` 直接进行
 1024 分辨率生成；它会在读取图片和初始化 GPU 前拒绝 Pixal3D 模型包。
+
+形状生成可以和材质生成分开执行。下面的命令只生成网格，同时保存实际用于
+条件输入的去背 RGBA 图片，以及重拓扑前的 shape latent：
+
+```sh
+./build/trellis2-image-to-gltf \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image example_image/T.png \
+  --shape-only \
+  --prepared-image-output prepared.png \
+  --shape-latent-output shape.tslat \
+  --output shape.glb
+```
+
+`--shape-only` 会跳过 texture flow 和 texture decoder。`.tslat` 是与资产绑定的
+缓存，只应和同一个形状或仅修改拓扑的重拓扑版本一起保存和复用。
+
+### 为现有 TRELLIS.2 网格生成材质
+
+`trellis2-texture-mesh` 可以为现有三角网格生成 PBR 材质。没有兼容缓存时，
+它会将网格转换成 Flexible Dual Grid，再运行 `FlexiDualGridVaeEncoder`；有缓存
+时则直接复用 shape latent。之后根据参考图片生成并烘焙 base color 和
+metallic-roughness 纹理，输出自包含 GLB。
+
+```sh
+./build/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input remeshed-shape.glb \
+  --image prepared.png --image-prepared \
+  --shape-latent shape.tslat \
+  --output textured.glb
+```
+
+缓存不存在、损坏、分辨率不符或与当前网格几何不兼容时，程序会回退到重新编码
+当前网格。可使用 `--shape-latent-output FILE` 保存回退后得到的新缓存。该任务会
+重建静态纹理网格，不保留输入的节点、材质、UV、蒙皮、动画或 VRM 扩展。
+
 Pixal3D 默认使用 `1024_cascade`，命令为：
 
 ```sh
@@ -151,8 +190,10 @@ Vulkan 构建使用相同参数，不需要额外环境变量或推理选项：
 ```
 
 输入可以是 GLB 或 glTF，输出是包含骨骼、逆绑定矩阵、关节索引和蒙皮权重的
-自包含 GLB。当前实现会保留展平到世界坐标的网格几何和拓扑，但会重建默认
-PBR 材质；不会保留源材质、UV、纹理、节点结构和动画。
+自包含 GLB。当前实现会保留展平到世界坐标的网格几何、拓扑、标准 glTF PBR
+材质、UV、采样器以及图片和纹理数据；不会保留源节点结构、morph target、
+动画或 VRM 扩展。若源外观无法安全复制，仍会输出有效的绑定模型，并回退为
+不透明白色 PBR 材质。
 
 Windows：
 

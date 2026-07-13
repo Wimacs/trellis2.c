@@ -136,17 +136,18 @@ static trellis_status sparse_backend_kind_from_graph_backend(
 static trellis_status trellis_pipeline_image_to_gltf_impl(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options,
+    const trellis_image_to_gltf_feature_options * feature_options,
     const char * required_family);
 
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
-    return trellis_pipeline_image_to_gltf_impl(options, &pixal_options, NULL);
+    return trellis_pipeline_image_to_gltf_impl(options, &pixal_options, NULL, NULL);
 }
 
 trellis_status trellis_pipeline_image_to_gltf_ex(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options) {
-    return trellis_pipeline_image_to_gltf_impl(options, pixal_options, NULL);
+    return trellis_pipeline_image_to_gltf_impl(options, pixal_options, NULL, NULL);
 }
 
 trellis_status trellis_pipeline_trellis2_image_to_gltf(
@@ -155,6 +156,18 @@ trellis_status trellis_pipeline_trellis2_image_to_gltf(
     return trellis_pipeline_image_to_gltf_impl(
         options,
         &pixal_options,
+        NULL,
+        "trellis2");
+}
+
+trellis_status trellis_pipeline_trellis2_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_image_to_gltf_feature_options * feature_options) {
+    trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
+    return trellis_pipeline_image_to_gltf_impl(
+        options,
+        &pixal_options,
+        feature_options,
         "trellis2");
 }
 
@@ -164,14 +177,30 @@ trellis_status trellis_pipeline_pixal3d_image_to_gltf(
     return trellis_pipeline_image_to_gltf_impl(
         options,
         pixal_options,
+        NULL,
+        "pixal3d");
+}
+
+trellis_status trellis_pipeline_pixal3d_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options,
+    const trellis_image_to_gltf_feature_options * feature_options) {
+    return trellis_pipeline_image_to_gltf_impl(
+        options,
+        pixal_options,
+        feature_options,
         "pixal3d");
 }
 
 static trellis_status trellis_pipeline_image_to_gltf_impl(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options,
+    const trellis_image_to_gltf_feature_options * feature_options,
     const char * required_family) {
-    if (pixal_options == NULL ||
+    if ((feature_options != NULL &&
+         (feature_options->struct_size < TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_V1_SIZE ||
+          feature_options->version != TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_VERSION)) ||
+        pixal_options == NULL ||
         pixal_options->struct_size < TRELLIS_PIXAL3D_OPTIONS_V1_SIZE ||
         !isfinite(pixal_options->camera_angle_x) ||
         !isfinite(pixal_options->camera_distance) ||
@@ -180,6 +209,19 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
         options->image_path == NULL || options->device < 0 ||
         options->vkmesh_gpu_workspace_budget_mib < 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int shape_only =
+        feature_options != NULL && feature_options->shape_only != 0;
+    const char * prepared_image_output_path = feature_options != NULL ?
+        feature_options->prepared_image_output_path : NULL;
+    const char * shape_latent_output_path = feature_options != NULL ?
+        feature_options->shape_latent_output_path : NULL;
+    if (shape_latent_output_path != NULL &&
+        shape_latent_output_path[0] != '\0' &&
+        required_family != NULL && strcmp(required_family, "trellis2") != 0) {
+        TRELLIS_ERROR(
+            "pipeline: reusable shape SLat caches are only supported by the trellis2 adapter");
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     const char * pixal_naf_override = pixal_options->naf_path;
@@ -249,6 +291,14 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         trellis_model_package_free(&model_package);
         return status;
     }
+    if (shape_latent_output_path != NULL &&
+        shape_latent_output_path[0] != '\0' &&
+        strcmp(task_adapter->family, "trellis2") != 0) {
+        TRELLIS_ERROR(
+            "pipeline: reusable shape SLat caches are only supported by the trellis2 adapter");
+        trellis_model_package_free(&model_package);
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
     projected_conditioning = task_adapter->uses_projected_conditioning;
     if (pixal_camera_angle_x <= 0.0f) {
         pixal_camera_angle_x = task_adapter->default_camera_angle_x;
@@ -311,6 +361,18 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         return status;
     }
     const char * sparse_structure_image_path = prepared_image.source_path;
+    if (prepared_image_output_path != NULL &&
+        prepared_image_output_path[0] != '\0') {
+        status = trellis_pipeline_write_prepared_condition_image_png(
+            &prepared_image,
+            prepared_image_output_path);
+        if (status != TRELLIS_STATUS_OK) {
+            trellis_pipeline_prepared_condition_image_free(&prepared_image);
+            trellis_model_package_free(&model_package);
+            return status;
+        }
+        sparse_structure_image_path = prepared_image_output_path;
+    }
 
     trellis_backend_context graph_backend;
     trellis_cuda_context cuda;
@@ -467,6 +529,7 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         status = TRELLIS_STATUS_INVALID_ARGUMENT;
         goto cleanup;
     }
+    const int pipeline_stage_count = shape_only ? 4 : 5;
 
     const char * shape_flow_lr_role =
         use_1024_cascade || final_resolution < 1024 ?
@@ -477,23 +540,26 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         &model_package, "sparse_structure_flow");
     shape_flow_lr_component = trellis_model_package_find_component(
         &model_package, shape_flow_lr_role);
-    texture_flow_component = trellis_model_package_find_component(
-        &model_package, texture_flow_role);
+    if (!shape_only) {
+        texture_flow_component = trellis_model_package_find_component(
+            &model_package, texture_flow_role);
+    }
     if (use_1024_cascade) {
         shape_flow_hr_component = trellis_model_package_find_component(
             &model_package, "shape_flow_1024");
     }
     if (sparse_flow_component == NULL || shape_flow_lr_component == NULL ||
-        texture_flow_component == NULL ||
         (use_1024_cascade && shape_flow_hr_component == NULL) ||
         !pipeline_component_path(&model_package, "sparse_structure_flow", sparse_flow_path) ||
         !pipeline_component_path(&model_package, "sparse_structure_decoder", sparse_decoder_path) ||
         !pipeline_component_path(&model_package, shape_flow_lr_role, shape_flow_lr_path) ||
         (use_1024_cascade &&
          !pipeline_component_path(&model_package, "shape_flow_1024", shape_flow_hr_path)) ||
-        !pipeline_component_path(&model_package, texture_flow_role, texture_flow_path) ||
         !pipeline_component_path(&model_package, "shape_decoder", shape_decoder_path) ||
-        !pipeline_component_path(&model_package, "texture_decoder", texture_decoder_path)) {
+        (!shape_only &&
+         (texture_flow_component == NULL ||
+          !pipeline_component_path(&model_package, texture_flow_role, texture_flow_path) ||
+          !pipeline_component_path(&model_package, "texture_decoder", texture_decoder_path)))) {
         status = TRELLIS_STATUS_PARSE_ERROR;
         goto cleanup;
     }
@@ -514,16 +580,26 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
     shape_flow_hr_attention = use_1024_cascade ?
         pipeline_component_attention_policy(options, shape_flow_hr_component) :
         shape_flow_lr_attention;
-    texture_flow_attention = pipeline_component_attention_policy(
-        options, texture_flow_component);
-    TRELLIS_INFO(
-        "attention policy: sparse=%s shape_lr=%s shape_hr=%s texture=%s%s",
-        pipeline_attention_policy_name(&sparse_flow_attention),
-        pipeline_attention_policy_name(&shape_flow_lr_attention),
-        pipeline_attention_policy_name(&shape_flow_hr_attention),
-        pipeline_attention_policy_name(&texture_flow_attention),
-        projected_conditioning && !options->use_ggml_flash_attn ?
-            " (Pixal3D strict BF16 Flash package defaults)" : "");
+    if (shape_only) {
+        TRELLIS_INFO(
+            "attention policy: sparse=%s shape_lr=%s shape_hr=%s texture=disabled (shape-only)%s",
+            pipeline_attention_policy_name(&sparse_flow_attention),
+            pipeline_attention_policy_name(&shape_flow_lr_attention),
+            pipeline_attention_policy_name(&shape_flow_hr_attention),
+            projected_conditioning && !options->use_ggml_flash_attn ?
+                " (Pixal3D strict BF16 Flash package defaults)" : "");
+    } else {
+        texture_flow_attention = pipeline_component_attention_policy(
+            options, texture_flow_component);
+        TRELLIS_INFO(
+            "attention policy: sparse=%s shape_lr=%s shape_hr=%s texture=%s%s",
+            pipeline_attention_policy_name(&sparse_flow_attention),
+            pipeline_attention_policy_name(&shape_flow_lr_attention),
+            pipeline_attention_policy_name(&shape_flow_hr_attention),
+            pipeline_attention_policy_name(&texture_flow_attention),
+            projected_conditioning && !options->use_ggml_flash_attn ?
+                " (Pixal3D strict BF16 Flash package defaults)" : "");
+    }
 
     if (options->model_cache) {
         const size_t model_cache_budget_bytes = model_cache_budget_bytes_from_options(options);
@@ -539,7 +615,9 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         model_cache_ptr = &model_cache;
     }
 
-    TRELLIS_INFO("[1/5] SparseStructureFlowModel image -> sparse structure");
+    TRELLIS_INFO(
+        "[1/%d] SparseStructureFlowModel image -> sparse structure",
+        pipeline_stage_count);
     trellis_sparse_structure_options sparse_structure;
     memset(&sparse_structure, 0, sizeof(sparse_structure));
     sparse_structure.model_dir = options->model_dir;
@@ -586,7 +664,9 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
     const float * shape_lr_cond = sparse_structure_result.cond;
     int shape_lr_cond_tokens = sparse_structure_result.cond_tokens;
     if (sparse_structure_result.projected_conditioning) {
-        TRELLIS_INFO("[2a/5] Pixal3D DINOv3 + NAF -> shape-512 projected condition");
+        TRELLIS_INFO(
+            "[2a/%d] Pixal3D DINOv3 + NAF -> shape-512 projected condition",
+            pipeline_stage_count);
         trellis_image_condition_options cond_options;
         memset(&cond_options, 0, sizeof(cond_options));
         cond_options.model_dir = options->model_dir;
@@ -618,7 +698,8 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
     }
 
     TRELLIS_INFO(
-        "[2/5] SLatFlowModel image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
+        "[2/%d] SLatFlowModel image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
+        pipeline_stage_count,
         (long long) sparse_structure_result.n_coords,
         sparse_structure_result.cond_tokens,
         use_1024_cascade ? 512 : final_resolution);
@@ -682,7 +763,9 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         shape_latent_lr = shape_latent;
         memset(&shape_latent, 0, sizeof(shape_latent));
 
-        TRELLIS_INFO("[2b/5] FlexiDualGridVaeDecoder 512 shape SLat -> cascade HR coords");
+        TRELLIS_INFO(
+            "[2b/%d] FlexiDualGridVaeDecoder 512 shape SLat -> cascade HR coords",
+            pipeline_stage_count);
         trellis_pipeline_mesh_options cascade_upsample_options;
         memset(&cascade_upsample_options, 0, sizeof(cascade_upsample_options));
         cascade_upsample_options.model_dir = options->model_dir;
@@ -755,8 +838,9 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
 
         TRELLIS_INFO(
             sparse_structure_result.projected_conditioning ?
-                "[2c/5] Pixal3D DINOv3 + NAF -> shape-1024 projected condition" :
-                "[2c/5] DINOv3 image encoder -> 1024 condition");
+                "[2c/%d] Pixal3D DINOv3 + NAF -> shape-1024 projected condition" :
+                "[2c/%d] DINOv3 image encoder -> 1024 condition",
+            pipeline_stage_count);
         trellis_image_condition_options cond_options;
         memset(&cond_options, 0, sizeof(cond_options));
         cond_options.model_dir = options->model_dir;
@@ -790,7 +874,8 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
             ggml_time_us() - perf_start_us);
 
         TRELLIS_INFO(
-            "[2c/5] SLatFlowModel 1024 image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
+            "[2c/%d] SLatFlowModel 1024 image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
+            pipeline_stage_count,
             (long long) cascade_n,
             cond_1024.cond_tokens,
             actual_hr_resolution);
@@ -823,7 +908,11 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
             ggml_time_us() - perf_start_us);
     }
 
-    TRELLIS_INFO("[3/5] FlexiDualGridVaeDecoder shape SLat -> mesh/subdivision guides");
+    TRELLIS_INFO(
+        shape_only ?
+            "[3/%d] FlexiDualGridVaeDecoder shape SLat -> mesh" :
+            "[3/%d] FlexiDualGridVaeDecoder shape SLat -> mesh/subdivision guides",
+        pipeline_stage_count);
     trellis_pipeline_mesh_options mesh_options;
     memset(&mesh_options, 0, sizeof(mesh_options));
     mesh_options.model_dir = options->model_dir;
@@ -841,7 +930,10 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
     mesh_options.cache = model_cache_ptr;
 
     perf_start_us = ggml_time_us();
-    status = trellis_pipeline_decode_shape_latent_mesh(&mesh_options, &shape_subs, &mesh);
+    status = trellis_pipeline_decode_shape_latent_mesh(
+        &mesh_options,
+        shape_only ? NULL : &shape_subs,
+        &mesh);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
@@ -859,9 +951,15 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
                 trellis_status_string(status));
             goto cleanup;
         }
-        TRELLIS_INFO(
-            "SparseUnet Vulkan decoder backend: released %.1f MiB of inactive shape buffers; subdivision guides retained",
-            (double) released_bytes / (1024.0 * 1024.0));
+        if (shape_only) {
+            TRELLIS_INFO(
+                "SparseUnet Vulkan decoder backend: released %.1f MiB of inactive shape buffers",
+                (double) released_bytes / (1024.0 * 1024.0));
+        } else {
+            TRELLIS_INFO(
+                "SparseUnet Vulkan decoder backend: released %.1f MiB of inactive shape buffers; subdivision guides retained",
+                (double) released_bytes / (1024.0 * 1024.0));
+        }
     }
     if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
         status = trellis_pipeline_dump_raw_mesh_if_requested(
@@ -871,10 +969,27 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
             goto cleanup;
         }
     }
+    /* The anchor belongs to the shape SLat/decoder coordinate frame.  Save it
+     * before vkmesh can introduce a small scale or center drift; a later
+     * retopologized mesh is mapped back to this frame on cache reuse. */
+    if (shape_latent_output_path != NULL &&
+        shape_latent_output_path[0] != '\0') {
+        status = trellis_shape_latent_cache_write(
+            shape_latent_output_path,
+            &shape_latent,
+            &mesh,
+            NULL);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "pipeline: shape latent cache export failed: %s",
+                trellis_status_string(status));
+            goto cleanup;
+        }
+    }
     if (options->mesh_postprocess) {
         status = trellis_pipeline_postprocess_mesh_with_vkmesh(
             &mesh,
-            &gltf_projection_mesh,
+            shape_only ? NULL : &gltf_projection_mesh,
             options->vkmesh_path,
             options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000,
             options->mesh_postprocess_no_simplify,
@@ -887,6 +1002,20 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }
+    }
+
+    if (shape_only) {
+        TRELLIS_INFO("[4/4] Shape-only mesh -> glTF");
+        status = trellis_pipeline_write_shape_gltf_ex(
+            output_gltf_path,
+            &mesh,
+            task_adapter->gltf_coordinate_transform);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "pipeline: shape-only glTF export failed: %s",
+                trellis_status_string(status));
+        }
+        goto cleanup;
     }
 
     const float * texture_cond = use_1024_cascade ?

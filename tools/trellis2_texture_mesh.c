@@ -20,6 +20,9 @@ static void usage(FILE * output, const char * executable) {
         "  --dino DIR              DINOv3 image encoder directory\n"
         "  --input FILE            Input .glb/.gltf triangle mesh\n"
         "  --image FILE            Material reference image\n"
+        "  --image-prepared        Treat --image as the final condition; disable BiRefNet\n"
+        "  --shape-latent FILE     Reuse a compatible TRELLIS shape SLat cache\n"
+        "  --shape-latent-output FILE Write cache after mesh encoding when reuse misses\n"
         "  --output FILE           Output textured GLB (default textured.glb)\n"
         "  --birefnet FILE         Override auto-discovered BiRefNet GGUF\n"
         "  --shape-encoder FILE    Override FlexiDualGridVaeEncoder weights\n"
@@ -78,6 +81,16 @@ int main(int argc, char ** argv) {
             options.input_path = argument_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--image") == 0) {
             options.image_path = argument_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--image-prepared") == 0) {
+            options.image_prepared = 1;
+        } else if (strcmp(argv[i], "--shape-latent") == 0) {
+            options.shape_latent_path = argument_value(argc, argv, &i);
+            if (options.shape_latent_path == NULL ||
+                options.shape_latent_path[0] == '\0') goto bad_args;
+        } else if (strcmp(argv[i], "--shape-latent-output") == 0) {
+            options.shape_latent_output_path = argument_value(argc, argv, &i);
+            if (options.shape_latent_output_path == NULL ||
+                options.shape_latent_output_path[0] == '\0') goto bad_args;
         } else if (strcmp(argv[i], "--output") == 0 ||
                    strcmp(argv[i], "--glb") == 0) {
             options.output_path = argument_value(argc, argv, &i);

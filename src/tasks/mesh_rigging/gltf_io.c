@@ -315,6 +315,12 @@ void trellis_mesh_rigging_asset_free(trellis_mesh_rigging_asset * asset) {
     free(asset->source_path);
     free(asset->positions);
     free(asset->normals);
+    if (asset->texcoords != NULL) {
+        for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
+            free(asset->texcoords[set]);
+        }
+    }
+    free(asset->texcoords);
     free(asset->face_normals);
     free(asset->triangles);
     free(asset->primitives);
@@ -359,6 +365,7 @@ trellis_status trellis_mesh_rigging_gltf_load(
     size_t vertex_count = 0;
     size_t triangle_count = 0;
     size_t primitive_count = 0;
+    uint64_t texcoord_sets_used = 0;
     trellis_status status = TRELLIS_STATUS_OK;
     for (size_t node_index = 0; node_index < (size_t) data->nodes_count; ++node_index) {
         const cgltf_node * node = &data->nodes[node_index];
@@ -371,6 +378,26 @@ trellis_status trellis_mesh_rigging_gltf_load(
             const cgltf_primitive * primitive = &node->mesh->primitives[primitive_index];
             if (!primitive_is_triangular(primitive->type)) {
                 continue;
+            }
+            for (size_t attribute_index = 0;
+                 attribute_index < (size_t) primitive->attributes_count;
+                 ++attribute_index) {
+                const cgltf_attribute * attribute = &primitive->attributes[attribute_index];
+                if (attribute->type != cgltf_attribute_type_texcoord) {
+                    continue;
+                }
+                if (attribute->index < 0 || attribute->index >= 64) {
+                    set_error(
+                        error_out,
+                        error_size,
+                        "TEXCOORD_%d on node %zu primitive %zu exceeds the 64-set preservation limit",
+                        attribute->index,
+                        node_index,
+                        primitive_index);
+                    cgltf_free(data);
+                    return TRELLIS_STATUS_NOT_IMPLEMENTED;
+                }
+                texcoord_sets_used |= UINT64_C(1) << (unsigned) attribute->index;
             }
             size_t primitive_vertices = 0;
             size_t primitive_triangles = 0;
@@ -425,12 +452,47 @@ trellis_status trellis_mesh_rigging_gltf_load(
     asset.vertex_count = vertex_count;
     asset.triangle_count = triangle_count;
     asset.primitive_count = primitive_count;
+    if (texcoord_sets_used != 0) {
+        for (size_t set = 64u; set > 0; --set) {
+            if ((texcoord_sets_used & (UINT64_C(1) << (set - 1u))) != 0) {
+                asset.texcoord_set_count = set;
+                break;
+            }
+        }
+        asset.texcoords = (float **) calloc(
+            asset.texcoord_set_count, sizeof(*asset.texcoords));
+        if (asset.texcoords != NULL) {
+            size_t texcoord_values = 0;
+            if (!multiply_size(vertex_count, 2u, &texcoord_values)) {
+                set_error(error_out, error_size, "texture-coordinate allocation size overflow");
+                trellis_mesh_rigging_asset_free(&asset);
+                cgltf_free(data);
+                return TRELLIS_STATUS_OUT_OF_MEMORY;
+            }
+            for (size_t set = 0; set < asset.texcoord_set_count; ++set) {
+                if ((texcoord_sets_used & (UINT64_C(1) << set)) != 0) {
+                    asset.texcoords[set] = (float *) calloc(
+                        texcoord_values, sizeof(float));
+                }
+            }
+        }
+    }
     if (asset.source_path == NULL || asset.positions == NULL || asset.normals == NULL ||
-        asset.face_normals == NULL || asset.triangles == NULL || asset.primitives == NULL) {
+        asset.face_normals == NULL || asset.triangles == NULL || asset.primitives == NULL ||
+        (texcoord_sets_used != 0 && asset.texcoords == NULL)) {
         set_error(error_out, error_size, "out of memory allocating flattened mesh");
         trellis_mesh_rigging_asset_free(&asset);
         cgltf_free(data);
         return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (size_t set = 0; set < asset.texcoord_set_count; ++set) {
+        if ((texcoord_sets_used & (UINT64_C(1) << set)) != 0 &&
+            asset.texcoords[set] == NULL) {
+            set_error(error_out, error_size, "out of memory allocating flattened texture coordinates");
+            trellis_mesh_rigging_asset_free(&asset);
+            cgltf_free(data);
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
     }
 
     size_t vertex_cursor = 0;
@@ -490,6 +552,47 @@ trellis_status trellis_mesh_rigging_gltf_load(
                     goto cleanup;
                 }
             }
+            uint64_t primitive_texcoord_mask = 0;
+            for (size_t set = 0; set < asset.texcoord_set_count; ++set) {
+                const cgltf_accessor * texcoord = cgltf_find_accessor(
+                    primitive, cgltf_attribute_type_texcoord, (cgltf_int) set);
+                if (texcoord == NULL) {
+                    continue;
+                }
+                if (texcoord->type != cgltf_type_vec2 ||
+                    (size_t) texcoord->count != primitive_vertices) {
+                    set_error(
+                        error_out,
+                        error_size,
+                        "TEXCOORD_%zu on node %zu primitive %zu must be a VEC2 with %zu elements",
+                        set,
+                        node_index,
+                        primitive_index,
+                        primitive_vertices);
+                    status = TRELLIS_STATUS_PARSE_ERROR;
+                    goto cleanup;
+                }
+                for (size_t vertex = 0; vertex < primitive_vertices; ++vertex) {
+                    float uv[2];
+                    if (!cgltf_accessor_read_float(
+                            texcoord, (cgltf_size) vertex, uv, 2u) ||
+                        !isfinite(uv[0]) || !isfinite(uv[1])) {
+                        set_error(
+                            error_out,
+                            error_size,
+                            "failed to read finite TEXCOORD_%zu element %zu from node %zu primitive %zu",
+                            set,
+                            vertex,
+                            node_index,
+                            primitive_index);
+                        status = TRELLIS_STATUS_PARSE_ERROR;
+                        goto cleanup;
+                    }
+                    asset.texcoords[set][(vertex_cursor + vertex) * 2u + 0u] = uv[0];
+                    asset.texcoords[set][(vertex_cursor + vertex) * 2u + 1u] = uv[1];
+                }
+                primitive_texcoord_mask |= UINT64_C(1) << set;
+            }
             status = append_primitive_triangles(
                 primitive,
                 primitive_vertices,
@@ -516,6 +619,7 @@ trellis_status trellis_mesh_rigging_gltf_load(
             range->source_position_accessor_index = (size_t) (position - data->accessors);
             range->source_material_index = primitive->material != NULL ?
                 (size_t) (primitive->material - data->materials) : SIZE_MAX;
+            range->texcoord_mask = primitive_texcoord_mask;
             vertex_cursor += primitive_vertices;
             triangle_cursor += primitive_triangles;
         }

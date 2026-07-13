@@ -2564,12 +2564,18 @@ static void compute_mesh_buffer_layout(const trellis_gltf_mesh * mesh, size_t of
     sizes[0] = (size_t) mesh->index_count * sizeof(uint32_t);
     sizes[1] = (size_t) mesh->vertex_count * 3u * sizeof(float);
     sizes[2] = (size_t) mesh->vertex_count * 3u * sizeof(float);
-    sizes[3] = (size_t) mesh->vertex_count * 2u * sizeof(float);
     offsets[0] = 0;
     offsets[1] = align4(offsets[0] + sizes[0]);
     offsets[2] = align4(offsets[1] + sizes[1]);
-    offsets[3] = align4(offsets[2] + sizes[2]);
-    *total_size_out = align4(offsets[3] + sizes[3]);
+    if (mesh->uvs != NULL) {
+        sizes[3] = (size_t) mesh->vertex_count * 2u * sizeof(float);
+        offsets[3] = align4(offsets[2] + sizes[2]);
+        *total_size_out = align4(offsets[3] + sizes[3]);
+    } else {
+        offsets[3] = 0;
+        sizes[3] = 0;
+        *total_size_out = align4(offsets[2] + sizes[2]);
+    }
 }
 
 static trellis_status build_mesh_binary_buffer(
@@ -2587,7 +2593,9 @@ static trellis_status build_mesh_binary_buffer(
     memcpy(data + offsets[0], mesh->indices, sizes[0]);
     memcpy(data + offsets[1], mesh->positions, sizes[1]);
     memcpy(data + offsets[2], mesh->normals, sizes[2]);
-    memcpy(data + offsets[3], mesh->uvs, sizes[3]);
+    if (mesh->uvs != NULL) {
+        memcpy(data + offsets[3], mesh->uvs, sizes[3]);
+    }
     *data_out = data;
     return TRELLIS_STATUS_OK;
 }
@@ -2691,9 +2699,13 @@ static trellis_status write_gltf_json(
     const size_t offsets[6],
     const size_t sizes[6],
     size_t buffer_size,
+    int include_textures,
     int write_glb,
     const void * bin_data) {
-    if (write_glb && (bin_data == NULL || buffer_size == 0)) {
+    if (mesh == NULL || mesh->positions == NULL || mesh->normals == NULL ||
+        mesh->indices == NULL || mesh->vertex_count == 0 || mesh->index_count == 0 ||
+        (write_glb && (bin_data == NULL || buffer_size == 0)) ||
+        (include_textures && mesh->uvs == NULL)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     cgltf_data data;
@@ -2715,17 +2727,21 @@ static trellis_status write_gltf_json(
 
     cgltf_buffer_view views[6];
     memset(views, 0, sizeof(views));
-    int view_count = write_glb ? 6 : 4;
+    const int has_uvs = mesh->uvs != NULL;
+    int view_count = 3 + has_uvs + (write_glb && include_textures ? 2 : 0);
     for (int i = 0; i < view_count; ++i) {
         views[i].buffer = &buffer;
         views[i].offset = offsets[i];
         views[i].size = sizes[i];
     }
     views[0].type = cgltf_buffer_view_type_indices;
-    views[1].type = views[2].type = views[3].type = cgltf_buffer_view_type_vertices;
+    views[1].type = views[2].type = cgltf_buffer_view_type_vertices;
     views[1].stride = 3u * sizeof(float);
     views[2].stride = 3u * sizeof(float);
-    views[3].stride = 2u * sizeof(float);
+    if (has_uvs) {
+        views[3].type = cgltf_buffer_view_type_vertices;
+        views[3].stride = 2u * sizeof(float);
+    }
     data.buffer_views = views;
     data.buffer_views_count = (cgltf_size) view_count;
 
@@ -2755,26 +2771,30 @@ static trellis_status write_gltf_json(
     accessors[2].component_type = cgltf_component_type_r_32f;
     accessors[2].type = cgltf_type_vec3;
     accessors[2].count = mesh->vertex_count;
-    accessors[3].buffer_view = &views[3];
-    accessors[3].component_type = cgltf_component_type_r_32f;
-    accessors[3].type = cgltf_type_vec2;
-    accessors[3].count = mesh->vertex_count;
+    if (has_uvs) {
+        accessors[3].buffer_view = &views[3];
+        accessors[3].component_type = cgltf_component_type_r_32f;
+        accessors[3].type = cgltf_type_vec2;
+        accessors[3].count = mesh->vertex_count;
+    }
     data.accessors = accessors;
-    data.accessors_count = 4;
+    data.accessors_count = (cgltf_size) (3 + has_uvs);
 
     cgltf_image images[2];
     memset(images, 0, sizeof(images));
-    if (write_glb) {
-        images[0].buffer_view = &views[4];
-        images[0].mime_type = (char *) "image/png";
-        images[1].buffer_view = &views[5];
-        images[1].mime_type = (char *) "image/png";
-    } else {
-        images[0].uri = (char *) base_uri;
-        images[1].uri = (char *) mr_uri;
+    if (include_textures) {
+        if (write_glb) {
+            images[0].buffer_view = &views[4];
+            images[0].mime_type = (char *) "image/png";
+            images[1].buffer_view = &views[5];
+            images[1].mime_type = (char *) "image/png";
+        } else {
+            images[0].uri = (char *) base_uri;
+            images[1].uri = (char *) mr_uri;
+        }
+        data.images = images;
+        data.images_count = 2;
     }
-    data.images = images;
-    data.images_count = 2;
 
     cgltf_sampler sampler;
     memset(&sampler, 0, sizeof(sampler));
@@ -2782,8 +2802,10 @@ static trellis_status write_gltf_json(
     sampler.min_filter = cgltf_filter_type_linear;
     sampler.wrap_s = cgltf_wrap_mode_clamp_to_edge;
     sampler.wrap_t = cgltf_wrap_mode_clamp_to_edge;
-    data.samplers = &sampler;
-    data.samplers_count = 1;
+    if (include_textures) {
+        data.samplers = &sampler;
+        data.samplers_count = 1;
+    }
 
     cgltf_texture textures[2];
     memset(textures, 0, sizeof(textures));
@@ -2791,21 +2813,25 @@ static trellis_status write_gltf_json(
     textures[0].sampler = &sampler;
     textures[1].image = &images[1];
     textures[1].sampler = &sampler;
-    data.textures = textures;
-    data.textures_count = 2;
+    if (include_textures) {
+        data.textures = textures;
+        data.textures_count = 2;
+    }
 
     cgltf_material material;
     memset(&material, 0, sizeof(material));
-    material.name = (char *) "trellis_pbr";
+    material.name = (char *) (include_textures ? "trellis_pbr" : "trellis_shape");
     material.has_pbr_metallic_roughness = 1;
-    material.pbr_metallic_roughness.base_color_texture.texture = &textures[0];
-    material.pbr_metallic_roughness.metallic_roughness_texture.texture = &textures[1];
-    material.pbr_metallic_roughness.base_color_factor[0] = 1.0f;
-    material.pbr_metallic_roughness.base_color_factor[1] = 1.0f;
-    material.pbr_metallic_roughness.base_color_factor[2] = 1.0f;
+    if (include_textures) {
+        material.pbr_metallic_roughness.base_color_texture.texture = &textures[0];
+        material.pbr_metallic_roughness.metallic_roughness_texture.texture = &textures[1];
+    }
+    material.pbr_metallic_roughness.base_color_factor[0] = include_textures ? 1.0f : 0.72f;
+    material.pbr_metallic_roughness.base_color_factor[1] = include_textures ? 1.0f : 0.74f;
+    material.pbr_metallic_roughness.base_color_factor[2] = include_textures ? 1.0f : 0.78f;
     material.pbr_metallic_roughness.base_color_factor[3] = 1.0f;
-    material.pbr_metallic_roughness.metallic_factor = 1.0f;
-    material.pbr_metallic_roughness.roughness_factor = 1.0f;
+    material.pbr_metallic_roughness.metallic_factor = include_textures ? 1.0f : 0.0f;
+    material.pbr_metallic_roughness.roughness_factor = include_textures ? 1.0f : 0.8f;
     material.alpha_mode = cgltf_alpha_mode_opaque;
     material.double_sided = 1;
     data.materials = &material;
@@ -2819,10 +2845,12 @@ static trellis_status write_gltf_json(
     attributes[1].name = (char *) "NORMAL";
     attributes[1].type = cgltf_attribute_type_normal;
     attributes[1].data = &accessors[2];
-    attributes[2].name = (char *) "TEXCOORD_0";
-    attributes[2].type = cgltf_attribute_type_texcoord;
-    attributes[2].index = 0;
-    attributes[2].data = &accessors[3];
+    if (has_uvs) {
+        attributes[2].name = (char *) "TEXCOORD_0";
+        attributes[2].type = cgltf_attribute_type_texcoord;
+        attributes[2].index = 0;
+        attributes[2].data = &accessors[3];
+    }
 
     cgltf_primitive primitive;
     memset(&primitive, 0, sizeof(primitive));
@@ -2830,7 +2858,7 @@ static trellis_status write_gltf_json(
     primitive.indices = &accessors[0];
     primitive.material = &material;
     primitive.attributes = attributes;
-    primitive.attributes_count = 3;
+    primitive.attributes_count = (cgltf_size) (2 + has_uvs);
 
     cgltf_mesh cgmesh;
     memset(&cgmesh, 0, sizeof(cgmesh));
@@ -2862,6 +2890,121 @@ static trellis_status write_gltf_json(
     options.type = write_glb ? cgltf_file_type_glb : cgltf_file_type_gltf;
     cgltf_result result = cgltf_write_file(&options, gltf_path, &data);
     return result == cgltf_result_success ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+}
+
+static trellis_status shape_mesh_from_host(
+    const trellis_mesh_host * mesh,
+    trellis_gltf_mesh * out) {
+    if (mesh == NULL || out == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
+        (uint64_t) mesh->n_vertices > UINT32_MAX ||
+        (uint64_t) mesh->n_faces > UINT32_MAX / 3u) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out, 0, sizeof(*out));
+    out->vertex_count = (uint32_t) mesh->n_vertices;
+    out->index_count = (uint32_t) mesh->n_faces * 3u;
+    out->positions = (float *) malloc(
+        (size_t) out->vertex_count * 3u * sizeof(float));
+    out->normals = (float *) malloc(
+        (size_t) out->vertex_count * 3u * sizeof(float));
+    out->indices = (uint32_t *) malloc(
+        (size_t) out->index_count * sizeof(uint32_t));
+    if (out->positions == NULL || out->normals == NULL || out->indices == NULL) {
+        gltf_mesh_free(out);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(
+        out->positions,
+        mesh->vertices,
+        (size_t) out->vertex_count * 3u * sizeof(float));
+    for (uint32_t i = 0; i < out->index_count; ++i) {
+        const int32_t index = mesh->faces[i];
+        if (index < 0 || (uint32_t) index >= out->vertex_count) {
+            gltf_mesh_free(out);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        out->indices[i] = (uint32_t) index;
+    }
+    mesh_compute_normals(mesh, out->normals);
+    return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_pipeline_write_shape_gltf_ex(
+    const char * path,
+    const trellis_mesh_host * mesh,
+    trellis_pipeline_gltf_coordinate_transform coordinate_transform) {
+    if (path == NULL || mesh == NULL ||
+        !gltf_coordinate_transform_is_valid(coordinate_transform)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    char dir[4096];
+    char stem[512];
+    if (!split_output_paths(path, dir, sizeof(dir), stem, sizeof(stem)) ||
+        !mkdir_p_export(dir)) {
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    const int write_glb = path_has_extension_ci(path, ".glb");
+    char bin_uri[1024];
+    char bin_path[4096];
+    memset(bin_uri, 0, sizeof(bin_uri));
+    memset(bin_path, 0, sizeof(bin_path));
+    if (!write_glb &&
+        !make_named_file(
+            bin_uri,
+            sizeof(bin_uri),
+            bin_path,
+            sizeof(bin_path),
+            dir,
+            stem,
+            ".bin")) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    trellis_gltf_mesh gltf_mesh;
+    memset(&gltf_mesh, 0, sizeof(gltf_mesh));
+    uint8_t * binary = NULL;
+    size_t offsets[6] = {0, 0, 0, 0, 0, 0};
+    size_t sizes[6] = {0, 0, 0, 0, 0, 0};
+    size_t binary_size = 0;
+    trellis_status status = shape_mesh_from_host(mesh, &gltf_mesh);
+    if (status == TRELLIS_STATUS_OK) {
+        status = transform_mesh_to_export_axes(
+            &gltf_mesh,
+            coordinate_transform);
+    }
+    if (status == TRELLIS_STATUS_OK && write_glb) {
+        status = build_mesh_binary_buffer(
+            &gltf_mesh, offsets, sizes, &binary_size, &binary);
+    } else if (status == TRELLIS_STATUS_OK) {
+        status = write_binary_buffer(
+            bin_path, &gltf_mesh, offsets, sizes, &binary_size);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        status = write_gltf_json(
+            path,
+            write_glb ? NULL : bin_uri,
+            NULL,
+            NULL,
+            &gltf_mesh,
+            offsets,
+            sizes,
+            binary_size,
+            0,
+            write_glb,
+            write_glb ? binary : NULL);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        TRELLIS_INFO(
+            "glTF export: wrote shape-only %s %s vertices=%u faces=%u",
+            write_glb ? "GLB" : "glTF",
+            path,
+            gltf_mesh.vertex_count,
+            gltf_mesh.index_count / 3u);
+    }
+    free(binary);
+    gltf_mesh_free(&gltf_mesh);
+    return status;
 }
 
 trellis_status trellis_pipeline_write_gltf_ex(
@@ -2967,6 +3110,7 @@ trellis_status trellis_pipeline_write_gltf_ex(
             offsets,
             sizes,
             buffer_size,
+            1,
             write_glb,
             glb_bin);
     }

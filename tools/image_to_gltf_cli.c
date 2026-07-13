@@ -55,9 +55,11 @@ static void usage(
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
         "  --birefnet FILE         Override auto-discovered BiRefNet GGUF for opaque input\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
-        "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures, default output.glb\n"
+        "  --prepared-image-output FILE Write the exact prepared RGBA condition image as PNG\n"
+        "  --gltf FILE             Output glTF 2.0 path; .glb is single-file, default output.glb\n"
         "  --glb FILE              Alias of --gltf\n"
         "  --output FILE           Alias of --gltf\n"
+        "  --shape-only            Skip texture generation and export an untextured mesh\n"
         "  --texture-size N        glTF texture size, default 1024\n"
         "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
         "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
@@ -116,7 +118,8 @@ static void usage(
     } else {
         fputs(
             "\nTRELLIS.2 options:\n"
-            "  --pipeline NAME         512 (default) or 1024\n",
+            "  --pipeline NAME         512 (default) or 1024\n"
+            "  --shape-latent-output FILE Write reusable TRELLIS shape SLat cache\n",
             out);
     }
 }
@@ -201,6 +204,8 @@ int trellis_image_to_gltf_cli_main(
     print_banner(model);
 
     trellis_image_to_gltf_options options;
+    trellis_image_to_gltf_feature_options feature_options =
+        TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_INIT;
     trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
     memset(&options, 0, sizeof(options));
     options.device = 0;
@@ -248,10 +253,20 @@ int trellis_image_to_gltf_cli_main(
             options.birefnet_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--image") == 0) {
             options.image_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--prepared-image-output") == 0) {
+            feature_options.prepared_image_output_path = arg_value(argc, argv, &i);
+            if (feature_options.prepared_image_output_path == NULL ||
+                feature_options.prepared_image_output_path[0] == '\0') goto bad_args;
+        } else if (!pixal3d && strcmp(argv[i], "--shape-latent-output") == 0) {
+            feature_options.shape_latent_output_path = arg_value(argc, argv, &i);
+            if (feature_options.shape_latent_output_path == NULL ||
+                feature_options.shape_latent_output_path[0] == '\0') goto bad_args;
         } else if (strcmp(argv[i], "--gltf") == 0 ||
                    strcmp(argv[i], "--glb") == 0 ||
                    strcmp(argv[i], "--output") == 0) {
             options.gltf_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--shape-only") == 0) {
+            feature_options.shape_only = 1;
         } else if (strcmp(argv[i], "--mesh-postprocess") == 0) {
             options.mesh_postprocess = 1;
         } else if (strcmp(argv[i], "--no-mesh-postprocess") == 0) {
@@ -414,8 +429,10 @@ int trellis_image_to_gltf_cli_main(
     }
 
     trellis_status status = pixal3d ?
-        trellis_pipeline_pixal3d_image_to_gltf(&options, &pixal_options) :
-        trellis_pipeline_trellis2_image_to_gltf(&options);
+        trellis_pipeline_pixal3d_image_to_gltf_ex(
+            &options, &pixal_options, &feature_options) :
+        trellis_pipeline_trellis2_image_to_gltf_ex(
+            &options, &feature_options);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR(
             "%s failed: %s",

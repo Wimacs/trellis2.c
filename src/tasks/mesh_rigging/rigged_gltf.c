@@ -16,9 +16,7 @@ enum {
     RIGGED_VIEW_NORMALS,
     RIGGED_VIEW_JOINTS,
     RIGGED_VIEW_WEIGHTS,
-    RIGGED_VIEW_INDICES,
-    RIGGED_VIEW_INVERSE_BINDS,
-    RIGGED_VIEW_COUNT,
+    RIGGED_REQUIRED_VIEW_COUNT,
 };
 
 enum {
@@ -48,6 +46,24 @@ typedef struct rigged_neighbors {
     size_t count;
     size_t capacity;
 } rigged_neighbors;
+
+typedef struct rigged_source_image {
+    const unsigned char * bytes;
+    unsigned char * owned_bytes;
+    size_t size;
+    const char * embedded_mime_type;
+    char * owned_mime_type;
+    char * original_uri;
+    cgltf_buffer_view * original_buffer_view;
+    char * original_mime_type;
+} rigged_source_image;
+
+typedef struct rigged_source_appearance {
+    cgltf_data * data;
+    rigged_source_image * images;
+} rigged_source_appearance;
+
+static const char * rigged_cgltf_result_name(cgltf_result result);
 
 static void rigged_set_error(
     char * output,
@@ -402,6 +418,11 @@ static trellis_status rigged_validate_inputs(
         rigged_set_error(error, error_size, "rigged GLB needs non-empty geometry and primitive ranges");
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    if (asset->texcoord_set_count > 64u ||
+        (asset->texcoord_set_count != 0 && asset->texcoords == NULL)) {
+        rigged_set_error(error, error_size, "rigged GLB has an invalid texture-coordinate table");
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
     if (skeleton->joint_count == 0 || skeleton->joint_count > (size_t) UINT16_MAX + 1u) {
         rigged_set_error(
             error,
@@ -446,11 +467,42 @@ static trellis_status rigged_validate_inputs(
         rigged_set_error(error, error_size, "normalization has non-finite or non-positive scale data");
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-
     size_t expected_vertex = 0;
     size_t expected_triangle = 0;
     for (size_t primitive = 0; primitive < asset->primitive_count; ++primitive) {
         const trellis_mesh_rigging_primitive_range * range = &asset->primitives[primitive];
+        const uint64_t allowed_texcoord_mask = asset->texcoord_set_count == 64u ?
+            UINT64_MAX :
+            (asset->texcoord_set_count == 0 ? UINT64_C(0) :
+                (UINT64_C(1) << asset->texcoord_set_count) - UINT64_C(1));
+        if ((range->texcoord_mask & ~allowed_texcoord_mask) != 0) {
+            rigged_set_error(
+                error,
+                error_size,
+                "primitive range %zu references a missing texture-coordinate set",
+                primitive);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        if (range->texcoord_mask != 0 && asset->texcoords == NULL) {
+            rigged_set_error(
+                error,
+                error_size,
+                "primitive range %zu references missing texture-coordinate storage",
+                primitive);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
+            if ((range->texcoord_mask & (UINT64_C(1) << set)) != 0 &&
+                asset->texcoords[set] == NULL) {
+                rigged_set_error(
+                    error,
+                    error_size,
+                    "primitive range %zu references null TEXCOORD_%zu data",
+                    primitive,
+                    set);
+                return TRELLIS_STATUS_INVALID_ARGUMENT;
+            }
+        }
         if (range->first_vertex != expected_vertex ||
             range->first_triangle != expected_triangle ||
             range->vertex_count == 0 || range->triangle_count == 0 ||
@@ -479,6 +531,23 @@ static trellis_status rigged_validate_inputs(
                         triangle,
                         index,
                         primitive);
+                    return TRELLIS_STATUS_INVALID_ARGUMENT;
+                }
+            }
+        }
+        for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
+            if ((range->texcoord_mask & (UINT64_C(1) << set)) == 0) continue;
+            for (size_t vertex = range->first_vertex;
+                 vertex < range->first_vertex + range->vertex_count;
+                 ++vertex) {
+                const float * uv = asset->texcoords[set] + vertex * 2u;
+                if (!isfinite(uv[0]) || !isfinite(uv[1])) {
+                    rigged_set_error(
+                        error,
+                        error_size,
+                        "TEXCOORD_%zu element %zu is non-finite",
+                        set,
+                        vertex);
                     return TRELLIS_STATUS_INVALID_ARGUMENT;
                 }
             }
@@ -702,6 +771,303 @@ static int rigged_layout_region(
     return 1;
 }
 
+static char * rigged_duplicate_string(const char * value) {
+    if (value == NULL) return NULL;
+    const size_t length = strlen(value) + 1u;
+    char * result = (char *) malloc(length);
+    if (result != NULL) memcpy(result, value, length);
+    return result;
+}
+
+static int rigged_ascii_equal_nocase(
+    const char * left,
+    const char * right,
+    size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (tolower((unsigned char) left[i]) !=
+            tolower((unsigned char) right[i])) return 0;
+    }
+    return 1;
+}
+
+static const char * rigged_infer_image_mime_type(const char * uri) {
+    if (uri == NULL) return NULL;
+    const char * end = uri + strlen(uri);
+    while (end > uri && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    const char * query = memchr(uri, '?', (size_t) (end - uri));
+    if (query != NULL) end = query;
+    const char * dot = end;
+    while (dot > uri && dot[-1] != '.' && dot[-1] != '/' && dot[-1] != '\\') --dot;
+    if (dot == uri || dot[-1] != '.') return NULL;
+    const size_t length = (size_t) (end - dot);
+    if (length == 3u && rigged_ascii_equal_nocase(dot, "png", 3u)) return "image/png";
+    if ((length == 3u && rigged_ascii_equal_nocase(dot, "jpg", 3u)) ||
+        (length == 4u && rigged_ascii_equal_nocase(dot, "jpeg", 4u))) return "image/jpeg";
+    if (length == 4u && rigged_ascii_equal_nocase(dot, "webp", 4u)) return "image/webp";
+    if (length == 4u && rigged_ascii_equal_nocase(dot, "ktx2", 4u)) return "image/ktx2";
+    return NULL;
+}
+
+static trellis_status rigged_read_file_bytes(
+    const char * path,
+    unsigned char ** bytes_out,
+    size_t * size_out,
+    char * error,
+    size_t error_size) {
+    FILE * file = fopen(path, "rb");
+    if (file == NULL) {
+        rigged_set_error(error, error_size, "could not open source image '%s'", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        rigged_set_error(error, error_size, "could not size source image '%s'", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    const long length = ftell(file);
+    if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        rigged_set_error(error, error_size, "source image '%s' is empty or unreadable", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    unsigned char * bytes = (unsigned char *) malloc((size_t) length);
+    if (bytes == NULL) {
+        fclose(file);
+        rigged_set_error(error, error_size, "out of memory loading source image '%s'", path);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    const int ok = fread(bytes, 1, (size_t) length, file) == (size_t) length;
+    fclose(file);
+    if (!ok) {
+        free(bytes);
+        rigged_set_error(error, error_size, "could not read source image '%s'", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    *bytes_out = bytes;
+    *size_out = (size_t) length;
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status rigged_load_uri_image(
+    const char * source_path,
+    const char * uri,
+    rigged_source_image * image,
+    char * error,
+    size_t error_size) {
+    if (strncmp(uri, "data:", 5u) == 0) {
+        const char * comma = strchr(uri + 5u, ',');
+        if (comma == NULL) {
+            rigged_set_error(error, error_size, "source image has an invalid data URI");
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        const char * semicolon = memchr(uri + 5u, ';', (size_t) (comma - (uri + 5u)));
+        const char * mime_end = semicolon != NULL ? semicolon : comma;
+        if (mime_end > uri + 5u) {
+            const size_t mime_length = (size_t) (mime_end - (uri + 5u));
+            image->owned_mime_type = (char *) malloc(mime_length + 1u);
+            if (image->owned_mime_type == NULL) {
+                return TRELLIS_STATUS_OUT_OF_MEMORY;
+            }
+            memcpy(image->owned_mime_type, uri + 5u, mime_length);
+            image->owned_mime_type[mime_length] = '\0';
+            image->embedded_mime_type = image->owned_mime_type;
+        }
+        const int is_base64 = semicolon != NULL &&
+            (size_t) (comma - semicolon) >= 7u &&
+            strncmp(comma - 7u, ";base64", 7u) == 0;
+        if (is_base64) {
+            const char * encoded = comma + 1u;
+            const size_t encoded_length = strlen(encoded);
+            if (encoded_length == 0 || encoded_length % 4u != 0) {
+                rigged_set_error(error, error_size, "source image has malformed base64 data");
+                return TRELLIS_STATUS_PARSE_ERROR;
+            }
+            size_t decoded_size = encoded_length / 4u * 3u;
+            if (encoded_length > 0 && encoded[encoded_length - 1u] == '=') --decoded_size;
+            if (encoded_length > 1u && encoded[encoded_length - 2u] == '=') --decoded_size;
+            cgltf_options options;
+            memset(&options, 0, sizeof(options));
+            void * decoded = NULL;
+            const cgltf_result result = cgltf_load_buffer_base64(
+                &options, (cgltf_size) decoded_size, encoded, &decoded);
+            if (result != cgltf_result_success || decoded == NULL) {
+                rigged_set_error(error, error_size, "could not decode source image data URI");
+                return result == cgltf_result_out_of_memory ?
+                    TRELLIS_STATUS_OUT_OF_MEMORY : TRELLIS_STATUS_PARSE_ERROR;
+            }
+            image->owned_bytes = (unsigned char *) decoded;
+            image->bytes = image->owned_bytes;
+            image->size = decoded_size;
+            return TRELLIS_STATUS_OK;
+        }
+        char * decoded = rigged_duplicate_string(comma + 1u);
+        if (decoded == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
+        const size_t decoded_size = (size_t) cgltf_decode_uri(decoded);
+        image->owned_bytes = (unsigned char *) decoded;
+        image->bytes = image->owned_bytes;
+        image->size = decoded_size;
+        if (decoded_size == 0) {
+            rigged_set_error(
+                error,
+                error_size,
+                "source image data URI decodes to an empty payload");
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        return TRELLIS_STATUS_OK;
+    }
+
+    char * decoded_uri = rigged_duplicate_string(uri);
+    if (decoded_uri == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
+    (void) cgltf_decode_uri(decoded_uri);
+    const char * slash = strrchr(source_path, '/');
+    const char * backslash = strrchr(source_path, '\\');
+    if (backslash != NULL && (slash == NULL || backslash > slash)) slash = backslash;
+    const int absolute = decoded_uri[0] == '/' || decoded_uri[0] == '\\' ||
+        (isalpha((unsigned char) decoded_uri[0]) && decoded_uri[1] == ':');
+    const size_t directory_length = !absolute && slash != NULL ?
+        (size_t) (slash - source_path + 1u) : 0u;
+    size_t path_length = 0;
+    if (!rigged_add_size(directory_length, strlen(decoded_uri), &path_length) ||
+        !rigged_add_size(path_length, 1u, &path_length)) {
+        free(decoded_uri);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    char * path = (char *) malloc(path_length);
+    if (path == NULL) {
+        free(decoded_uri);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    if (directory_length != 0) memcpy(path, source_path, directory_length);
+    memcpy(path + directory_length, decoded_uri, strlen(decoded_uri) + 1u);
+    const trellis_status status = rigged_read_file_bytes(
+        path, &image->owned_bytes, &image->size, error, error_size);
+    image->bytes = image->owned_bytes;
+    if (image->embedded_mime_type == NULL) {
+        image->embedded_mime_type = rigged_infer_image_mime_type(decoded_uri);
+    }
+    free(path);
+    free(decoded_uri);
+    return status;
+}
+
+static void rigged_source_appearance_free(rigged_source_appearance * appearance) {
+    if (appearance == NULL) return;
+    if (appearance->data != NULL && appearance->images != NULL) {
+        for (size_t i = 0; i < (size_t) appearance->data->images_count; ++i) {
+            appearance->data->images[i].uri = appearance->images[i].original_uri;
+            appearance->data->images[i].buffer_view =
+                appearance->images[i].original_buffer_view;
+            appearance->data->images[i].mime_type =
+                appearance->images[i].original_mime_type;
+            free(appearance->images[i].owned_mime_type);
+            free(appearance->images[i].owned_bytes);
+        }
+    }
+    free(appearance->images);
+    cgltf_free(appearance->data);
+    memset(appearance, 0, sizeof(*appearance));
+}
+
+static trellis_status rigged_source_appearance_load(
+    const trellis_mesh_rigging_asset * asset,
+    rigged_source_appearance * appearance,
+    char * error,
+    size_t error_size) {
+    memset(appearance, 0, sizeof(*appearance));
+    if (asset->source_path == NULL || asset->source_path[0] == '\0') {
+        return TRELLIS_STATUS_OK;
+    }
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_result result = cgltf_parse_file(
+        &options, asset->source_path, &appearance->data);
+    if (result == cgltf_result_success) {
+        result = cgltf_load_buffers(&options, appearance->data, asset->source_path);
+    }
+    if (result == cgltf_result_success) {
+        result = cgltf_validate(appearance->data);
+    }
+    if (result != cgltf_result_success || appearance->data == NULL) {
+        rigged_set_error(
+            error,
+            error_size,
+            "could not reopen source appearance '%s': %s",
+            asset->source_path,
+            rigged_cgltf_result_name(result));
+        rigged_source_appearance_free(appearance);
+        return result == cgltf_result_out_of_memory ?
+            TRELLIS_STATUS_OUT_OF_MEMORY : TRELLIS_STATUS_PARSE_ERROR;
+    }
+    if (appearance->data->extensions_required_count != 0) {
+        rigged_set_error(
+            error,
+            error_size,
+            "source appearance requires unsupported glTF extension '%s'",
+            appearance->data->extensions_required[0]);
+        rigged_source_appearance_free(appearance);
+        return TRELLIS_STATUS_NOT_IMPLEMENTED;
+    }
+    for (size_t primitive = 0; primitive < asset->primitive_count; ++primitive) {
+        const trellis_mesh_rigging_primitive_range * range = &asset->primitives[primitive];
+        if (range->source_mesh_index >= (size_t) appearance->data->meshes_count ||
+            range->source_primitive_index >= (size_t)
+                appearance->data->meshes[range->source_mesh_index].primitives_count ||
+            (range->source_material_index != SIZE_MAX &&
+             range->source_material_index >= (size_t) appearance->data->materials_count)) {
+            rigged_set_error(error, error_size, "source appearance mapping is inconsistent at primitive %zu", primitive);
+            rigged_source_appearance_free(appearance);
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+    }
+    if (appearance->data->images_count == 0) {
+        return TRELLIS_STATUS_OK;
+    }
+    appearance->images = (rigged_source_image *) calloc(
+        (size_t) appearance->data->images_count, sizeof(*appearance->images));
+    if (appearance->images == NULL) {
+        rigged_source_appearance_free(appearance);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (size_t i = 0; i < (size_t) appearance->data->images_count; ++i) {
+        cgltf_image * source_image = &appearance->data->images[i];
+        rigged_source_image * image = &appearance->images[i];
+        image->original_uri = source_image->uri;
+        image->original_buffer_view = source_image->buffer_view;
+        image->original_mime_type = source_image->mime_type;
+        image->embedded_mime_type = source_image->mime_type;
+    }
+    for (size_t i = 0; i < (size_t) appearance->data->images_count; ++i) {
+        cgltf_image * source_image = &appearance->data->images[i];
+        rigged_source_image * image = &appearance->images[i];
+        if (source_image->buffer_view != NULL) {
+            image->bytes = cgltf_buffer_view_data(source_image->buffer_view);
+            image->size = (size_t) source_image->buffer_view->size;
+            if (image->bytes == NULL || image->size == 0) {
+                rigged_set_error(error, error_size, "source image %zu has no readable buffer-view payload", i);
+                rigged_source_appearance_free(appearance);
+                return TRELLIS_STATUS_PARSE_ERROR;
+            }
+        } else if (source_image->uri != NULL) {
+            const trellis_status status = rigged_load_uri_image(
+                asset->source_path, source_image->uri, image, error, error_size);
+            if (status != TRELLIS_STATUS_OK) {
+                rigged_source_appearance_free(appearance);
+                return status;
+            }
+        } else {
+            rigged_set_error(error, error_size, "source image %zu has neither bufferView nor URI", i);
+            rigged_source_appearance_free(appearance);
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        if (image->embedded_mime_type == NULL) {
+            rigged_set_error(error, error_size, "source image %zu has no MIME type that can be embedded", i);
+            rigged_source_appearance_free(appearance);
+            return TRELLIS_STATUS_NOT_IMPLEMENTED;
+        }
+    }
+    return TRELLIS_STATUS_OK;
+}
+
 static const char * rigged_cgltf_result_name(cgltf_result result) {
     switch (result) {
         case cgltf_result_success: return "success";
@@ -786,8 +1152,34 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         return status;
     }
 
+    rigged_source_appearance source_appearance;
+    char appearance_diagnostic[512] = { 0 };
+    int appearance_fallback = 0;
+    status = rigged_source_appearance_load(
+        asset,
+        &source_appearance,
+        appearance_diagnostic,
+        sizeof(appearance_diagnostic));
+    if (status == TRELLIS_STATUS_OUT_OF_MEMORY) {
+        rigged_set_error(
+            error_out,
+            error_size,
+            "%s",
+            appearance_diagnostic[0] != '\0' ?
+                appearance_diagnostic :
+                "out of memory while preserving source appearance");
+        free(vertex_weights);
+        free(vertex_joints);
+        return status;
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        appearance_fallback = 1;
+        status = TRELLIS_STATUS_OK;
+    }
+
     unsigned char * binary = NULL;
     cgltf_accessor * accessors = NULL;
+    cgltf_buffer_view * views = NULL;
     cgltf_primitive * primitives = NULL;
     cgltf_attribute * attributes = NULL;
     cgltf_node * nodes = NULL;
@@ -799,11 +1191,15 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     size_t * child_fill = NULL;
     float * world_joints = NULL;
     char * joint_names = NULL;
+    char * texcoord_attribute_names = NULL;
+    size_t * image_view_offsets = NULL;
 
     size_t position_bytes = 0;
     size_t normal_bytes = 0;
     size_t joint_bytes = 0;
     size_t weight_bytes = 0;
+    size_t texcoord_elements = 0;
+    size_t texcoord_bytes = 0;
     size_t index_count = 0;
     size_t index_bytes = 0;
     size_t inverse_bind_bytes = 0;
@@ -811,6 +1207,8 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         !rigged_multiply_size(asset->vertex_count, 3u * sizeof(float), &normal_bytes) ||
         !rigged_multiply_size(asset->vertex_count, 4u * sizeof(uint16_t), &joint_bytes) ||
         !rigged_multiply_size(asset->vertex_count, 4u * sizeof(float), &weight_bytes) ||
+        !rigged_multiply_size(asset->texcoord_set_count, asset->vertex_count, &texcoord_elements) ||
+        !rigged_multiply_size(texcoord_elements, 2u * sizeof(float), &texcoord_bytes) ||
         !rigged_multiply_size(asset->triangle_count, 3u, &index_count) ||
         !rigged_multiply_size(index_count, sizeof(uint32_t), &index_bytes) ||
         !rigged_multiply_size(skeleton->joint_count, 16u * sizeof(float), &inverse_bind_bytes)) {
@@ -819,18 +1217,60 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         goto cleanup;
     }
 
-    size_t view_offsets[RIGGED_VIEW_COUNT] = { 0 };
+    size_t geometry_view_count = RIGGED_REQUIRED_VIEW_COUNT;
+    const size_t texcoord_view = texcoord_bytes != 0 ? geometry_view_count++ : SIZE_MAX;
+    const size_t index_view = geometry_view_count++;
+    const size_t inverse_bind_view = geometry_view_count++;
+    const size_t image_view_base = geometry_view_count;
+    size_t view_count = 0;
+    if (!rigged_add_size(
+            geometry_view_count,
+            source_appearance.data != NULL ?
+                (size_t) source_appearance.data->images_count : 0u,
+            &view_count)) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        rigged_set_error(error_out, error_size, "GLB buffer-view count overflow");
+        goto cleanup;
+    }
+    size_t view_offsets[RIGGED_REQUIRED_VIEW_COUNT] = { 0 };
+    size_t texcoord_offset = 0;
+    size_t index_offset = 0;
+    size_t inverse_bind_offset = 0;
     size_t binary_size = 0;
     if (!rigged_layout_region(&binary_size, position_bytes, &view_offsets[RIGGED_VIEW_POSITIONS]) ||
         !rigged_layout_region(&binary_size, normal_bytes, &view_offsets[RIGGED_VIEW_NORMALS]) ||
         !rigged_layout_region(&binary_size, joint_bytes, &view_offsets[RIGGED_VIEW_JOINTS]) ||
         !rigged_layout_region(&binary_size, weight_bytes, &view_offsets[RIGGED_VIEW_WEIGHTS]) ||
-        !rigged_layout_region(&binary_size, index_bytes, &view_offsets[RIGGED_VIEW_INDICES]) ||
-        !rigged_layout_region(&binary_size, inverse_bind_bytes, &view_offsets[RIGGED_VIEW_INVERSE_BINDS]) ||
+        (texcoord_bytes != 0 &&
+         !rigged_layout_region(&binary_size, texcoord_bytes, &texcoord_offset)) ||
+        !rigged_layout_region(&binary_size, index_bytes, &index_offset) ||
+        !rigged_layout_region(&binary_size, inverse_bind_bytes, &inverse_bind_offset) ||
         binary_size > UINT32_MAX) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
         rigged_set_error(error_out, error_size, "GLB binary chunk exceeds the 32-bit GLB limit");
         goto cleanup;
+    }
+    if (source_appearance.data != NULL && source_appearance.data->images_count != 0) {
+        image_view_offsets = (size_t *) calloc(
+            (size_t) source_appearance.data->images_count, sizeof(*image_view_offsets));
+        if (image_view_offsets == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            rigged_set_error(error_out, error_size, "out of memory allocating source image layout");
+            goto cleanup;
+        }
+        for (size_t image = 0;
+             image < (size_t) source_appearance.data->images_count;
+             ++image) {
+            if (!rigged_layout_region(
+                    &binary_size,
+                    source_appearance.images[image].size,
+                    &image_view_offsets[image]) ||
+                binary_size > UINT32_MAX) {
+                status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                rigged_set_error(error_out, error_size, "embedded source images exceed the GLB size limit");
+                goto cleanup;
+            }
+        }
     }
     binary = (unsigned char *) calloc(binary_size, 1u);
     if (binary == NULL) {
@@ -854,6 +1294,15 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
             binary + view_offsets[RIGGED_VIEW_WEIGHTS] + element * sizeof(float),
             vertex_weights[element]);
     }
+    for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
+        if (asset->texcoords == NULL || asset->texcoords[set] == NULL) continue;
+        for (size_t element = 0; element < asset->vertex_count * 2u; ++element) {
+            const size_t output_element = set * asset->vertex_count * 2u + element;
+            rigged_write_f32_le(
+                binary + texcoord_offset + output_element * sizeof(float),
+                asset->texcoords[set][element]);
+        }
+    }
     for (size_t primitive = 0; primitive < asset->primitive_count; ++primitive) {
         const trellis_mesh_rigging_primitive_range * range = &asset->primitives[primitive];
         for (size_t triangle = 0; triangle < range->triangle_count; ++triangle) {
@@ -863,7 +1312,7 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
                 const uint32_t local_index = (uint32_t) ((size_t) global_index - range->first_vertex);
                 const size_t element = source_triangle * 3u + corner;
                 rigged_write_u32_le(
-                    binary + view_offsets[RIGGED_VIEW_INDICES] + element * sizeof(uint32_t),
+                    binary + index_offset + element * sizeof(uint32_t),
                     local_index);
             }
         }
@@ -903,28 +1352,49 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         inverse_bind[14] = -world_joints[joint * 3u + 2u];
         for (size_t element = 0; element < 16u; ++element) {
             rigged_write_f32_le(
-                binary + view_offsets[RIGGED_VIEW_INVERSE_BINDS] +
+                binary + inverse_bind_offset +
                     (joint * 16u + element) * sizeof(float),
                 inverse_bind[element]);
+        }
+    }
+    if (source_appearance.data != NULL) {
+        for (size_t image = 0;
+             image < (size_t) source_appearance.data->images_count;
+             ++image) {
+            memcpy(
+                binary + image_view_offsets[image],
+                source_appearance.images[image].bytes,
+                source_appearance.images[image].size);
         }
     }
 
     size_t accessor_count = 0;
     size_t attribute_count = 0;
+    size_t texcoord_accessor_count = 0;
+    for (size_t primitive = 0; primitive < asset->primitive_count; ++primitive) {
+        uint64_t mask = asset->primitives[primitive].texcoord_mask;
+        while (mask != 0) {
+            texcoord_accessor_count += (size_t) (mask & UINT64_C(1));
+            mask >>= 1u;
+        }
+    }
     if (!rigged_multiply_size(
             asset->primitive_count,
             RIGGED_ACCESSORS_PER_PRIMITIVE,
             &accessor_count) ||
+        !rigged_add_size(accessor_count, texcoord_accessor_count, &accessor_count) ||
         !rigged_add_size(accessor_count, 1u, &accessor_count) ||
         !rigged_multiply_size(
             asset->primitive_count,
             RIGGED_ATTRIBUTES_PER_PRIMITIVE,
-            &attribute_count)) {
+            &attribute_count) ||
+        !rigged_add_size(attribute_count, texcoord_accessor_count, &attribute_count)) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
         rigged_set_error(error_out, error_size, "GLB metadata allocation size overflow");
         goto cleanup;
     }
     accessors = (cgltf_accessor *) calloc(accessor_count, sizeof(*accessors));
+    views = (cgltf_buffer_view *) calloc(view_count, sizeof(*views));
     primitives = (cgltf_primitive *) calloc(asset->primitive_count, sizeof(*primitives));
     attributes = (cgltf_attribute *) calloc(attribute_count, sizeof(*attributes));
     nodes = (cgltf_node *) calloc(skeleton->joint_count + 1u, sizeof(*nodes));
@@ -934,9 +1404,13 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     child_fill = (size_t *) calloc(skeleton->joint_count, sizeof(*child_fill));
     scene_nodes = (cgltf_node **) calloc(root_count + 1u, sizeof(*scene_nodes));
     joint_names = (char *) calloc(skeleton->joint_count, 32u);
-    if (accessors == NULL || primitives == NULL || attributes == NULL || nodes == NULL ||
+    if (texcoord_accessor_count != 0) {
+        texcoord_attribute_names = (char *) calloc(texcoord_accessor_count, 24u);
+    }
+    if (accessors == NULL || views == NULL || primitives == NULL || attributes == NULL || nodes == NULL ||
         skin_joints == NULL || child_counts == NULL || child_offsets == NULL ||
-        child_fill == NULL || scene_nodes == NULL || joint_names == NULL) {
+        child_fill == NULL || scene_nodes == NULL || joint_names == NULL ||
+        (texcoord_accessor_count != 0 && texcoord_attribute_names == NULL)) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
         rigged_set_error(error_out, error_size, "out of memory allocating GLB metadata");
         goto cleanup;
@@ -952,14 +1426,12 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     }
 
     cgltf_buffer buffer;
-    cgltf_buffer_view views[RIGGED_VIEW_COUNT];
     cgltf_material material;
     cgltf_mesh mesh;
     cgltf_skin skin;
     cgltf_scene scene;
     cgltf_data data;
     memset(&buffer, 0, sizeof(buffer));
-    memset(views, 0, sizeof(views));
     memset(&material, 0, sizeof(material));
     memset(&mesh, 0, sizeof(mesh));
     memset(&skin, 0, sizeof(skin));
@@ -969,30 +1441,55 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     buffer.name = (char *) "TokenSkin binary";
     buffer.size = binary_size;
     buffer.data = binary;
-    const size_t view_sizes[RIGGED_VIEW_COUNT] = {
+    const size_t required_view_sizes[RIGGED_REQUIRED_VIEW_COUNT] = {
         position_bytes,
         normal_bytes,
         joint_bytes,
         weight_bytes,
-        index_bytes,
-        inverse_bind_bytes,
     };
-    for (size_t view = 0; view < RIGGED_VIEW_COUNT; ++view) {
+    for (size_t view = 0; view < RIGGED_REQUIRED_VIEW_COUNT; ++view) {
         views[view].buffer = &buffer;
         views[view].offset = view_offsets[view];
-        views[view].size = view_sizes[view];
+        views[view].size = required_view_sizes[view];
+    }
+    if (texcoord_view != SIZE_MAX) {
+        views[texcoord_view].buffer = &buffer;
+        views[texcoord_view].offset = texcoord_offset;
+        views[texcoord_view].size = texcoord_bytes;
+        views[texcoord_view].name = (char *) "texture coordinates";
+        views[texcoord_view].type = cgltf_buffer_view_type_vertices;
+    }
+    views[index_view].buffer = &buffer;
+    views[index_view].offset = index_offset;
+    views[index_view].size = index_bytes;
+    views[index_view].name = (char *) "indices";
+    views[index_view].type = cgltf_buffer_view_type_indices;
+    views[inverse_bind_view].buffer = &buffer;
+    views[inverse_bind_view].offset = inverse_bind_offset;
+    views[inverse_bind_view].size = inverse_bind_bytes;
+    views[inverse_bind_view].name = (char *) "inverse bind matrices";
+    for (size_t image = 0;
+         source_appearance.data != NULL &&
+             image < (size_t) source_appearance.data->images_count;
+         ++image) {
+        cgltf_buffer_view * view = &views[image_view_base + image];
+        view->buffer = &buffer;
+        view->offset = image_view_offsets[image];
+        view->size = source_appearance.images[image].size;
+        view->name = source_appearance.data->images[image].name;
+        source_appearance.data->images[image].uri = NULL;
+        source_appearance.data->images[image].buffer_view = view;
+        source_appearance.data->images[image].mime_type =
+            (char *) source_appearance.images[image].embedded_mime_type;
     }
     views[RIGGED_VIEW_POSITIONS].name = (char *) "positions";
     views[RIGGED_VIEW_NORMALS].name = (char *) "normals";
     views[RIGGED_VIEW_JOINTS].name = (char *) "joints";
     views[RIGGED_VIEW_WEIGHTS].name = (char *) "weights";
-    views[RIGGED_VIEW_INDICES].name = (char *) "indices";
-    views[RIGGED_VIEW_INVERSE_BINDS].name = (char *) "inverse bind matrices";
     views[RIGGED_VIEW_POSITIONS].type = cgltf_buffer_view_type_vertices;
     views[RIGGED_VIEW_NORMALS].type = cgltf_buffer_view_type_vertices;
     views[RIGGED_VIEW_JOINTS].type = cgltf_buffer_view_type_vertices;
     views[RIGGED_VIEW_WEIGHTS].type = cgltf_buffer_view_type_vertices;
-    views[RIGGED_VIEW_INDICES].type = cgltf_buffer_view_type_indices;
 
     material.name = (char *) "TokenSkin default PBR";
     material.has_pbr_metallic_roughness = 1;
@@ -1004,6 +1501,10 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     material.pbr_metallic_roughness.roughness_factor = 1.0f;
     material.alpha_mode = cgltf_alpha_mode_opaque;
 
+    size_t texcoord_accessor_cursor =
+        asset->primitive_count * RIGGED_ACCESSORS_PER_PRIMITIVE;
+    size_t texcoord_name_cursor = 0;
+    size_t attribute_cursor = 0;
     for (size_t primitive = 0; primitive < asset->primitive_count; ++primitive) {
         const trellis_mesh_rigging_primitive_range * range = &asset->primitives[primitive];
         cgltf_accessor * position = &accessors[primitive * RIGGED_ACCESSORS_PER_PRIMITIVE + 0u];
@@ -1051,7 +1552,7 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         weights->type = cgltf_type_vec4;
         weights->count = range->vertex_count;
 
-        indices->buffer_view = &views[RIGGED_VIEW_INDICES];
+        indices->buffer_view = &views[index_view];
         indices->offset = range->first_triangle * 3u * sizeof(uint32_t);
         indices->component_type = cgltf_component_type_r_32u;
         indices->type = cgltf_type_scalar;
@@ -1074,8 +1575,7 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         indices->min[0] = (float) minimum_index;
         indices->max[0] = (float) maximum_index;
 
-        cgltf_attribute * primitive_attributes =
-            attributes + primitive * RIGGED_ATTRIBUTES_PER_PRIMITIVE;
+        cgltf_attribute * primitive_attributes = attributes + attribute_cursor;
         primitive_attributes[0].name = (char *) "POSITION";
         primitive_attributes[0].type = cgltf_attribute_type_position;
         primitive_attributes[0].data = position;
@@ -1091,16 +1591,53 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
         primitive_attributes[3].index = 0;
         primitive_attributes[3].data = weights;
 
+        size_t primitive_attribute_count = RIGGED_ATTRIBUTES_PER_PRIMITIVE;
+        for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
+            if ((range->texcoord_mask & (UINT64_C(1) << set)) == 0) continue;
+            cgltf_accessor * texcoord = &accessors[texcoord_accessor_cursor++];
+            texcoord->buffer_view = &views[texcoord_view];
+            texcoord->offset =
+                (set * asset->vertex_count + range->first_vertex) * 2u * sizeof(float);
+            texcoord->component_type = cgltf_component_type_r_32f;
+            texcoord->type = cgltf_type_vec2;
+            texcoord->count = range->vertex_count;
+            cgltf_attribute * attribute =
+                &primitive_attributes[primitive_attribute_count++];
+            char * name = texcoord_attribute_names + texcoord_name_cursor * 24u;
+            snprintf(name, 24u, "TEXCOORD_%zu", set);
+            ++texcoord_name_cursor;
+            attribute->name = name;
+            attribute->type = cgltf_attribute_type_texcoord;
+            attribute->index = (cgltf_int) set;
+            attribute->data = texcoord;
+        }
+
         primitives[primitive].type = cgltf_primitive_type_triangles;
         primitives[primitive].indices = indices;
-        primitives[primitive].material = &material;
+        if (source_appearance.data != NULL &&
+            range->source_material_index != SIZE_MAX) {
+            primitives[primitive].material =
+                &source_appearance.data->materials[range->source_material_index];
+        } else if (source_appearance.data == NULL ||
+            source_appearance.data->materials_count == 0) {
+            primitives[primitive].material = &material;
+        }
         primitives[primitive].attributes = primitive_attributes;
-        primitives[primitive].attributes_count = RIGGED_ATTRIBUTES_PER_PRIMITIVE;
+        primitives[primitive].attributes_count = primitive_attribute_count;
+        attribute_cursor += primitive_attribute_count;
+    }
+
+    if (texcoord_accessor_cursor != accessor_count - 1u ||
+        texcoord_name_cursor != texcoord_accessor_count ||
+        attribute_cursor != attribute_count) {
+        status = TRELLIS_STATUS_ERROR;
+        rigged_set_error(error_out, error_size, "internal texture-coordinate metadata count mismatch");
+        goto cleanup;
     }
 
     cgltf_accessor * inverse_binds = &accessors[accessor_count - 1u];
     inverse_binds->name = (char *) "inverse bind matrices";
-    inverse_binds->buffer_view = &views[RIGGED_VIEW_INVERSE_BINDS];
+    inverse_binds->buffer_view = &views[inverse_bind_view];
     inverse_binds->component_type = cgltf_component_type_r_32f;
     inverse_binds->type = cgltf_type_mat4;
     inverse_binds->count = skeleton->joint_count;
@@ -1164,12 +1701,26 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     data.asset.generator = (char *) "trellis2.c TokenSkin rigged GLB writer";
     data.meshes = &mesh;
     data.meshes_count = 1;
-    data.materials = &material;
-    data.materials_count = 1;
+    if (source_appearance.data != NULL &&
+        source_appearance.data->materials_count != 0) {
+        data.materials = source_appearance.data->materials;
+        data.materials_count = source_appearance.data->materials_count;
+    } else {
+        data.materials = &material;
+        data.materials_count = 1;
+    }
+    if (source_appearance.data != NULL) {
+        data.images = source_appearance.data->images;
+        data.images_count = source_appearance.data->images_count;
+        data.samplers = source_appearance.data->samplers;
+        data.samplers_count = source_appearance.data->samplers_count;
+        data.textures = source_appearance.data->textures;
+        data.textures_count = source_appearance.data->textures_count;
+    }
     data.accessors = accessors;
     data.accessors_count = accessor_count;
     data.buffer_views = views;
-    data.buffer_views_count = RIGGED_VIEW_COUNT;
+    data.buffer_views_count = view_count;
     data.buffers = &buffer;
     data.buffers_count = 1;
     data.skins = &skin;
@@ -1219,9 +1770,20 @@ trellis_status trellis_mesh_rigging_write_rigged_glb(
     status = rigged_verify_written_glb(path, error_out, error_size);
     if (status != TRELLIS_STATUS_OK) {
         remove(path);
+    } else if (appearance_fallback) {
+        rigged_set_error(
+            error_out,
+            error_size,
+            "warning: source appearance could not be preserved (%s); "
+            "exported the rig with a default opaque white PBR material",
+            appearance_diagnostic[0] != '\0' ?
+                appearance_diagnostic : "unknown source appearance error");
     }
 
 cleanup:
+    rigged_source_appearance_free(&source_appearance);
+    free(image_view_offsets);
+    free(texcoord_attribute_names);
     free(joint_names);
     free(world_joints);
     free(child_fill);
@@ -1234,6 +1796,7 @@ cleanup:
     free(attributes);
     free(primitives);
     free(accessors);
+    free(views);
     free(binary);
     free(vertex_weights);
     free(vertex_joints);

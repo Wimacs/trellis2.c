@@ -79,10 +79,10 @@ DINO; `--birefnet FILE` remains an explicit override.
 
 `trellis2_image_to_gltf.c` and `pixal3d_image_to_gltf.c` are thin model-pinned
 entry points over `image_to_gltf_cli.c`. They call
-`trellis_pipeline_trellis2_image_to_gltf()` and
-`trellis_pipeline_pixal3d_image_to_gltf()` respectively. The generic library
-entry points remain for source compatibility, but there is no generic CLI that
-auto-dispatches between model families.
+the family-specific `_ex` APIs with a versioned
+`trellis_image_to_gltf_feature_options` struct. The original family and generic
+library entry points remain ABI-compatible and default the new features off;
+there is no generic CLI that auto-dispatches between model families.
 
 `trellis2-texture-mesh` is the independent TRELLIS.2 existing-mesh material
 generator. It does not add a mode to either image-to-3D executable:
@@ -108,6 +108,31 @@ textures. Opaque images automatically run the discovered BiRefNet checkpoint;
 no backend-specific flag or foreground-preprocessing command is needed. The
 pipeline creates a new static textured GLB and therefore does not retain source
 materials, UVs, node structure, skinning, animations, or VRM extensions.
+
+Generate shape-only output together with reusable material inputs:
+
+```sh
+./build-cuda/trellis2-image-to-gltf \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image example_image/vrm.png \
+  --shape-only \
+  --prepared-image-output outputs/vrm-prepared.png \
+  --shape-latent-output outputs/vrm-shape.tslat \
+  --output outputs/vrm-shape.glb
+
+./build-cuda/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input outputs/vrm-shape.glb \
+  --image outputs/vrm-prepared.png --image-prepared \
+  --shape-latent outputs/vrm-shape.tslat \
+  --output outputs/vrm-textured.glb
+```
+
+The latent cache belongs to the same generated asset and may be reused after a
+topology-only remesh. On a cache miss the texturing CLI encodes the current mesh;
+`--shape-latent-output FILE` can save that replacement cache.
 
 TokenSkin follows the same one-model/one-executable rule with the independent
 `tokenskin-rig` mesh-rigging CLI. Convert the official TokenRig checkpoint into
@@ -141,9 +166,11 @@ Run a Vulkan build with the same CLI contract:
 No backend-specific environment variable or additional inference flag is
 needed. Input may be GLB or glTF; output is a self-contained rigged GLB. The
 current exporter preserves flattened world-space mesh geometry and topology,
-adds the generated skeleton and skin data, and rebuilds a default PBR material.
-It does not preserve source materials, UVs, textures, node structure, or
-animations.
+adds the generated skeleton and skin data, and preserves standard primitive
+materials, UV sets, textures, samplers, and image payloads in the output GLB.
+If source appearance cannot be copied it falls back to a default white PBR
+material instead of failing the rig. It does not preserve source node structure,
+morph targets, or animations.
 
 `gltfpack` is built from the pinned `3rd/meshoptimizer` submodule. It can make
 a simplified LOD before TokenSkin rigging; for example, this keeps regular

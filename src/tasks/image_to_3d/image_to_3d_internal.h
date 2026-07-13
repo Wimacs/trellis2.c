@@ -33,8 +33,16 @@ trellis_status trellis_pipeline_prepare_condition_image_for_image_to_gltf(
     int require_foreground,
     trellis_prepared_condition_image * prepared_out);
 
+trellis_status trellis_pipeline_adopt_prepared_condition_image(
+    const char * image_path,
+    trellis_prepared_condition_image * prepared_out);
+
 void trellis_pipeline_prepared_condition_image_free(
     trellis_prepared_condition_image * prepared);
+
+trellis_status trellis_pipeline_write_prepared_condition_image_png(
+    const trellis_prepared_condition_image * prepared,
+    const char * output_path);
 
 typedef enum trellis_pipeline_cache_entry_kind {
     TRELLIS_PIPELINE_CACHE_ENTRY_DINO = 0,
@@ -245,6 +253,27 @@ typedef trellis_structured_latent trellis_shape_latent;
 void trellis_structured_latent_free(trellis_structured_latent * latent);
 void trellis_shape_latent_free(trellis_shape_latent * latent);
 
+typedef struct trellis_shape_latent_cache_info {
+    uint32_t version;
+    int resolution;
+    int channels;
+    int64_t n_coords;
+    /* Shape-decoder coordinate frame before topology postprocessing. */
+    float anchor_aabb_min[3];
+    float anchor_aabb_max[3];
+} trellis_shape_latent_cache_info;
+
+trellis_status trellis_shape_latent_cache_write(
+    const char * path,
+    const trellis_structured_latent * latent,
+    const trellis_mesh_host * anchor_mesh,
+    trellis_shape_latent_cache_info * info_out);
+
+trellis_status trellis_shape_latent_cache_read(
+    const char * path,
+    trellis_structured_latent * latent_out,
+    trellis_shape_latent_cache_info * info_out);
+
 typedef struct trellis_structured_latent_options {
     const char * model_dir;
     const char * flow_override_path;
@@ -406,6 +435,11 @@ trellis_status trellis_pipeline_write_gltf_ex(
     const trellis_pbr_voxels * voxels,
     int texture_size,
     int device,
+    trellis_pipeline_gltf_coordinate_transform coordinate_transform);
+
+trellis_status trellis_pipeline_write_shape_gltf_ex(
+    const char * path,
+    const trellis_mesh_host * mesh,
     trellis_pipeline_gltf_coordinate_transform coordinate_transform);
 
 #endif

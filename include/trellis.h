@@ -911,6 +911,25 @@ typedef struct trellis_image_to_gltf_options {
     int vkmesh_gpu_workspace_budget_mib; /* 0=automatic */
 } trellis_image_to_gltf_options;
 
+/* Optional image-to-glTF features and persisted intermediate artifacts.  This
+ * is deliberately separate from trellis_image_to_gltf_options so callers
+ * compiled against the original, unversioned options layout remain ABI-safe. */
+typedef struct trellis_image_to_gltf_feature_options {
+    size_t struct_size;           /* set to sizeof(trellis_image_to_gltf_feature_options) */
+    uint32_t version;             /* set to TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_VERSION */
+    int shape_only;               /* skip texture flow/decoder and export an untextured mesh */
+    const char * prepared_image_output_path; /* optional RGBA PNG used for conditioning */
+    const char * shape_latent_output_path; /* optional reusable TRELLIS.2 shape SLat cache */
+} trellis_image_to_gltf_feature_options;
+
+#define TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_VERSION 1u
+#define TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_V1_SIZE \
+    (offsetof(trellis_image_to_gltf_feature_options, shape_latent_output_path) + \
+     sizeof(const char *))
+#define TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_INIT \
+    { sizeof(trellis_image_to_gltf_feature_options), \
+      TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_VERSION, 0, NULL, NULL }
+
 typedef struct trellis_pixal3d_options {
     size_t struct_size;           /* set to sizeof(trellis_pixal3d_options) */
     const char * naf_path;        /* NULL/empty: search model_dir/ckpts automatically */
@@ -937,9 +956,18 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
 trellis_status trellis_pipeline_trellis2_image_to_gltf(
     const trellis_image_to_gltf_options * options);
 
+trellis_status trellis_pipeline_trellis2_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_image_to_gltf_feature_options * feature_options);
+
 trellis_status trellis_pipeline_pixal3d_image_to_gltf(
     const trellis_image_to_gltf_options * options,
     const trellis_pixal3d_options * pixal_options);
+
+trellis_status trellis_pipeline_pixal3d_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options,
+    const trellis_image_to_gltf_feature_options * feature_options);
 
 typedef struct trellis_mesh_texturing_options {
     size_t struct_size;              /* set to sizeof(trellis_mesh_texturing_options) */
@@ -963,17 +991,25 @@ typedef struct trellis_mesh_texturing_options {
     int flow_no_rope;                /* debug sparse-RoPE bypass */
     int emulate_bf16_blocks;         /* debug explicit BF16 activation round trips */
     int no_flash_attn;               /* debug explicit-attention fallback */
+    int image_prepared;              /* image_path is the final condition; skip BiRefNet */
+    const char * shape_latent_path;   /* optional reusable shape SLat cache input */
+    const char * shape_latent_output_path; /* optional cache written after mesh encoding */
 } trellis_mesh_texturing_options;
 
 #define TRELLIS_MESH_TEXTURING_OPTIONS_V1_SIZE \
     (offsetof(trellis_mesh_texturing_options, no_flash_attn) + sizeof(int))
+#define TRELLIS_MESH_TEXTURING_OPTIONS_V2_SIZE \
+    (offsetof(trellis_mesh_texturing_options, image_prepared) + sizeof(int))
+#define TRELLIS_MESH_TEXTURING_OPTIONS_V3_SIZE \
+    (offsetof(trellis_mesh_texturing_options, shape_latent_output_path) + sizeof(const char *))
 #define TRELLIS_MESH_TEXTURING_OPTIONS_INIT \
     { sizeof(trellis_mesh_texturing_options), NULL, NULL, NULL, NULL, NULL, \
-      NULL, NULL, NULL, NULL, NULL, 0, 512, 1024, 12, 42u, -1, -1, 0, 0, 0 }
+      NULL, NULL, NULL, NULL, NULL, 0, 512, 1024, 12, 42u, -1, -1, 0, 0, 0, 0, NULL, NULL }
 
 /* TRELLIS.2-only existing-mesh material generation. The input geometry is
- * normalized and converted to a Flexible Dual Grid, encoded into shape SLat,
- * then used as the concat condition for the released texture flow/decoder. */
+ * aligned to a compatible cached shape SLat when supplied; otherwise it is
+ * normalized, converted to a Flexible Dual Grid, and encoded. The shape SLat
+ * then conditions the released texture flow/decoder. */
 trellis_status trellis_pipeline_trellis2_texture_mesh(
     const trellis_mesh_texturing_options * options);
 

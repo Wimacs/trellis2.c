@@ -168,6 +168,26 @@ static void unlink_if_set(const char * path) {
     }
 }
 
+trellis_status trellis_pipeline_adopt_prepared_condition_image(
+    const char * image_path,
+    trellis_prepared_condition_image * prepared_out) {
+    if (image_path == NULL || image_path[0] == '\0' || prepared_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_prepared_condition_image prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    const int n = snprintf(
+        prepared.source_path,
+        sizeof(prepared.source_path),
+        "%s",
+        image_path);
+    if (n < 0 || (size_t) n >= sizeof(prepared.source_path)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *prepared_out = prepared;
+    return TRELLIS_STATUS_OK;
+}
+
 static trellis_status apply_birefnet_background_removal(
     const char * input_path,
     const char * gguf_path,
@@ -258,6 +278,53 @@ void trellis_pipeline_prepared_condition_image_free(
     unlink_if_set(prepared->foreground_path);
     unlink_if_set(prepared->converted_path);
     memset(prepared, 0, sizeof(*prepared));
+}
+
+trellis_status trellis_pipeline_write_prepared_condition_image_png(
+    const trellis_prepared_condition_image * prepared,
+    const char * output_path) {
+    if (prepared == NULL || prepared->source_path[0] == '\0' ||
+        output_path == NULL || output_path[0] == '\0') {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    int width = 0;
+    int height = 0;
+    int components = 0;
+    unsigned char * rgba = stbi_load(
+        prepared->source_path,
+        &width,
+        &height,
+        &components,
+        4);
+    if (rgba == NULL || width <= 0 || height <= 0 || width > INT32_MAX / 4) {
+        TRELLIS_ERROR(
+            "image prep: failed to load prepared condition image: %s",
+            prepared->source_path);
+        stbi_image_free(rgba);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    const int wrote = stbi_write_png(
+        output_path,
+        width,
+        height,
+        4,
+        rgba,
+        width * 4);
+    stbi_image_free(rgba);
+    if (!wrote) {
+        TRELLIS_ERROR(
+            "image prep: failed to persist prepared RGBA PNG: %s",
+            output_path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    TRELLIS_INFO(
+        "image prep: persisted prepared RGBA PNG: %s (%dx%d)",
+        output_path,
+        width,
+        height);
+    return TRELLIS_STATUS_OK;
 }
 
 static trellis_status prepare_condition_image_impl(

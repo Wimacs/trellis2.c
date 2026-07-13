@@ -346,9 +346,6 @@ trellis_status trellis_pipeline_tokenskin_rig(
     dense_weights.point_count = preprocessed.sample_count;
     dense_weights.joint_count = skeleton.joint_count;
     dense_weights.interpolation_neighbors = 8;
-    TRELLIS_WARN(
-        "TokenSkin flattened rig export preserves geometry/primitive topology; "
-        "source textures, materials and animations are not yet copied");
     started_us = ggml_time_us();
     status = trellis_mesh_rigging_write_rigged_glb(
         options->output_path,
@@ -361,6 +358,13 @@ trellis_status trellis_pipeline_tokenskin_rig(
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("TokenSkin rigged GLB export: %s", error);
         goto cleanup;
+    }
+    if (error[0] != '\0') {
+        TRELLIS_WARN("TokenSkin rigged GLB export: %s", error);
+    } else {
+        TRELLIS_INFO(
+            "TokenSkin rig export preserved the available source appearance "
+            "and texture coordinates");
     }
     perf_stage("export", started_us);
     TRELLIS_INFO("TokenSkin rigged GLB: %s", options->output_path);

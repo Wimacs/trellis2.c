@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern unsigned char * stbi_load(
+    char const * filename,
+    int * x,
+    int * y,
+    int * comp,
+    int req_comp);
+extern void stbi_image_free(void * retval_from_stbi_load);
+
 static int failures = 0;
 
 #define CHECK_TRUE(expr) do { \
@@ -52,12 +60,18 @@ static void test_prepare_profiles(void) {
     char model_dir[PATH_MAX];
     char opaque_path[PATH_MAX];
     char transparent_path[PATH_MAX];
+    char prepared_output_path[PATH_MAX];
     CHECK_TRUE(trellis_make_temp_path(
         model_dir, sizeof(model_dir), "trellis_prepare_model", NULL));
     CHECK_TRUE(trellis_make_temp_path(
         opaque_path, sizeof(opaque_path), "trellis_prepare_opaque", ".ppm"));
     CHECK_TRUE(trellis_make_temp_path(
         transparent_path, sizeof(transparent_path), "trellis_prepare_alpha", ".tga"));
+    CHECK_TRUE(trellis_make_temp_path(
+        prepared_output_path,
+        sizeof(prepared_output_path),
+        "trellis_prepare_persisted",
+        ".png"));
     CHECK_TRUE(trellis_mkdir_p(model_dir));
     CHECK_TRUE(write_opaque_ppm(opaque_path));
     CHECK_TRUE(write_transparent_tga(transparent_path));
@@ -73,6 +87,20 @@ static void test_prepare_profiles(void) {
 
     trellis_prepared_condition_image prepared;
     memset(&prepared, 0, sizeof(prepared));
+    CHECK_TRUE(trellis_setenv(
+        "TRELLIS_BIREFNET_PATH",
+        opaque_path,
+        1) == 0);
+    CHECK_TRUE(trellis_pipeline_adopt_prepared_condition_image(
+        opaque_path,
+        &prepared) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(strcmp(prepared.source_path, opaque_path) == 0);
+    CHECK_TRUE(prepared.converted_path[0] == '\0');
+    CHECK_TRUE(prepared.foreground_path[0] == '\0');
+    trellis_pipeline_prepared_condition_image_free(&prepared);
+    CHECK_TRUE(trellis_access_read(opaque_path));
+    CHECK_TRUE(trellis_unsetenv("TRELLIS_BIREFNET_PATH") == 0);
+
     CHECK_TRUE(trellis_pipeline_prepare_condition_image(
         model_dir,
         model_dir,
@@ -85,7 +113,29 @@ static void test_prepare_profiles(void) {
     CHECK_TRUE(strcmp(prepared.source_path, opaque_path) == 0);
     CHECK_TRUE(prepared.converted_path[0] == '\0');
     CHECK_TRUE(prepared.foreground_path[0] == '\0');
+    CHECK_TRUE(trellis_pipeline_write_prepared_condition_image_png(
+        &prepared,
+        prepared_output_path) == TRELLIS_STATUS_OK);
     trellis_pipeline_prepared_condition_image_free(&prepared);
+
+    int persisted_width = 0;
+    int persisted_height = 0;
+    int persisted_components = 0;
+    unsigned char * persisted_rgba = stbi_load(
+        prepared_output_path,
+        &persisted_width,
+        &persisted_height,
+        &persisted_components,
+        4);
+    CHECK_TRUE(persisted_rgba != NULL);
+    CHECK_TRUE(persisted_width == 1 && persisted_height == 1);
+    if (persisted_rgba != NULL) {
+        CHECK_TRUE(persisted_rgba[0] == 255u);
+        CHECK_TRUE(persisted_rgba[1] == 0u);
+        CHECK_TRUE(persisted_rgba[2] == 0u);
+        CHECK_TRUE(persisted_rgba[3] == 255u);
+    }
+    stbi_image_free(persisted_rgba);
 
     CHECK_TRUE(trellis_pipeline_prepare_condition_image(
         model_dir,
@@ -116,10 +166,28 @@ static void test_prepare_profiles(void) {
         1,
         &prepared) == TRELLIS_STATUS_OK);
     CHECK_TRUE(strcmp(prepared.source_path, transparent_path) == 0);
+    CHECK_TRUE(trellis_pipeline_write_prepared_condition_image_png(
+        &prepared,
+        prepared_output_path) == TRELLIS_STATUS_OK);
     trellis_pipeline_prepared_condition_image_free(&prepared);
+
+    persisted_width = 0;
+    persisted_height = 0;
+    persisted_components = 0;
+    persisted_rgba = stbi_load(
+        prepared_output_path,
+        &persisted_width,
+        &persisted_height,
+        &persisted_components,
+        4);
+    CHECK_TRUE(persisted_rgba != NULL);
+    CHECK_TRUE(persisted_width == 1 && persisted_height == 1);
+    if (persisted_rgba != NULL) CHECK_TRUE(persisted_rgba[3] == 0u);
+    stbi_image_free(persisted_rgba);
 
     restore_environment(saved);
     free(saved);
+    trellis_unlink(prepared_output_path);
     trellis_unlink(transparent_path);
     trellis_unlink(opaque_path);
     remove(model_dir);

@@ -44,6 +44,12 @@ def main() -> int:
             "TRELLIS.2 pipeline profiles are unclear", trellis_help.stdout)
     require("--pipeline NAME         512 (default) or 1024" in trellis_help.stdout,
             "TRELLIS.2 is missing its pipeline option", trellis_help.stdout)
+    require("--prepared-image-output" in trellis_help.stdout,
+            "TRELLIS.2 is missing prepared-image persistence", trellis_help.stdout)
+    require("--shape-only" in trellis_help.stdout,
+            "TRELLIS.2 is missing shape-only generation", trellis_help.stdout)
+    require("--shape-latent-output" in trellis_help.stdout,
+            "TRELLIS.2 is missing shape latent persistence", trellis_help.stdout)
     for pixal_flag in ("--naf", "--fov", "--camera-distance", "--mesh-scale"):
         require(pixal_flag not in trellis_help.stdout, f"TRELLIS.2 exposes {pixal_flag}", trellis_help.stdout)
 
@@ -52,6 +58,17 @@ def main() -> int:
     require("Pixal3D image-to-3D" in pixal_help.stdout, "wrong Pixal3D banner", pixal_help.stdout)
     for pixal_flag in ("--naf", "--pipeline", "--fov", "--camera-distance", "--mesh-scale"):
         require(pixal_flag in pixal_help.stdout, f"Pixal3D is missing {pixal_flag}", pixal_help.stdout)
+    require("--prepared-image-output" in pixal_help.stdout,
+            "Pixal3D is missing prepared-image persistence", pixal_help.stdout)
+    require("--shape-only" in pixal_help.stdout,
+            "Pixal3D is missing shape-only generation", pixal_help.stdout)
+    require("--shape-latent-output" not in pixal_help.stdout,
+            "Pixal3D advertises unsupported shape latent persistence", pixal_help.stdout)
+
+    rejected_pixal_latent = run(args.pixal3d, "--shape-latent-output", "unused.tslat")
+    require(rejected_pixal_latent.returncode == 2,
+            "Pixal3D accepted unsupported shape latent persistence",
+            rejected_pixal_latent.stdout)
 
     rejected_flag = run(args.trellis2, "--naf", "unused.safetensors")
     require(rejected_flag.returncode == 2, "TRELLIS.2 accepted --naf", rejected_flag.stdout)
@@ -74,6 +91,11 @@ def main() -> int:
         str(args.source_dir / "models" / "pixal3d"),
         "--pipeline",
         "1024",
+        "--shape-only",
+        "--prepared-image-output",
+        "must-not-be-written.png",
+        "--shape-latent-output",
+        "must-not-be-written.tslat",
         *common,
     )
     require(wrong_trellis_family.returncode == 1,
@@ -85,6 +107,9 @@ def main() -> int:
         args.pixal3d,
         "--model",
         str(args.source_dir / "models" / "trellis2"),
+        "--shape-only",
+        "--prepared-image-output",
+        "must-not-be-written.png",
         *common,
     )
     require(wrong_pixal_family.returncode == 1,
@@ -97,7 +122,7 @@ def main() -> int:
             "TRELLIS.2 mesh texturing --help failed", texturing_help.stdout)
     require("TRELLIS.2 shape-conditioned material pipeline" in texturing_help.stdout,
             "wrong TRELLIS.2 mesh texturing task banner", texturing_help.stdout)
-    for required_flag in ("--input", "--image", "--shape-encoder", "--texture-flow"):
+    for required_flag in ("--input", "--image", "--image-prepared", "--shape-latent", "--shape-latent-output", "--shape-encoder", "--texture-flow"):
         require(required_flag in texturing_help.stdout,
                 f"TRELLIS.2 mesh texturing is missing {required_flag}",
                 texturing_help.stdout)
@@ -116,6 +141,7 @@ def main() -> int:
         "must-not-be-opened.glb",
         "--image",
         "must-not-be-opened.png",
+        "--image-prepared",
         "--output",
         "must-not-be-written.glb",
     )

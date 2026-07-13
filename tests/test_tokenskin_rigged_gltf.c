@@ -26,6 +26,121 @@ static int nearly_equal(float left, float right, float tolerance) {
     return fabsf(left - right) <= tolerance;
 }
 
+static const unsigned char textured_image_bytes[8] = {
+    0x89u, 0x50u, 0x4eu, 0x47u, 0x0du, 0x0au, 0x1au, 0x0au,
+};
+
+static int test_write_all(FILE * file, const void * data, size_t size) {
+    return size == 0 || fwrite(data, 1, size, file) == size;
+}
+
+static int test_write_u32_le(FILE * file, uint32_t value) {
+    const unsigned char bytes[4] = {
+        (unsigned char) value,
+        (unsigned char) (value >> 8u),
+        (unsigned char) (value >> 16u),
+        (unsigned char) (value >> 24u),
+    };
+    return test_write_all(file, bytes, sizeof(bytes));
+}
+
+static void test_store_f32_le(unsigned char output[4], float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    output[0] = (unsigned char) bits;
+    output[1] = (unsigned char) (bits >> 8u);
+    output[2] = (unsigned char) (bits >> 16u);
+    output[3] = (unsigned char) (bits >> 24u);
+}
+
+static int write_textured_source_glb(const char * path) {
+    static const float positions[9] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+    };
+    static const float texcoords[6] = {
+        0.125f, 0.25f,
+        0.75f, 0.375f,
+        0.5f, 0.875f,
+    };
+    unsigned char binary[76] = { 0 };
+    for (size_t i = 0; i < 9u; ++i) {
+        test_store_f32_le(binary + i * 4u, positions[i]);
+    }
+    for (size_t i = 0; i < 6u; ++i) {
+        test_store_f32_le(binary + 36u + i * 4u, texcoords[i]);
+    }
+    binary[60] = 0u;
+    binary[62] = 1u;
+    binary[64] = 2u;
+    memcpy(binary + 68u, textured_image_bytes, sizeof(textured_image_bytes));
+
+    static const char document[] =
+        "{"
+        "\"asset\":{\"version\":\"2.0\"},"
+        "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],"
+        "\"nodes\":[{\"mesh\":0}],"
+        "\"meshes\":[{\"primitives\":[{"
+          "\"indices\":2,\"material\":0,"
+          "\"attributes\":{\"POSITION\":0,\"TEXCOORD_0\":1}"
+        "}]}],"
+        "\"materials\":[{"
+          "\"name\":\"paint\",\"doubleSided\":true,"
+          "\"alphaMode\":\"MASK\",\"alphaCutoff\":0.42,"
+          "\"emissiveFactor\":[0.1,0.2,0.3],"
+          "\"normalTexture\":{\"index\":0,\"scale\":0.6},"
+          "\"occlusionTexture\":{\"index\":0,\"strength\":0.7},"
+          "\"emissiveTexture\":{\"index\":0},"
+          "\"pbrMetallicRoughness\":{"
+            "\"baseColorFactor\":[0.2,0.3,0.4,0.5],"
+            "\"metallicFactor\":0.25,\"roughnessFactor\":0.75,"
+            "\"baseColorTexture\":{\"index\":0,\"texCoord\":0},"
+            "\"metallicRoughnessTexture\":{\"index\":0}"
+          "}"
+        "}],"
+        "\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,"
+          "\"wrapS\":33071,\"wrapT\":33648}],"
+        "\"images\":[{\"name\":\"surface image\",\"bufferView\":3,"
+          "\"mimeType\":\"image/png\"}],"
+        "\"textures\":[{\"name\":\"surface texture\",\"sampler\":0,\"source\":0}],"
+        "\"buffers\":[{\"byteLength\":76}],"
+        "\"bufferViews\":["
+          "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36,\"target\":34962},"
+          "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":24,\"target\":34962},"
+          "{\"buffer\":0,\"byteOffset\":60,\"byteLength\":6,\"target\":34963},"
+          "{\"buffer\":0,\"byteOffset\":68,\"byteLength\":8}"
+        "],"
+        "\"accessors\":["
+          "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\","
+            "\"min\":[0,0,0],\"max\":[1,1,0]},"
+          "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},"
+          "{\"bufferView\":2,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\","
+            "\"min\":[0],\"max\":[2]}"
+        "]"
+        "}";
+    const size_t json_size = strlen(document);
+    const size_t padded_json_size = (json_size + 3u) & ~(size_t) 3u;
+    const uint32_t total_size = (uint32_t) (12u + 8u + padded_json_size + 8u + sizeof(binary));
+    FILE * file = fopen(path, "wb");
+    if (file == NULL) return 0;
+    int ok = test_write_u32_le(file, UINT32_C(0x46546c67)) &&
+        test_write_u32_le(file, 2u) &&
+        test_write_u32_le(file, total_size) &&
+        test_write_u32_le(file, (uint32_t) padded_json_size) &&
+        test_write_u32_le(file, UINT32_C(0x4e4f534a)) &&
+        test_write_all(file, document, json_size);
+    for (size_t i = json_size; i < padded_json_size && ok; ++i) {
+        const unsigned char space = 0x20u;
+        ok = test_write_all(file, &space, 1u);
+    }
+    ok = ok && test_write_u32_le(file, (uint32_t) sizeof(binary)) &&
+        test_write_u32_le(file, UINT32_C(0x004e4942)) &&
+        test_write_all(file, binary, sizeof(binary));
+    if (fclose(file) != 0) ok = 0;
+    return ok;
+}
+
 static void make_asset(trellis_mesh_rigging_asset * asset) {
     static float positions[] = {
         8.0f, 18.0f, 30.0f,
@@ -422,6 +537,19 @@ static int test_invalid_inputs(
         sizeof(error)) == TRELLIS_STATUS_INVALID_ARGUMENT);
     TEST_REQUIRE(strstr(error, "non-finite") != NULL);
 
+    trellis_mesh_rigging_asset invalid_texcoords = *asset;
+    invalid_texcoords.texcoord_set_count = 1u;
+    invalid_texcoords.texcoords = NULL;
+    TEST_REQUIRE(trellis_mesh_rigging_write_rigged_glb(
+        "test_tokenskin_invalid.glb",
+        &invalid_texcoords,
+        normalization,
+        skeleton,
+        weights,
+        error,
+        sizeof(error)) == TRELLIS_STATUS_INVALID_ARGUMENT);
+    TEST_REQUIRE(strstr(error, "texture-coordinate") != NULL);
+
     TEST_REQUIRE(trellis_mesh_rigging_write_rigged_glb(
         "test_tokenskin_invalid.gltf",
         asset,
@@ -436,6 +564,232 @@ static int test_invalid_inputs(
 
 fail:
     remove("test_tokenskin_invalid.glb");
+    return 0;
+}
+
+static int test_source_appearance_preserved(void) {
+    const char * source_path = "test_tokenskin_textured_source.glb";
+    const char * output_path = "test_tokenskin_textured_rigged.glb";
+    trellis_mesh_rigging_asset asset = TRELLIS_MESH_RIGGING_ASSET_INIT;
+    cgltf_data * output = NULL;
+    char error[512];
+    TEST_REQUIRE(write_textured_source_glb(source_path));
+    TEST_REQUIRE(trellis_mesh_rigging_gltf_load(
+        source_path, &asset, error, sizeof(error)) == TRELLIS_STATUS_OK);
+    TEST_REQUIRE(asset.vertex_count == 3u);
+    TEST_REQUIRE(asset.primitive_count == 1u);
+    TEST_REQUIRE(asset.texcoord_set_count == 1u);
+    TEST_REQUIRE(asset.texcoords != NULL && asset.texcoords[0] != NULL);
+    TEST_REQUIRE(asset.primitives[0].texcoord_mask == UINT64_C(1));
+    TEST_REQUIRE(asset.primitives[0].source_material_index == 0u);
+
+    trellis_mesh_rigging_normalization normalization;
+    memset(&normalization, 0, sizeof(normalization));
+    normalization.scale = 1.0f;
+    normalization.inverse_scale = 1.0f;
+    static float joint_position[3] = { 0.0f, 0.0f, 0.0f };
+    static int32_t joint_parent[1] = { -1 };
+    trellis_tokenskin_skeleton skeleton;
+    memset(&skeleton, 0, sizeof(skeleton));
+    skeleton.joints_xyz = joint_position;
+    skeleton.parents = joint_parent;
+    skeleton.joint_count = 1u;
+    static const float weight_values[3] = { 1.0f, 1.0f, 1.0f };
+    trellis_mesh_rigging_dense_skin_weights weights =
+        TRELLIS_MESH_RIGGING_DENSE_SKIN_WEIGHTS_INIT;
+    weights.values = weight_values;
+    weights.point_count = 3u;
+    weights.joint_count = 1u;
+    TEST_REQUIRE(trellis_mesh_rigging_write_rigged_glb(
+        output_path,
+        &asset,
+        &normalization,
+        &skeleton,
+        &weights,
+        error,
+        sizeof(error)) == TRELLIS_STATUS_OK);
+    TEST_REQUIRE(error[0] == '\0');
+
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    TEST_REQUIRE(cgltf_parse_file(&options, output_path, &output) == cgltf_result_success);
+    TEST_REQUIRE(cgltf_load_buffers(&options, output, output_path) == cgltf_result_success);
+    TEST_REQUIRE(cgltf_validate(output) == cgltf_result_success);
+    TEST_REQUIRE(output->materials_count == 1u);
+    TEST_REQUIRE(output->textures_count == 1u);
+    TEST_REQUIRE(output->samplers_count == 1u);
+    TEST_REQUIRE(output->images_count == 1u);
+    TEST_REQUIRE(output->materials[0].name != NULL &&
+        strcmp(output->materials[0].name, "paint") == 0);
+    TEST_REQUIRE(output->materials[0].double_sided);
+    TEST_REQUIRE(output->materials[0].alpha_mode == cgltf_alpha_mode_mask);
+    TEST_REQUIRE(nearly_equal(output->materials[0].alpha_cutoff, 0.42f, 1e-6f));
+    TEST_REQUIRE(output->materials[0].has_pbr_metallic_roughness);
+    TEST_REQUIRE(nearly_equal(
+        output->materials[0].pbr_metallic_roughness.base_color_factor[2],
+        0.4f,
+        1e-6f));
+    TEST_REQUIRE(nearly_equal(
+        output->materials[0].pbr_metallic_roughness.metallic_factor,
+        0.25f,
+        1e-6f));
+    TEST_REQUIRE(output->materials[0].pbr_metallic_roughness.base_color_texture.texture ==
+        &output->textures[0]);
+    TEST_REQUIRE(output->materials[0].normal_texture.texture == &output->textures[0]);
+    TEST_REQUIRE(output->textures[0].image == &output->images[0]);
+    TEST_REQUIRE(output->textures[0].sampler == &output->samplers[0]);
+    TEST_REQUIRE(output->images[0].uri == NULL);
+    TEST_REQUIRE(output->images[0].buffer_view != NULL);
+    TEST_REQUIRE(output->images[0].buffer_view->size == sizeof(textured_image_bytes));
+    TEST_REQUIRE(memcmp(
+        cgltf_buffer_view_data(output->images[0].buffer_view),
+        textured_image_bytes,
+        sizeof(textured_image_bytes)) == 0);
+
+    TEST_REQUIRE(output->meshes_count == 1u);
+    TEST_REQUIRE(output->meshes[0].primitives_count == 1u);
+    const cgltf_primitive * primitive = &output->meshes[0].primitives[0];
+    TEST_REQUIRE(primitive->material == &output->materials[0]);
+    const cgltf_accessor * texcoord =
+        cgltf_find_accessor(primitive, cgltf_attribute_type_texcoord, 0);
+    TEST_REQUIRE(texcoord != NULL);
+    TEST_REQUIRE(texcoord->component_type == cgltf_component_type_r_32f);
+    TEST_REQUIRE(texcoord->type == cgltf_type_vec2);
+    TEST_REQUIRE(texcoord->count == 3u);
+    static const float expected_uvs[3][2] = {
+        { 0.125f, 0.25f },
+        { 0.75f, 0.375f },
+        { 0.5f, 0.875f },
+    };
+    for (size_t vertex = 0; vertex < 3u; ++vertex) {
+        float uv[2];
+        TEST_REQUIRE(cgltf_accessor_read_float(texcoord, vertex, uv, 2u));
+        TEST_REQUIRE(nearly_equal(uv[0], expected_uvs[vertex][0], 1e-6f));
+        TEST_REQUIRE(nearly_equal(uv[1], expected_uvs[vertex][1], 1e-6f));
+    }
+
+    cgltf_free(output);
+    trellis_mesh_rigging_asset_free(&asset);
+    remove(output_path);
+    remove(source_path);
+    return 1;
+
+fail:
+    cgltf_free(output);
+    trellis_mesh_rigging_asset_free(&asset);
+    remove(output_path);
+    remove(source_path);
+    return 0;
+}
+
+static int test_unreadable_source_appearance_falls_back(void) {
+    const char * source_path = "test_tokenskin_unreadable_source.glb";
+    const char * output_path = "test_tokenskin_unreadable_rigged.glb";
+    trellis_mesh_rigging_asset asset = TRELLIS_MESH_RIGGING_ASSET_INIT;
+    cgltf_data * output = NULL;
+    char error[512];
+    TEST_REQUIRE(write_textured_source_glb(source_path));
+    TEST_REQUIRE(trellis_mesh_rigging_gltf_load(
+        source_path, &asset, error, sizeof(error)) == TRELLIS_STATUS_OK);
+    TEST_REQUIRE(asset.texcoord_set_count == 1u);
+    TEST_REQUIRE(asset.texcoords != NULL && asset.texcoords[0] != NULL);
+    TEST_REQUIRE(asset.primitives[0].texcoord_mask == UINT64_C(1));
+    TEST_REQUIRE(remove(source_path) == 0);
+
+    trellis_mesh_rigging_normalization normalization;
+    memset(&normalization, 0, sizeof(normalization));
+    normalization.scale = 1.0f;
+    normalization.inverse_scale = 1.0f;
+    static float joint_position[3] = { 0.0f, 0.0f, 0.0f };
+    static int32_t joint_parent[1] = { -1 };
+    trellis_tokenskin_skeleton skeleton;
+    memset(&skeleton, 0, sizeof(skeleton));
+    skeleton.joints_xyz = joint_position;
+    skeleton.parents = joint_parent;
+    skeleton.joint_count = 1u;
+    static const float weight_values[3] = { 1.0f, 1.0f, 1.0f };
+    trellis_mesh_rigging_dense_skin_weights weights =
+        TRELLIS_MESH_RIGGING_DENSE_SKIN_WEIGHTS_INIT;
+    weights.values = weight_values;
+    weights.point_count = 3u;
+    weights.joint_count = 1u;
+    TEST_REQUIRE(trellis_mesh_rigging_write_rigged_glb(
+        output_path,
+        &asset,
+        &normalization,
+        &skeleton,
+        &weights,
+        error,
+        sizeof(error)) == TRELLIS_STATUS_OK);
+    TEST_REQUIRE(strstr(error, "warning:") != NULL);
+    TEST_REQUIRE(strstr(error, "could not reopen source appearance") != NULL);
+    TEST_REQUIRE(strstr(error, "default opaque white PBR material") != NULL);
+
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    TEST_REQUIRE(cgltf_parse_file(&options, output_path, &output) == cgltf_result_success);
+    TEST_REQUIRE(cgltf_load_buffers(&options, output, output_path) == cgltf_result_success);
+    TEST_REQUIRE(cgltf_validate(output) == cgltf_result_success);
+
+    TEST_REQUIRE(output->skins_count == 1u);
+    TEST_REQUIRE(output->skins[0].joints_count == 1u);
+    TEST_REQUIRE(output->skins[0].inverse_bind_matrices != NULL);
+    TEST_REQUIRE(output->nodes_count == 2u);
+    TEST_REQUIRE(output->nodes[0].mesh != NULL);
+    TEST_REQUIRE(output->nodes[0].skin == &output->skins[0]);
+
+    TEST_REQUIRE(output->materials_count == 1u);
+    TEST_REQUIRE(output->textures_count == 0u);
+    TEST_REQUIRE(output->samplers_count == 0u);
+    TEST_REQUIRE(output->images_count == 0u);
+    const cgltf_material * material = &output->materials[0];
+    TEST_REQUIRE(material->name != NULL &&
+        strcmp(material->name, "TokenSkin default PBR") == 0);
+    TEST_REQUIRE(material->has_pbr_metallic_roughness);
+    for (size_t channel = 0; channel < 4u; ++channel) {
+        TEST_REQUIRE(nearly_equal(
+            material->pbr_metallic_roughness.base_color_factor[channel],
+            1.0f,
+            1e-6f));
+    }
+    TEST_REQUIRE(nearly_equal(
+        material->pbr_metallic_roughness.metallic_factor, 0.0f, 1e-6f));
+    TEST_REQUIRE(nearly_equal(
+        material->pbr_metallic_roughness.roughness_factor, 1.0f, 1e-6f));
+    TEST_REQUIRE(material->alpha_mode == cgltf_alpha_mode_opaque);
+
+    TEST_REQUIRE(output->meshes_count == 1u);
+    TEST_REQUIRE(output->meshes[0].primitives_count == 1u);
+    const cgltf_primitive * primitive = &output->meshes[0].primitives[0];
+    TEST_REQUIRE(primitive->material == material);
+    const cgltf_accessor * texcoord =
+        cgltf_find_accessor(primitive, cgltf_attribute_type_texcoord, 0);
+    TEST_REQUIRE(texcoord != NULL);
+    TEST_REQUIRE(texcoord->component_type == cgltf_component_type_r_32f);
+    TEST_REQUIRE(texcoord->type == cgltf_type_vec2);
+    TEST_REQUIRE(texcoord->count == 3u);
+    static const float expected_uvs[3][2] = {
+        { 0.125f, 0.25f },
+        { 0.75f, 0.375f },
+        { 0.5f, 0.875f },
+    };
+    for (size_t vertex = 0; vertex < 3u; ++vertex) {
+        float uv[2];
+        TEST_REQUIRE(cgltf_accessor_read_float(texcoord, vertex, uv, 2u));
+        TEST_REQUIRE(nearly_equal(uv[0], expected_uvs[vertex][0], 1e-6f));
+        TEST_REQUIRE(nearly_equal(uv[1], expected_uvs[vertex][1], 1e-6f));
+    }
+
+    cgltf_free(output);
+    trellis_mesh_rigging_asset_free(&asset);
+    remove(output_path);
+    return 1;
+
+fail:
+    cgltf_free(output);
+    trellis_mesh_rigging_asset_free(&asset);
+    remove(output_path);
+    remove(source_path);
     return 0;
 }
 
@@ -483,6 +837,12 @@ int main(void) {
     }
     if (!test_invalid_inputs(
             &asset, &normalization, &skeleton, &direct_weights)) {
+        goto fail;
+    }
+    if (!test_source_appearance_preserved()) {
+        goto fail;
+    }
+    if (!test_unreadable_source_appearance_falls_back()) {
         goto fail;
     }
 

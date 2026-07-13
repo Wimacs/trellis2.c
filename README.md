@@ -116,13 +116,33 @@ vkmesh for hole filling and remeshing, with simplification disabled by default.
 For opaque input, both also use an auto-discovered BiRefNet model when available;
 Pixal3D requires it, while TRELLIS.2 can still run without it.
 
+Shape generation can be run independently from material generation.  This also
+persists the exact foreground condition image and the pre-remesh shape latent so
+that a later material task for the same asset can reuse both:
+
+```sh
+./build/trellis2-image-to-gltf \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --image example_image/T.png \
+  --shape-only \
+  --prepared-image-output prepared.png \
+  --shape-latent-output shape.tslat \
+  --output shape.glb
+```
+
+`--shape-only` skips the texture flow and texture decoder.  The `.tslat` file is
+an asset-bound cache: keep it with the generated shape and pass it only for that
+shape or a topology-only remesh of it.
+
 ### TRELLIS.2 existing-mesh material generation
 
 `trellis2-texture-mesh` applies the released TRELLIS.2 material pipeline to an
 existing triangle mesh. It normalizes the mesh, converts it to a Flexible Dual
-Grid, runs `FlexiDualGridVaeEncoder`, conditions the texture flow on the
-resulting shape latent and reference image, then bakes base-color and metallic-
-roughness textures into a self-contained GLB.
+Grid and runs `FlexiDualGridVaeEncoder` when no compatible shape cache is
+provided. It conditions the texture flow on the resulting or cached shape
+latent and reference image, then bakes base-color and metallic-roughness
+textures into a self-contained GLB.
 
 CUDA and Vulkan use the same command contract; select the executable from the
 corresponding build directory:
@@ -142,6 +162,23 @@ corresponding build directory:
   --image reference.png \
   --output textured-vulkan.glb
 ```
+
+To texture a generated or topology-remeshed shape without repeating background
+removal or shape encoding, reuse the two artifacts produced above:
+
+```sh
+./build/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input remeshed-shape.glb \
+  --image prepared.png --image-prepared \
+  --shape-latent shape.tslat \
+  --output textured.glb
+```
+
+An unavailable, invalid, resolution-mismatched, or geometrically incompatible
+cache is ignored and the current mesh is encoded instead.  Use
+`--shape-latent-output FILE` to persist that fallback encoding.
 
 The standard TRELLIS.2 download contains the shape encoder checkpoint. Opaque
 images use the same automatic BiRefNet discovery as image-to-3D, so neither a
@@ -193,7 +230,11 @@ C callers that need Pixal3D overrides can initialize
 selects the same FOV/mesh-scale fit. TRELLIS.2 callers can use
 `trellis_pipeline_trellis2_image_to_gltf()`. The generic entry points remain as
 library compatibility APIs, but no command-line executable auto-dispatches
-between families.
+between families. To request shape-only output or persisted prepared-image and
+latent artifacts, initialize `trellis_image_to_gltf_feature_options` with
+`TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_INIT` and use the corresponding
+family-specific `_ex` entry point. Keeping these features in a separate,
+versioned struct preserves the ABI of the original image-to-glTF options.
 
 ### TokenSkin mesh rigging
 
@@ -229,8 +270,10 @@ No backend-specific environment variable or extra inference flag is required.
 The input may be GLB or glTF; the output is a self-contained rigged GLB with a
 generated skeleton, inverse bind matrices, joints, and skin weights. The
 current path preserves the flattened world-space mesh geometry and topology,
-but rebuilds a default PBR material. Source materials, UVs, textures, node
-structure, and animations are not preserved.
+plus standard primitive material assignments, UV sets, materials, textures,
+samplers, and embedded image payloads. If source appearance cannot be copied,
+rigging still succeeds with a default white PBR material. Source node structure,
+morph targets, and animations are not preserved.
 
 Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
 On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
