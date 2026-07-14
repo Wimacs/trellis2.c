@@ -228,6 +228,7 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
     if (part_count_out != NULL) *part_count_out = 0;
     if (positions == NULL || triangles == NULL || semantic_labels == NULL ||
         face_count == 0 || vertex_count == 0 || vertex_count > UINT32_MAX ||
+        face_count > UINT32_MAX ||
         face_count > SIZE_MAX / (3u * sizeof(uint32_t)) ||
         vertex_count > SIZE_MAX / sizeof(uint32_t) ||
         vertex_count > SIZE_MAX / (3u * sizeof(int64_t)) ||
@@ -344,17 +345,55 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
         }
         vertex_to_welded[vertex] = match;
     }
-    for (size_t index = 0; index < face_count * 3u; ++index) {
-        if ((size_t) triangles[index] >= vertex_count) {
+    size_t adjacency_vertex_count = (size_t) welded_count;
+    for (size_t face = 0; face < face_count; ++face) {
+        const uint32_t original[3] = {
+            triangles[face * 3u],
+            triangles[face * 3u + 1u],
+            triangles[face * 3u + 2u],
+        };
+        if ((size_t) original[0] >= vertex_count ||
+            (size_t) original[1] >= vertex_count ||
+            (size_t) original[2] >= vertex_count ||
+            original[0] == original[1] || original[1] == original[2] ||
+            original[2] == original[0]) {
             status = TRELLIS_STATUS_PARSE_ERROR;
             goto cleanup;
         }
-        welded_triangles[index] = vertex_to_welded[triangles[index]];
+        const uint32_t welded[3] = {
+            vertex_to_welded[original[0]],
+            vertex_to_welded[original[1]],
+            vertex_to_welded[original[2]],
+        };
+        for (size_t corner = 0; corner < 3u; ++corner) {
+            int duplicates_earlier_corner = 0;
+            for (size_t earlier = 0; earlier < corner; ++earlier) {
+                if (welded[corner] == welded[earlier]) {
+                    duplicates_earlier_corner = 1;
+                    break;
+                }
+            }
+            if (duplicates_earlier_corner) {
+                /* Keep tolerance-collapsed corners from turning an otherwise
+                 * valid source face into a self-edge. Each synthetic ID is
+                 * private to one corner, while all other geometric welding is
+                 * retained for cross-face adjacency. */
+                if (adjacency_vertex_count == SIZE_MAX ||
+                    adjacency_vertex_count > (size_t) UINT32_MAX) {
+                    status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                    goto cleanup;
+                }
+                welded_triangles[face * 3u + corner] =
+                    (uint32_t) adjacency_vertex_count++;
+            } else {
+                welded_triangles[face * 3u + corner] = welded[corner];
+            }
+        }
     }
     status = trellis_mesh_segmentation_partition_faces(
         welded_triangles,
         face_count,
-        welded_count,
+        adjacency_vertex_count,
         semantic_labels,
         min_component_faces,
         part_ids_out,

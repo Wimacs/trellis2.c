@@ -5,6 +5,7 @@
 /build-vulkan/
 /build-win/
 /build-win-vulkan/
+/build-publish-vulkan/
 cmake-build-*/
 /.vs/
 CMakeFiles/

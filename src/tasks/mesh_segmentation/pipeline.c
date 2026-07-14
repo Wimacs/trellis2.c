@@ -1469,7 +1469,12 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         options->palette_merge_distance,
         &semantic_labels,
         &semantic_count);
-    if (status != TRELLIS_STATUS_OK) goto cleanup;
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "mesh segmentation: voxel-to-face label assignment failed: %s",
+            trellis_status_string(status));
+        goto cleanup;
+    }
     status = trellis_mesh_segmentation_partition_faces_geometric(
         normalized_mesh.vertices,
         asset.triangles,
@@ -1480,7 +1485,12 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         1e-5f,
         &face_part_ids,
         &part_count);
-    if (status != TRELLIS_STATUS_OK) goto cleanup;
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "mesh segmentation: geometric face partitioning failed: %s",
+            trellis_status_string(status));
+        goto cleanup;
+    }
     gltf_error[0] = '\0';
     status = trellis_mesh_segmentation_write_parts_glb(
         options->output_path,
