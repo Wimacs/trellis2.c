@@ -197,20 +197,20 @@ static trellis_status sparse_convnext_block_exec(
     trellis_sparse_buffer * out = NULL;
     const int64_t total_start_us = sparse_profile_now_us();
     trellis_status status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &conv);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &norm);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c * 4u, &mlp1);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &mlp2);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &out);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->sparse_conv3d(backend, rulebook, h, block->conv_w, block->conv_b, conv, n, c, c);
         sparse_profile_log(profile_enabled, "convnext", level, block_index, "sparse_conv3d", n, c, start_us);
     }
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &norm);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->row_norm(backend, conv, block->norm_gamma, block->norm_beta, norm, n, c, 1e-6f);
         sparse_profile_log(profile_enabled, "convnext", level, block_index, "row_norm", n, c, start_us);
     }
+    ops->free_buffer(backend, conv);
+    conv = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c * 4u, &mlp1);
     if (status == TRELLIS_STATUS_OK && ops->linear_silu != NULL) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->linear_silu(backend, norm, block->mlp0_w, block->mlp0_b, mlp1, n, c, 4 * c);
@@ -225,11 +225,17 @@ static trellis_status sparse_convnext_block_exec(
             sparse_profile_log(profile_enabled, "convnext", level, block_index, "silu_mlp0", n, 4 * c, silu_start_us);
         }
     }
+    ops->free_buffer(backend, norm);
+    norm = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &mlp2);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->linear(backend, mlp1, block->mlp2_w, block->mlp2_b, mlp2, n, 4 * c, c);
         sparse_profile_log(profile_enabled, "convnext", level, block_index, "linear_mlp2", n, c, start_us);
     }
+    ops->free_buffer(backend, mlp1);
+    mlp1 = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) c, &out);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->add(backend, h, mlp2, out, (size_t) n * (size_t) c);
@@ -430,12 +436,6 @@ static trellis_status sparse_c2s_block_exec(
         sparse_profile_log(profile_enabled, "c2s", level, -1, "build_next_rulebook", map_n, co, start_us);
     }
     if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) ci, &norm1);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) co * 8u, &conv1);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &h_up);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &skip);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &norm2);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &conv2);
-    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &out);
     if (status == TRELLIS_STATUS_OK && ops->row_norm_silu != NULL) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->row_norm_silu(backend, h, block->norm1_gamma, block->norm1_beta, norm1, n, ci, 1e-6f);
@@ -450,11 +450,15 @@ static trellis_status sparse_c2s_block_exec(
             sparse_profile_log(profile_enabled, "c2s", level, -1, "silu_pre", n, ci, silu_start_us);
         }
     }
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) n * (size_t) co * 8u, &conv1);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->sparse_conv3d(backend, cur_rulebook, norm1, block->conv1_w, block->conv1_b, conv1, n, ci, 8 * co);
         sparse_profile_log(profile_enabled, "c2s", level, -1, "sparse_conv3d_pre_gather", n, 8 * co, start_us);
     }
+    ops->free_buffer(backend, norm1);
+    norm1 = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &h_up);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         if (map_device != NULL) {
@@ -464,6 +468,9 @@ static trellis_status sparse_c2s_block_exec(
         }
         sparse_profile_log(profile_enabled, "c2s", level, -1, "c2s_gather", map_n, co, start_us);
     }
+    ops->free_buffer(backend, conv1);
+    conv1 = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &skip);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         if (map_device != NULL) {
@@ -473,6 +480,7 @@ static trellis_status sparse_c2s_block_exec(
         }
         sparse_profile_log(profile_enabled, "c2s", level, -1, "skip_repeat", map_n, co, start_us);
     }
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &norm2);
     if (status == TRELLIS_STATUS_OK && ops->row_norm_silu != NULL) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->row_norm_silu(backend, h_up, NULL, NULL, norm2, map_n, co, 1e-6f);
@@ -487,11 +495,17 @@ static trellis_status sparse_c2s_block_exec(
             sparse_profile_log(profile_enabled, "c2s", level, -1, "silu_post", map_n, co, silu_start_us);
         }
     }
+    ops->free_buffer(backend, h_up);
+    h_up = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &conv2);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->sparse_conv3d(backend, next_rulebook, norm2, block->conv2_w, block->conv2_b, conv2, map_n, co, co);
         sparse_profile_log(profile_enabled, "c2s", level, -1, "sparse_conv3d_post", map_n, co, start_us);
     }
+    ops->free_buffer(backend, norm2);
+    norm2 = NULL;
+    if (status == TRELLIS_STATUS_OK) status = ops->alloc_f32(backend, (size_t) map_n * (size_t) co, &out);
     if (status == TRELLIS_STATUS_OK) {
         const int64_t start_us = sparse_profile_now_us();
         status = ops->add(backend, conv2, skip, out, (size_t) map_n * (size_t) co);
@@ -704,6 +718,9 @@ trellis_status trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
             cur_rulebook = next_rulebook;
             cur_n = next_n;
             cur_channels = weights->channels[level + 1];
+            if (ops->trim != NULL) {
+                ops->trim(backend, TRELLIS_SPARSE_TRIM_FREE_BUFFERS, NULL);
+            }
             if (options->return_subs != NULL && weights->pred_subdiv && options->return_subs->n_levels < level + 1) {
                 options->return_subs->n_levels = level + 1;
             }
