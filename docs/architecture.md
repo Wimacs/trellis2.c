@@ -88,6 +88,7 @@ model-pinned entry points are:
 ```text
 trellis2-image-to-gltf  -> family=trellis2, profile=512
 trellis2-texture-mesh   -> family=trellis2, task=mesh_texturing
+trellis2-segment-mesh   -> family=trellis2, task=mesh_segmentation, profile=512_full
 pixal3d-image-to-gltf   -> family=pixal3d, profile=1024_cascade
 tokenskin-rig           -> family=tokenskin, task=mesh_rigging
 ```
@@ -102,3 +103,11 @@ texturing follows that rule even though it reuses TRELLIS.2 image conditioning,
 texture flow, texture decoding, and PBR export. TokenSkin likewise reuses the
 runtime and operators where appropriate, but its mesh-rigging pipeline and CLI
 remain separate from the image-to-3D and mesh-texturing executables.
+
+SegviGen follows the same separation. Its package owns only the Full paired
+flow, while the base TRELLIS.2 package owns DINO-independent SLat
+normalization, shape/texture encoders, and decoders. The mesh-segmentation task
+duplicates sparse coordinates into a dynamic/fixed 2N transformer sequence,
+integrates only the first N rows, then turns decoded categorical colors into
+connected face instances and a multi-node GLB. That task-specific pairing and
+postprocess do not add a SegviGen mode to the generic image-to-3D task.

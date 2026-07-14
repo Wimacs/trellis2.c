@@ -34,6 +34,7 @@ def main() -> int:
     parser.add_argument("--trellis2", required=True, type=Path)
     parser.add_argument("--pixal3d", required=True, type=Path)
     parser.add_argument("--texturing", required=True, type=Path)
+    parser.add_argument("--segmentation", required=True, type=Path)
     parser.add_argument("--tokenskin", required=True, type=Path)
     parser.add_argument("--source-dir", required=True, type=Path)
     args = parser.parse_args()
@@ -157,6 +158,241 @@ def main() -> int:
             "TRELLIS.2 mesh texturing initialized a GPU before family rejection",
             wrong_texturing_family.stdout)
 
+    segmentation_help = run(args.segmentation, "--help")
+    require(segmentation_help.returncode == 0,
+            "TRELLIS.2 mesh segmentation --help failed", segmentation_help.stdout)
+    require("Runs SegviGen Full inside the TRELLIS.2 runtime" in segmentation_help.stdout,
+            "wrong TRELLIS.2 mesh segmentation task banner", segmentation_help.stdout)
+    for required_flag in (
+        "--segmentation-model", "--input", "--condition-image",
+        "--rendered-condition", "--shape-latent", "--texture-latent",
+        "--segmentation-latent",
+        "--segmentation-flow", "--segmentation-latent-output",
+        "--min-component-faces",
+    ):
+        require(required_flag in segmentation_help.stdout,
+                f"TRELLIS.2 mesh segmentation is missing {required_flag}",
+                segmentation_help.stdout)
+    for unrelated_flag in ("--naf", "--num-beams", "--texture-size"):
+        require(unrelated_flag not in segmentation_help.stdout,
+                f"TRELLIS.2 mesh segmentation exposes {unrelated_flag}",
+                segmentation_help.stdout)
+
+    segmentation_required = (
+        "--model", "unused-base-model",
+        "--segmentation-model", "unused-segmentation-model",
+        "--dino", "unused-dino",
+        "--input", "unused.glb",
+        "--output", "unused-output.glb",
+    )
+    for option, value in (
+        ("--steps", "0"),
+        ("--steps", "1001"),
+        ("--device", "-1"),
+        ("--min-component-faces", "-1"),
+        ("--min-palette-voxels", "0"),
+        ("--palette-merge-distance", "-0.01"),
+        ("--palette-merge-distance", "1.8"),
+    ):
+        rejected_range = run(
+            args.segmentation,
+            *segmentation_required,
+            option,
+            value,
+        )
+        require(rejected_range.returncode == 2,
+                f"mesh segmentation accepted invalid {option}={value}",
+                rejected_range.stdout)
+        require("invalid argument range" in rejected_range.stdout,
+                f"mesh segmentation did not explain invalid {option}",
+                rejected_range.stdout)
+
+    wrong_segmentation_task = run(
+        args.segmentation,
+        "--model",
+        str(args.source_dir / "models" / "trellis2"),
+        "--segmentation-model",
+        str(args.source_dir / "models" / "trellis2"),
+        "--dino",
+        "must-not-be-opened-dino",
+        "--input",
+        "must-not-be-opened.glb",
+        "--output",
+        "must-not-be-written.glb",
+    )
+    require(wrong_segmentation_task.returncode == 1,
+            "mesh segmentation accepted a non-segmentation package",
+            wrong_segmentation_task.stdout)
+    require("incompatible package contract" in wrong_segmentation_task.stdout,
+            "mesh segmentation package error is unclear",
+            wrong_segmentation_task.stdout)
+    require("ggml_cuda_init" not in wrong_segmentation_task.stdout and
+            "ggml_vulkan" not in wrong_segmentation_task.stdout and
+            "failed to load mesh" not in wrong_segmentation_task.stdout,
+            "mesh segmentation parsed input or initialized a GPU before package rejection",
+            wrong_segmentation_task.stdout)
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        base_model = args.source_dir / "models" / "trellis2"
+        segmentation_model = args.source_dir / "models" / "segvigen"
+        input_path = temporary_root / "input.glb"
+        input_path.write_bytes(b"preflight fixture")
+        condition_path = temporary_root / "condition.png"
+        condition_path.write_bytes(b"preflight fixture")
+        cache_path = temporary_root / "cache.tslat"
+        cache_path.write_bytes(b"preflight fixture")
+
+        invalid_policy_dir = temporary_root / "invalid-policy"
+        invalid_policy_dir.mkdir()
+        invalid_manifest = json.loads(
+            (segmentation_model / "model.json").read_text()
+        )
+        invalid_manifest["components"][0]["execution"][
+            "emulate_bf16_blocks"
+        ] = False
+        (invalid_policy_dir / "model.json").write_text(
+            json.dumps(invalid_manifest)
+        )
+        wrong_policy = run(
+            args.segmentation,
+            "--model", str(base_model),
+            "--segmentation-model", str(invalid_policy_dir),
+            "--dino", str(temporary_root / "missing-dino"),
+            "--input", str(input_path),
+            "--output", str(temporary_root / "policy-output.glb"),
+        )
+        require(wrong_policy.returncode == 1,
+                "mesh segmentation accepted a non-official BF16 policy",
+                wrong_policy.stdout)
+        require(
+            "compute_dtype=bf16 attention=flash flash_kv_dtype=bf16 "
+            "emulate_bf16_blocks=true" in wrong_policy.stdout,
+            "mesh segmentation policy error is unclear",
+            wrong_policy.stdout,
+        )
+        require("ggml_cuda_init" not in wrong_policy.stdout and
+                "ggml_vulkan" not in wrong_policy.stdout,
+                "mesh segmentation initialized a GPU before policy rejection",
+                wrong_policy.stdout)
+
+        common_preflight = (
+            "--model", str(base_model),
+            "--segmentation-model", str(segmentation_model),
+            "--dino", str(temporary_root / "missing-dino"),
+            "--input", str(input_path),
+        )
+        input_output_conflict = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(input_path),
+        )
+        require(input_output_conflict.returncode == 1 and
+                "path conflict" in input_output_conflict.stdout,
+                "mesh segmentation did not reject input/output aliasing",
+                input_output_conflict.stdout)
+
+        condition_output_conflict = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(temporary_root / "parts.glb"),
+            "--condition-image", str(condition_path),
+            "--condition-prepared",
+            "--rendered-condition", str(condition_path),
+        )
+        require(condition_output_conflict.returncode == 1 and
+                "path conflict" in condition_output_conflict.stdout,
+                "mesh segmentation did not reject condition/output aliasing",
+                condition_output_conflict.stdout)
+
+        cache_output_conflict = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(temporary_root / "parts.glb"),
+            "--shape-latent", str(cache_path),
+            "--texture-latent-output", str(cache_path),
+        )
+        require(cache_output_conflict.returncode == 1 and
+                "path conflict" in cache_output_conflict.stdout,
+                "mesh segmentation did not reject cache input/output aliasing",
+                cache_output_conflict.stdout)
+
+        cached_postprocess_without_dino = run(
+            args.segmentation,
+            "--model", str(base_model),
+            "--segmentation-model", str(segmentation_model),
+            "--input", str(input_path),
+            "--output", str(temporary_root / "cached-output.glb"),
+            "--segmentation-latent", str(cache_path),
+        )
+        require(cached_postprocess_without_dino.returncode == 1 and
+                "segmentation latent cache" in cached_postprocess_without_dino.stdout,
+                "cached postprocess incorrectly required --dino",
+                cached_postprocess_without_dino.stdout)
+
+        wrong_extension = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(temporary_root / "parts.gltf"),
+        )
+        require(wrong_extension.returncode == 1 and
+                "must use the .glb extension" in wrong_extension.stdout,
+                "mesh segmentation accepted a non-GLB output",
+                wrong_extension.stdout)
+
+        parent_blocker = temporary_root / "not-a-directory"
+        parent_blocker.write_text("blocker")
+        bad_parent = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(parent_blocker / "parts.glb"),
+        )
+        require(bad_parent.returncode == 1 and
+                "parent directory" in bad_parent.stdout,
+                "mesh segmentation did not reject an unusable output parent",
+                bad_parent.stdout)
+
+        nested_output = temporary_root / "created" / "early" / "parts.glb"
+        missing_weight = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(nested_output),
+        )
+        require(missing_weight.returncode == 1 and
+                "required segmentation flow weight" in missing_weight.stdout,
+                "mesh segmentation did not preflight required model weights",
+                missing_weight.stdout)
+        require(nested_output.parent.is_dir(),
+                "mesh segmentation did not prepare the output parent early",
+                missing_weight.stdout)
+        require("failed to load mesh" not in missing_weight.stdout and
+                "ggml_cuda_init" not in missing_weight.stdout and
+                "ggml_vulkan" not in missing_weight.stdout,
+                "mesh segmentation parsed input or initialized a GPU before weight preflight",
+                missing_weight.stdout)
+
+        dummy_weight = temporary_root / "dummy.safetensors"
+        dummy_weight.write_bytes(b"preflight fixture")
+        missing_dino = run(
+            args.segmentation,
+            *common_preflight,
+            "--output", str(temporary_root / "dino-output.glb"),
+            "--segmentation-flow", str(dummy_weight),
+            "--shape-encoder", str(dummy_weight),
+            "--texture-encoder", str(dummy_weight),
+            "--shape-decoder", str(dummy_weight),
+            "--texture-decoder", str(dummy_weight),
+        )
+        require(missing_dino.returncode == 1 and
+                "required DINO model weight" in missing_dino.stdout,
+                "mesh segmentation did not preflight the DINO checkpoint",
+                missing_dino.stdout)
+        require("failed to load mesh" not in missing_dino.stdout and
+                "ggml_cuda_init" not in missing_dino.stdout and
+                "ggml_vulkan" not in missing_dino.stdout,
+                "mesh segmentation reached input/GPU work before DINO preflight",
+                missing_dino.stdout)
+
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary_root = Path(temporary_directory)
         triangle_path = temporary_root / "triangle.gltf"
@@ -200,6 +436,45 @@ def main() -> int:
                 },
             ],
         }))
+
+        missing_shape_decoder_package = temporary_root / "missing-shape-decoder"
+        missing_shape_decoder_package.mkdir()
+        missing_shape_decoder_manifest = json.loads(
+            (args.source_dir / "models" / "trellis2" / "model.json").read_text()
+        )
+        missing_shape_decoder_manifest["components"] = [
+            component
+            for component in missing_shape_decoder_manifest["components"]
+            if component.get("role") != "shape_decoder"
+        ]
+        (missing_shape_decoder_package / "model.json").write_text(
+            json.dumps(missing_shape_decoder_manifest)
+        )
+        missing_shape_decoder = run(
+            args.segmentation,
+            "--model",
+            str(missing_shape_decoder_package),
+            "--segmentation-model",
+            str(args.source_dir / "models" / "segvigen"),
+            "--dino",
+            "must-not-be-opened-dino",
+            "--input",
+            "must-not-be-opened.glb",
+            "--output",
+            str(temporary_root / "must-not-be-written-parts.glb"),
+        )
+        require(missing_shape_decoder.returncode == 1,
+                "uncached segmentation accepted a package without shape_decoder",
+                missing_shape_decoder.stdout)
+        require("shape_decoder is always required" in missing_shape_decoder.stdout,
+                "segmentation shape-decoder preflight error is unclear",
+                missing_shape_decoder.stdout)
+        require("ggml_cuda_init" not in missing_shape_decoder.stdout and
+                "ggml_vulkan" not in missing_shape_decoder.stdout and
+                "failed to load mesh" not in missing_shape_decoder.stdout,
+                "shape-decoder preflight parsed input or initialized a GPU",
+                missing_shape_decoder.stdout)
+
         prepared_texturing = run(
             args.texturing,
             "--model",

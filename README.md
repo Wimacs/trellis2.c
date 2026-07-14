@@ -16,7 +16,7 @@
 
 Native TRELLIS.2 and Pixal3D image-to-3D inference plus TokenSkin mesh rigging,
 with CUDA and Vulkan support. Each model has one family-pinned executable:
-`trellis2-image-to-gltf`, `trellis2-texture-mesh`,
+`trellis2-image-to-gltf`, `trellis2-texture-mesh`, `trellis2-segment-mesh`,
 `pixal3d-image-to-gltf`, or `tokenskin-rig`.
 
 ## Build
@@ -192,6 +192,89 @@ uses a 512 Flexible Dual Grid, 12 texture-flow steps, and 1024-pixel PBR maps.
 This task rebuilds a static textured mesh: source nodes, materials, UVs, skins,
 animations, and VRM extensions are not preserved.
 
+### SegviGen Full automatic mesh decomposition
+
+`trellis2-segment-mesh` runs the released SegviGen Full network as a separate
+`mesh_segmentation` task. Convert the trusted Lightning checkpoint once; the
+converter keeps the checkpoint's intentional BF16/F32 split and rejects any
+missing, extra, renamed, shape-incompatible, or dtype-incompatible tensor. The
+conversion command requires Python `torch` and `safetensors`:
+
+```sh
+python3 tools/convert_segvigen_weights.py \
+  /path/to/full_seg.ckpt \
+  /path/to/SegviGen/segvigen_full_mixed.safetensors
+cp models/segvigen/model.json /path/to/SegviGen/model.json
+```
+
+The normal command needs only the input mesh and model roots. It renders the
+fixed 40-degree SegviGen condition view, samples the source glTF PBR material,
+encodes shape and source texture SLat, runs the 2N-token paired flow for 12
+steps, transfers decoded colors to faces, welds glTF seams for connectivity,
+and writes one GLB node+mesh per physical part:
+
+```sh
+./build/trellis2-segment-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --segmentation-model /path/to/SegviGen \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input input.glb \
+  --output parts.glb
+```
+
+The automatic condition renderer is deterministic and CPU-only: it matches the
+released camera and glTF-to-Blender axis transform, samples base-color/alpha
+materials per fragment, and resolves a 2x supersampled raster. It does not try
+to reproduce Blender Cycles path tracing; pass the released Cycles render with
+`--condition-image ... --condition-prepared` when exact 2D conditioning parity
+is required. PNG/JPEG glTF textures are supported, while KTX2/BasisU material
+textures currently require prior transcoding.
+
+The output is one self-contained assembly GLB with a `trellis_parts` root and
+dense `part_0000`, `part_0001`, ... children. Every source face is emitted
+exactly once. Boundary vertices are duplicated between parts and each child
+receives a distinct categorical PBR material; source hierarchy, skins,
+animations, and appearance are not copied to this segmentation-preview asset.
+No cut or cap geometry is synthesized, so the separated surface meshes are not
+guaranteed to be watertight manufacturing solids.
+
+For reproducible experiments, `--condition-image FILE --condition-prepared`
+can replace the automatic render. `--shape-latent`, `--texture-latent`, and
+`--segmentation-latent` reuse native `TSLAT01` stages; the corresponding
+`--*-latent-output` flags persist them. Trusted official `.pth` fixtures can be
+converted with:
+
+```sh
+python3 tools/convert_segvigen_fixture.py \
+  official_slat.pth native_slat.tslat \
+  --glb input.glb
+```
+
+These cache flags are diagnostics: ordinary automatic decomposition does not
+require them. Cache files do not embed a cryptographic identity of the source
+mesh, so only reuse a cache with the GLB from which it was produced. The
+`--segmentation-latent` postprocess-only path skips condition encoding and the
+paired flow, so `--dino` may be omitted for that path. Base shape/texture
+decoders remain required because labels still have to be decoded and projected;
+the shape encoder is also required unless `--shape-latent` is supplied at the
+same time.
+Only the released `512_full` profile is accepted. The interactive and guided
+checkpoint contracts are deliberately not inferred from Full weights.
+
+An opt-in real-weight regression runs the complete automatic path and verifies
+that the output has multiple independent part meshes and preserves every input
+face exactly once. Configure/build normally, set
+`TRELLIS_SEGVIGEN_E2E_BASE_MODEL`,
+`TRELLIS_SEGVIGEN_E2E_SEGMENTATION_MODEL`, `TRELLIS_SEGVIGEN_E2E_DINO`, and
+`TRELLIS_SEGVIGEN_E2E_INPUT`, then run. Optional
+`TRELLIS_SEGVIGEN_E2E_OUTPUT`, `TRELLIS_SEGVIGEN_E2E_STEPS`, and
+`TRELLIS_SEGVIGEN_E2E_TIMEOUT` preserve the result or override the 12-step and
+1800-second defaults:
+
+```sh
+ctest --test-dir build -R mesh_segmentation_e2e --output-on-failure
+```
+
 ### Pixal3D
 
 Pixal3D uses its own `pixal3d-image-to-gltf` executable. Its projected image
@@ -284,10 +367,11 @@ Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
 On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
 Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
 tail rows are bounds checked. This avoids the BF16-to-F16 narrowing and F16
-accumulator overflow of ggml's current MMA kernel. TRELLIS.2 keeps the faster
-F16 MMA path for its sparse and 512-resolution flows, while its 1024 shape and
-texture components use strict BF16 Flash because real long-sequence regression
-testing exposes the same F16 accumulator overflow there. `--no-ggml-flash-attn`
+accumulator overflow of ggml's current MMA kernel. The base TRELLIS.2 package
+keeps the faster F16 MMA path for its ordinary sparse and 512-resolution flows.
+Its 1024 shape/texture components and SegviGen Full use strict BF16 Flash
+because real long-sequence regression testing exposes the same F16 accumulator
+overflow there. `--no-ggml-flash-attn`
 explicitly selects SDPA; that path can require
 quadratic score memory for long sparse sequences. The package-level policies
 are instance scoped, so loading Trellis2 and Pixal3D in one process does not

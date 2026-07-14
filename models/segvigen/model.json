@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "segvigen-full",
+  "family": "trellis2",
+  "task": "mesh_segmentation",
+  "profile": "512_full",
+  "components": [
+    {
+      "role": "segmentation_flow",
+      "architecture": "trellis_dit_flow",
+      "weights": "segvigen_full_mixed.safetensors",
+      "execution": {
+        "compute_dtype": "bf16",
+        "attention": "flash",
+        "flash_kv_dtype": "bf16",
+        "emulate_bf16_blocks": true
+      }
+    }
+  ]
+}

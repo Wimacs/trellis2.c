@@ -731,6 +731,7 @@ typedef struct legacy_component_template {
 
 static const legacy_component_template g_trellis2_legacy_components[] = {
     { "shape_encoder", "sparse_unet_vae_encoder", "ckpts/shape_enc_next_dc_f16c32_fp16.safetensors", TRELLIS_DTYPE_F32, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
+    { "texture_encoder", "sparse_unet_vae_encoder", "ckpts/tex_enc_next_dc_f16c32_fp16.safetensors", TRELLIS_DTYPE_F32, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "sparse_structure_flow", "trellis_dit_flow", "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
     { "sparse_structure_decoder", "sparse_structure_decoder", "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", TRELLIS_DTYPE_F16, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "shape_flow_512", "trellis_dit_flow", "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },

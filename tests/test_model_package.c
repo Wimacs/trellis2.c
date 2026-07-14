@@ -128,6 +128,10 @@ static void test_repository_templates(void) {
     CHECK_TRUE(shape_encoder != NULL);
     CHECK_TRUE(strcmp(shape_encoder->architecture, "sparse_unet_vae_encoder") == 0);
     CHECK_TRUE(shape_encoder->execution.compute_dtype == TRELLIS_DTYPE_F32);
+    const trellis_model_component_instance * texture_encoder =
+        trellis_model_package_find_component(&package, "texture_encoder");
+    CHECK_TRUE(texture_encoder != NULL);
+    CHECK_TRUE(strcmp(texture_encoder->architecture, "sparse_unet_vae_encoder") == 0);
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "shape_flow_1024");
     CHECK_TRUE(flow != NULL && flow->execution.attention == TRELLIS_ATTENTION_FLASH);
@@ -137,6 +141,21 @@ static void test_repository_templates(void) {
     CHECK_TRUE(trellis_model_package_resolve_component_path(
         &package, "shape_flow_1024", resolved, sizeof(resolved)) == TRELLIS_STATUS_OK);
     CHECK_TRUE(strstr(resolved, "/models/trellis2/ckpts/") != NULL);
+    trellis_model_package_free(&package);
+
+    CHECK_TRUE(snprintf(root, sizeof(root), "%s/models/segvigen", TRELLIS_TEST_SOURCE_DIR) > 0);
+    CHECK_TRUE(trellis_model_package_load(root, &package) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(strcmp(package.family, "trellis2") == 0);
+    CHECK_TRUE(strcmp(package.task, "mesh_segmentation") == 0);
+    CHECK_TRUE(strcmp(package.profile, "512_full") == 0);
+    const trellis_model_component_instance * segmentation_flow =
+        trellis_model_package_find_component(&package, "segmentation_flow");
+    CHECK_TRUE(segmentation_flow != NULL);
+    CHECK_TRUE(strcmp(segmentation_flow->architecture, "trellis_dit_flow") == 0);
+    CHECK_TRUE(segmentation_flow->execution.compute_dtype == TRELLIS_DTYPE_BF16);
+    CHECK_TRUE(segmentation_flow->execution.attention == TRELLIS_ATTENTION_FLASH);
+    CHECK_TRUE(segmentation_flow->execution.flash_kv_dtype == TRELLIS_DTYPE_BF16);
+    CHECK_TRUE(segmentation_flow->execution.emulate_bf16_blocks == 1);
     trellis_model_package_free(&package);
 
     CHECK_TRUE(snprintf(root, sizeof(root), "%s/models/pixal3d", TRELLIS_TEST_SOURCE_DIR) > 0);

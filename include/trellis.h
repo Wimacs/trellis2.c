@@ -1018,6 +1018,57 @@ typedef struct trellis_mesh_texturing_options {
 trellis_status trellis_pipeline_trellis2_texture_mesh(
     const trellis_mesh_texturing_options * options);
 
+typedef struct trellis_mesh_segmentation_options {
+    size_t struct_size;              /* set to sizeof(trellis_mesh_segmentation_options) */
+    const char * model_dir;          /* base TRELLIS.2 model package root */
+    const char * segmentation_model_dir; /* SegviGen Full model package root */
+    const char * dino_dir;           /* DINOv3 directory; NULL only with segmentation_latent_path */
+    const char * input_path;         /* source .glb/.gltf triangle mesh */
+    const char * output_path;        /* self-contained multi-part .glb */
+    const char * condition_image_path; /* optional prepared/render reference image */
+    const char * birefnet_path;      /* optional foreground model override */
+    const char * shape_encoder_path; /* optional base shape encoder override */
+    const char * texture_encoder_path; /* optional base texture encoder override */
+    const char * segmentation_flow_path; /* optional SegviGen flow override */
+    const char * shape_decoder_path; /* optional base shape decoder override */
+    const char * texture_decoder_path; /* optional base texture decoder override */
+    const char * shape_latent_path;  /* optional trusted/debug TSLAT cache input */
+    const char * texture_latent_path; /* optional trusted/debug TSLAT cache input */
+    const char * segmentation_latent_path; /* optional generated label TSLAT input */
+    const char * rendered_condition_output_path; /* optional automatic render dump */
+    const char * shape_latent_output_path; /* optional shape encoder cache output */
+    const char * texture_latent_output_path; /* optional texture encoder cache output */
+    const char * segmentation_latent_output_path; /* optional generated label SLat dump */
+    const char * backend;            /* NULL uses the backend compiled into this binary */
+    int device;                      /* backend device index, default 0 */
+    int resolution;                  /* SegviGen Full is pinned to 512 */
+    int steps;                       /* paired flow Euler steps, default 12 */
+    uint32_t seed;                   /* generated segmentation latent seed, default 42 */
+    int min_component_faces;         /* absorb smaller connected islands, default 16 */
+    int min_palette_voxels;          /* ignore smaller decoded color bins, default 16 */
+    float palette_merge_distance;    /* RGB Euclidean radius, default 32/255 */
+    int condition_image_prepared;    /* skip BiRefNet for condition_image_path */
+    int flow_blocks_override;        /* debug: -1 runs all flow blocks */
+    int flow_block_parts_override;   /* debug: -1 runs each complete block */
+    int flow_no_rope;                /* debug sparse-RoPE bypass */
+    int emulate_bf16_blocks;         /* debug explicit BF16 activation round trips */
+    int no_flash_attn;               /* debug explicit-attention fallback */
+} trellis_mesh_segmentation_options;
+
+#define TRELLIS_MESH_SEGMENTATION_OPTIONS_V1_SIZE \
+    (offsetof(trellis_mesh_segmentation_options, no_flash_attn) + sizeof(int))
+#define TRELLIS_MESH_SEGMENTATION_OPTIONS_INIT \
+    { sizeof(trellis_mesh_segmentation_options), NULL, NULL, NULL, NULL, NULL, \
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+      NULL, NULL, NULL, 0, 512, 12, 42u, 16, 16, (32.0f / 255.0f), 0, -1, -1, 0, 0, 0 }
+
+/* SegviGen Full automatic mesh decomposition. The model predicts categorical
+ * voxel colors from a paired generated/source texture SLat. Colors are
+ * transferred to faces, separated into connected physical instances, and
+ * written as one independently selectable glTF node+mesh per part. */
+trellis_status trellis_pipeline_trellis2_segment_mesh(
+    const trellis_mesh_segmentation_options * options);
+
 typedef struct trellis_tokenskin_rig_options {
     size_t struct_size;              /* set to sizeof(trellis_tokenskin_rig_options) */
     const char * model_dir;          /* TokenSkin model package root */

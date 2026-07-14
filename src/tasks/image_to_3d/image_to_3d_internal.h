@@ -294,6 +294,11 @@ typedef struct trellis_structured_latent_options {
     int concat_channels;
     const float * concat_mean;
     const float * concat_std;
+    /* Optional denormalized state [n_coords, 32] appended as a second sparse
+     * token set. Both sets reuse coords_bxyz and concat_cond; only the first
+     * set is integrated and returned. SegviGen Full uses this for the frozen
+     * source-texture SLat paired with the generated segmentation SLat. */
+    const float * paired_fixed_state;
     uint32_t noise_seed;
     int resolution;
     int steps;
@@ -317,6 +322,19 @@ typedef struct trellis_structured_latent_options {
 trellis_status trellis_pipeline_run_structured_latent(
     const trellis_structured_latent_options * options,
     trellis_structured_latent * latent_out);
+
+/* Pure host-side row packing shared by the structured-latent sampler and its
+ * contract tests. paired_fixed_state_norm == NULL produces n_coords rows;
+ * otherwise it produces 2*n_coords rows in dynamic-then-fixed order. */
+trellis_status trellis_structured_latent_pack_flow_input(
+    const float * dynamic_state_norm,
+    const float * paired_fixed_state_norm,
+    const float * concat_norm,
+    int64_t n_coords,
+    int state_channels,
+    int concat_channels,
+    float * output,
+    size_t output_count);
 
 typedef enum trellis_cascade_coord_quantization {
     TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS = 0,

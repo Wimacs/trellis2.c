@@ -1,4 +1,5 @@
 #include "image_to_3d_internal.h"
+#include "trellis_platform.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -12,6 +13,75 @@
 #define TSLAT_DECODER_AABB_LIMIT 0.5001f
 
 static const unsigned char tslat_magic[8] = {'T', 'S', 'L', 'A', 'T', '0', '1', '\0'};
+
+static FILE * open_sibling_temporary(
+    const char * path,
+    char ** temporary_out,
+    trellis_status * status_out) {
+    if (status_out != NULL) *status_out = TRELLIS_STATUS_INVALID_ARGUMENT;
+    if (path == NULL || temporary_out == NULL || status_out == NULL) return NULL;
+    *temporary_out = NULL;
+    const size_t path_length = strlen(path);
+    if (path_length > SIZE_MAX - 80u) return NULL;
+    const size_t capacity = path_length + 80u;
+    char * temporary = (char *) malloc(capacity);
+    if (temporary == NULL) {
+        *status_out = TRELLIS_STATUS_OUT_OF_MEMORY;
+        return NULL;
+    }
+    *status_out = TRELLIS_STATUS_IO_ERROR;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const int written = snprintf(
+            temporary,
+            capacity,
+            "%s.trellis-tmp-%ld-%d.tslat",
+            path,
+            trellis_getpid(),
+            attempt);
+        if (written < 0 || (size_t) written >= capacity) break;
+#ifdef _WIN32
+        const int descriptor = _open(
+            temporary,
+            _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
+            _S_IREAD | _S_IWRITE);
+#else
+        const int descriptor = open(temporary, O_CREAT | O_EXCL | O_RDWR, 0666);
+#endif
+        if (descriptor >= 0) {
+#ifdef _WIN32
+            FILE * file = _fdopen(descriptor, "wb");
+#else
+            FILE * file = fdopen(descriptor, "wb");
+#endif
+            if (file == NULL) {
+#ifdef _WIN32
+                _close(descriptor);
+#else
+                close(descriptor);
+#endif
+                trellis_unlink(temporary);
+                break;
+            }
+            *temporary_out = temporary;
+            *status_out = TRELLIS_STATUS_OK;
+            return file;
+        }
+        if (errno != EEXIST) break;
+    }
+    free(temporary);
+    return NULL;
+}
+
+static int atomic_replace_cache(const char * temporary, const char * path) {
+#ifdef _WIN32
+    return MoveFileExA(
+        temporary,
+        path,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(temporary, path) == 0;
+#endif
+}
 
 static int write_exact(FILE * file, const void * data, size_t bytes) {
     return bytes == 0 || fwrite(data, 1, bytes, file) == bytes;
@@ -178,15 +248,12 @@ trellis_status trellis_shape_latent_cache_write(
         if (!isfinite(latent->feats[index])) return TRELLIS_STATUS_PARSE_ERROR;
     }
 
-    const size_t path_length = strlen(path);
-    if (path_length > SIZE_MAX - 5u) return TRELLIS_STATUS_INVALID_ARGUMENT;
-    char * temporary = (char *) malloc(path_length + 5u);
-    if (temporary == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
-    snprintf(temporary, path_length + 5u, "%s.tmp", path);
-    FILE * file = fopen(temporary, "wb");
+    char * temporary = NULL;
+    trellis_status temporary_status = TRELLIS_STATUS_ERROR;
+    FILE * file = open_sibling_temporary(
+        path, &temporary, &temporary_status);
     if (file == NULL) {
-        free(temporary);
-        return TRELLIS_STATUS_IO_ERROR;
+        return temporary_status;
     }
 
     int ok = write_exact(file, tslat_magic, sizeof(tslat_magic)) &&
@@ -208,8 +275,8 @@ trellis_status trellis_shape_latent_cache_write(
     }
     if (fflush(file) != 0) ok = 0;
     if (fclose(file) != 0) ok = 0;
-    if (ok && rename(temporary, path) != 0) ok = 0;
-    if (!ok) remove(temporary);
+    if (ok && !atomic_replace_cache(temporary, path)) ok = 0;
+    if (!ok) trellis_unlink(temporary);
     free(temporary);
     if (!ok) return TRELLIS_STATUS_IO_ERROR;
     if (info_out != NULL) *info_out = info;

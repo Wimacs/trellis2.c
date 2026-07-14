@@ -78,6 +78,14 @@ static const trellis_task_descriptor g_tasks[] = {
     {
         TRELLIS_REGISTRY_ABI_VERSION,
         sizeof(trellis_task_descriptor),
+        "mesh_segmentation",
+        "mesh",
+        "segmented_mesh",
+        0,
+    },
+    {
+        TRELLIS_REGISTRY_ABI_VERSION,
+        sizeof(trellis_task_descriptor),
         "test_weight_binding",
         "tensor",
         "binding_report",

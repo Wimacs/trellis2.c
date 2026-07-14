@@ -124,6 +124,27 @@ int main(void) {
         sizeof(written.anchor_aabb_max)) == 0);
     trellis_structured_latent_free(&loaded);
 
+    /* Reusing a diagnostic output path must atomically replace the prior
+     * cache on Windows as well as POSIX. */
+    feats[0] = 123.25f;
+    CHECK(trellis_shape_latent_cache_write(path, &source, &mesh, NULL) ==
+        TRELLIS_STATUS_OK);
+    CHECK(trellis_shape_latent_cache_read(path, &loaded, &read_info) ==
+        TRELLIS_STATUS_OK);
+    CHECK(loaded.feats[0] == feats[0]);
+    trellis_structured_latent_free(&loaded);
+    char sibling[PATH_MAX + 80];
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        CHECK(snprintf(
+            sibling,
+            sizeof(sibling),
+            "%s.trellis-tmp-%ld-%d.tslat",
+            path,
+            trellis_getpid(),
+            attempt) > 0);
+        CHECK(!trellis_access_exists(sibling));
+    }
+
     FILE * file = fopen(path, "r+b");
     CHECK(file != NULL);
     CHECK(fputc('X', file) != EOF);

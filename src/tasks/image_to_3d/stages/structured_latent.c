@@ -170,6 +170,57 @@ static void normalize_slat_f32(
     }
 }
 
+trellis_status trellis_structured_latent_pack_flow_input(
+    const float * dynamic_state_norm,
+    const float * paired_fixed_state_norm,
+    const float * concat_norm,
+    int64_t n_coords,
+    int state_channels,
+    int concat_channels,
+    float * output,
+    size_t output_count) {
+    if (dynamic_state_norm == NULL || output == NULL || n_coords <= 0 ||
+        state_channels <= 0 || concat_channels < 0 ||
+        (concat_channels > 0 && concat_norm == NULL)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if ((uint64_t) n_coords > SIZE_MAX ||
+        (size_t) state_channels > SIZE_MAX - (size_t) concat_channels) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    const size_t multiplier = paired_fixed_state_norm != NULL ? 2u : 1u;
+    const size_t source_rows = (size_t) n_coords;
+    if (source_rows > SIZE_MAX / multiplier) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    const size_t rows = source_rows * multiplier;
+    const size_t channels = (size_t) state_channels + (size_t) concat_channels;
+    if (channels == 0 || channels > SIZE_MAX / sizeof(float) ||
+        (size_t) state_channels > SIZE_MAX / sizeof(float) ||
+        (size_t) concat_channels > SIZE_MAX / sizeof(float) ||
+        rows > SIZE_MAX / channels ||
+        output_count < rows * channels) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        const size_t source_row = row % (size_t) n_coords;
+        const float * state = row < (size_t) n_coords ?
+            dynamic_state_norm : paired_fixed_state_norm;
+        float * destination = output + row * channels;
+        memcpy(
+            destination,
+            state + source_row * (size_t) state_channels,
+            (size_t) state_channels * sizeof(float));
+        if (concat_channels > 0) {
+            memcpy(
+                destination + state_channels,
+                concat_norm + source_row * (size_t) concat_channels,
+                (size_t) concat_channels * sizeof(float));
+        }
+    }
+    return TRELLIS_STATUS_OK;
+}
+
 static int log_finite_stats_f32(
     const char * label,
     const char * value_label,
@@ -364,6 +415,8 @@ trellis_status trellis_pipeline_run_structured_latent(
     float * denorm = NULL;
     float * run_input = NULL;
     float * concat_norm = NULL;
+    float * paired_fixed_norm = NULL;
+    int32_t * flow_coords_bxyz = NULL;
     float * pairs = NULL;
     float * cos_phase = NULL;
     float * sin_phase = NULL;
@@ -437,7 +490,20 @@ trellis_status trellis_pipeline_run_structured_latent(
             state_channels);
         goto cleanup;
     }
+    const int paired = options->paired_fixed_state != NULL;
+    if (paired && component != TRELLIS_COMPONENT_TEX_SLAT_FLOW) {
+        TRELLIS_ERROR(
+            "structured latent %s: paired fixed state is only valid for texture flows",
+            label);
+        goto cleanup;
+    }
     if (flow_model.projection.enabled) {
+        if (paired) {
+            TRELLIS_ERROR(
+                "structured latent %s: paired tokens are incompatible with projected conditioning",
+                label);
+            goto cleanup;
+        }
         if (options->projected_cond == NULL ||
             options->projected_tokens != options->n_coords ||
             options->projected_channels != flow_model.projection.proj_channels) {
@@ -497,16 +563,50 @@ trellis_status trellis_pipeline_run_structured_latent(
         }
     }
 
+    if ((uint64_t) options->n_coords > SIZE_MAX ||
+        (paired && options->n_coords > INT64_MAX / 2) ||
+        (size_t) options->n_coords > SIZE_MAX / (paired ? 2u : 1u)) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    const int64_t flow_tokens = paired ? options->n_coords * 2 : options->n_coords;
+    if (flow_tokens <= 0 ||
+        (size_t) flow_tokens > SIZE_MAX / (size_t) flow.in_channels ||
+        (size_t) flow_tokens > SIZE_MAX / (size_t) state_channels ||
+        (size_t) flow_tokens > SIZE_MAX / (size_t) (flow.head_dim / 2) ||
+        (size_t) flow_tokens > SIZE_MAX / (4u * sizeof(int32_t))) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    if ((size_t) options->cond_tokens > SIZE_MAX / (size_t) flow.cond_channels ||
+        (flow_model.projection.enabled &&
+         (size_t) options->projected_tokens >
+             SIZE_MAX / (size_t) options->projected_channels)) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
     const size_t state_count = (size_t) options->n_coords * (size_t) state_channels;
-    const size_t input_count = (size_t) options->n_coords * (size_t) flow.in_channels;
+    const size_t prediction_count = (size_t) flow_tokens * (size_t) state_channels;
+    const size_t input_count = (size_t) flow_tokens * (size_t) flow.in_channels;
     const size_t context_count = (size_t) options->cond_tokens * (size_t) flow.cond_channels;
     const size_t projected_count = flow_model.projection.enabled ?
         (size_t) options->projected_tokens * (size_t) options->projected_channels :
         0u;
-    const size_t phase_count = (size_t) options->n_coords * (size_t) (flow.head_dim / 2);
+    const size_t phase_count = (size_t) flow_tokens * (size_t) (flow.head_dim / 2);
     const size_t concat_count = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
         (size_t) options->n_coords * (size_t) options->concat_channels :
         0u;
+    if (state_count > SIZE_MAX / sizeof(float) ||
+        prediction_count > SIZE_MAX / sizeof(float) ||
+        input_count > SIZE_MAX / sizeof(float) ||
+        context_count > SIZE_MAX / sizeof(float) ||
+        projected_count > SIZE_MAX / sizeof(float) ||
+        phase_count > SIZE_MAX / sizeof(float) ||
+        concat_count > SIZE_MAX / sizeof(float) ||
+        (size_t) steps > SIZE_MAX / (2u * sizeof(float))) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
     const int cond_only =
         options->guidance_strength == 1.0f && options->guidance_rescale <= 0.0f;
 
@@ -518,8 +618,8 @@ trellis_status trellis_pipeline_run_structured_latent(
         neg_projected_cond = (float *) calloc(projected_count, sizeof(float));
     }
     latent = (float *) malloc(state_count * sizeof(float));
-    pred_pos = (float *) malloc(state_count * sizeof(float));
-    if (!cond_only) pred_neg = (float *) malloc(state_count * sizeof(float));
+    pred_pos = (float *) malloc(prediction_count * sizeof(float));
+    if (!cond_only) pred_neg = (float *) malloc(prediction_count * sizeof(float));
     pred = (float *) malloc(state_count * sizeof(float));
     next = (float *) malloc(state_count * sizeof(float));
     x0 = (float *) malloc(state_count * sizeof(float));
@@ -527,6 +627,10 @@ trellis_status trellis_pipeline_run_structured_latent(
     run_input = (float *) malloc(input_count * sizeof(float));
     if (concat_count > 0) {
         concat_norm = (float *) malloc(concat_count * sizeof(float));
+    }
+    if (paired) {
+        paired_fixed_norm = (float *) malloc(state_count * sizeof(float));
+        flow_coords_bxyz = (int32_t *) malloc((size_t) flow_tokens * 4u * sizeof(int32_t));
     }
     pairs = (float *) malloc((size_t) steps * 2u * sizeof(float));
     cos_phase = (float *) malloc(phase_count * sizeof(float));
@@ -539,6 +643,7 @@ trellis_status trellis_pipeline_run_structured_latent(
         (!cond_only && pred_neg == NULL) || pred == NULL || next == NULL ||
         x0 == NULL || denorm == NULL ||
         run_input == NULL || (concat_count > 0 && concat_norm == NULL) ||
+        (paired && (paired_fixed_norm == NULL || flow_coords_bxyz == NULL)) ||
         pairs == NULL || cos_phase == NULL || sin_phase == NULL || latent_out->coords_bxyz == NULL) {
         TRELLIS_ERROR("structured latent %s: host allocation failed", label);
         goto cleanup;
@@ -560,12 +665,34 @@ trellis_status trellis_pipeline_run_structured_latent(
             concat_std,
             concat_norm);
     }
+    if (paired) {
+        normalize_slat_f32(
+            options->paired_fixed_state,
+            options->n_coords,
+            state_channels,
+            slat_mean,
+            slat_std,
+            paired_fixed_norm);
+        memcpy(
+            flow_coords_bxyz,
+            options->coords_bxyz,
+            (size_t) options->n_coords * 4u * sizeof(int32_t));
+        memcpy(
+            flow_coords_bxyz + (size_t) options->n_coords * 4u,
+            options->coords_bxyz,
+            (size_t) options->n_coords * 4u * sizeof(int32_t));
+        TRELLIS_INFO(
+            "structured latent %s: paired-token mode state_tokens=%lld transformer_tokens=%lld",
+            label,
+            (long long) options->n_coords,
+            (long long) flow_tokens);
+    }
 
     status = trellis_flow_timestep_pairs_f32(steps, rescale_t, pairs, (size_t) steps * 2u);
     if (status == TRELLIS_STATUS_OK) {
         status = trellis_rope_3d_sparse_phases_f32(
-            options->coords_bxyz,
-            options->n_coords,
+            paired ? flow_coords_bxyz : options->coords_bxyz,
+            flow_tokens,
             flow.head_dim,
             1.0f,
             10000.0f,
@@ -587,7 +714,7 @@ trellis_status trellis_pipeline_run_structured_latent(
                 &flow_executor_cond,
                 backend,
                 &flow_model,
-                options->n_coords,
+                flow_tokens,
                 options->cond_tokens,
                 options->cond,
                 options->projected_cond,
@@ -599,7 +726,7 @@ trellis_status trellis_pipeline_run_structured_latent(
                 &flow_executor_cond,
                 backend,
                 &flow,
-                options->n_coords,
+                flow_tokens,
                 options->cond_tokens,
                 options->cond,
                 cos_phase,
@@ -621,7 +748,7 @@ trellis_status trellis_pipeline_run_structured_latent(
             &flow_executor_cfg,
             backend,
             &flow_model,
-            options->n_coords,
+            flow_tokens,
             options->cond_tokens,
             options->cond,
             neg_context,
@@ -635,7 +762,7 @@ trellis_status trellis_pipeline_run_structured_latent(
             &flow_executor_cfg,
             backend,
             &flow,
-            options->n_coords,
+            flow_tokens,
             options->cond_tokens,
             options->cond,
             neg_context,
@@ -655,7 +782,7 @@ trellis_status trellis_pipeline_run_structured_latent(
                     &flow_executor_cond,
                     backend,
                     &flow_model,
-                    options->n_coords,
+                    flow_tokens,
                     options->cond_tokens,
                     options->cond,
                     options->projected_cond,
@@ -667,7 +794,7 @@ trellis_status trellis_pipeline_run_structured_latent(
                     &flow_executor_cond,
                     backend,
                     &flow,
-                    options->n_coords,
+                    flow_tokens,
                     options->cond_tokens,
                     options->cond,
                     cos_phase,
@@ -692,17 +819,22 @@ trellis_status trellis_pipeline_run_structured_latent(
         const int64_t step_start_us = ggml_time_us();
         const float t = pairs[2 * step + 0];
         const float t_prev = pairs[2 * step + 1];
-        if (concat_count > 0) {
-            for (int64_t i = 0; i < options->n_coords; ++i) {
-                float * dst = run_input + (size_t) i * (size_t) flow.in_channels;
-                memcpy(dst, latent + (size_t) i * (size_t) state_channels, (size_t) state_channels * sizeof(float));
-                memcpy(
-                    dst + state_channels,
-                    concat_norm + (size_t) i * (size_t) options->concat_channels,
-                    (size_t) options->concat_channels * sizeof(float));
-            }
-        } else {
-            memcpy(run_input, latent, state_count * sizeof(float));
+        status = trellis_structured_latent_pack_flow_input(
+            latent,
+            paired_fixed_norm,
+            concat_norm,
+            options->n_coords,
+            state_channels,
+            component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
+                options->concat_channels : 0,
+            run_input,
+            input_count);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "structured latent %s: paired flow input assembly failed: %s",
+                label,
+                trellis_status_string(status));
+            goto cleanup;
         }
         if (cond_only) {
             status = trellis_dit_flow_executor_run_single(
@@ -767,7 +899,14 @@ trellis_status trellis_pipeline_run_structured_latent(
         memcpy(latent, next, state_count * sizeof(float));
 
         char detail[128];
-        snprintf(detail, sizeof(detail), "t=%.6g->%.6g tokens=%lld", t, t_prev, (long long) options->n_coords);
+        snprintf(
+            detail,
+            sizeof(detail),
+            "t=%.6g->%.6g state_tokens=%lld transformer_tokens=%lld",
+            t,
+            t_prev,
+            (long long) options->n_coords,
+            (long long) flow_tokens);
         char progress_label[96];
         snprintf(progress_label, sizeof(progress_label), "structured latent %s", label);
         trellis_progress_steps(progress_label, step + 1, steps, ggml_time_us() - step_start_us, detail);
@@ -807,6 +946,8 @@ cleanup:
     free(denorm);
     free(run_input);
     free(concat_norm);
+    free(paired_fixed_norm);
+    free(flow_coords_bxyz);
     free(pairs);
     free(cos_phase);
     free(sin_phase);

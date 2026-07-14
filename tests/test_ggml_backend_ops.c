@@ -760,6 +760,88 @@ static int test_flash_bf16_mixed_v_panels(trellis_backend_context * backend) {
     return ok;
 }
 
+static int test_flash_bf16_qk_exponent_range(
+    trellis_backend_context * backend) {
+    enum { HEAD_DIM = 128, QUERY_TOKENS = 3, KV_TOKENS = 2 };
+    const int64_t q_nels = (int64_t) HEAD_DIM * QUERY_TOKENS;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * KV_TOKENS;
+    float * q_data = (float *) malloc((size_t) q_nels * sizeof(float));
+    float * k_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * output = (float *) malloc((size_t) q_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL &&
+        v_data != NULL && output != NULL);
+
+    /* Alternating channels put either Q or K outside F16's finite range while
+     * keeping every BF16 dot product finite.  Narrowing either operand to F16
+     * produces infinities/NaNs; native BF16 must select key 0 and return 11. */
+    for (int query = 0; query < QUERY_TOKENS; ++query) {
+        for (int channel = 0; channel < HEAD_DIM; ++channel) {
+            q_data[(size_t) query * HEAD_DIM + channel] =
+                (channel & 1) ? 1.0e-5f : 70000.0f;
+        }
+    }
+    for (int key = 0; key < KV_TOKENS; ++key) {
+        const float sign = key == 0 ? 1.0f : -1.0f;
+        for (int channel = 0; channel < HEAD_DIM; ++channel) {
+            k_data[(size_t) key * HEAD_DIM + channel] = sign *
+                ((channel & 1) ? 70000.0f : 1.0e-5f);
+            v_data[(size_t) key * HEAD_DIM + channel] =
+                key == 0 ? 11.0f : -13.0f;
+        }
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, QUERY_TOKENS, 1, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+    struct ggml_tensor * y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, 1.0f / sqrtf((float) HEAD_DIM), &policy);
+    CHECK_TRUE(y != NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL && ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    int ok = 1;
+    for (int64_t i = 0; i < q_nels; ++i) {
+        if (!isfinite(output[i]) || fabsf(output[i] - 11.0f) > 1.0e-3f) {
+            fprintf(
+                stderr,
+                "bf16 flash Q/K exponent range output[%lld]=%g expected=11\n",
+                (long long) i,
+                output[i]);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        printf("bf16 flash Q/K exponent range output=%g\n", output[0]);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(output);
+    free(v_data);
+    free(k_data);
+    free(q_data);
+    return ok;
+}
+
 static int test_flash_bf16_head128_causal_gqa(
     trellis_backend_context * backend) {
     enum {
@@ -922,6 +1004,7 @@ int main(int argc, char ** argv) {
         ok = ok && test_flash_constant_attention(&backend, 257, 257, 2, 70000.0f, 1, 1, 1);
         ok = ok && test_flash_constant_attention(&backend, 513, 5, 1, 70000.0f, 1, 1, 1);
         ok = ok && test_flash_bf16_mixed_v_panels(&backend);
+        ok = ok && test_flash_bf16_qk_exponent_range(&backend);
         ok = ok && test_flash_bf16_head128_causal_gqa(&backend);
         if (getenv("TRELLIS_LONG_ATTN_PERF") != NULL) {
             ok = ok && test_flash_constant_attention(&backend, 21775, 21775, 1, 1.0f, 1, 12, 5);

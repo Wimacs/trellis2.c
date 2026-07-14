@@ -84,6 +84,26 @@ endif()
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
+if (WIN32)
+    # ggml defaults its runtime DLLs to bin/<config>, while this project puts
+    # trellis2_c and its tools in <config>. Give every ggml DLL the same native
+    # output directory so an incremental backend-only rebuild cannot leave a
+    # stale copy beside the executables.
+    set(_trellis_ggml_runtime_targets ggml ggml-base ggml-cpu)
+    if (TARGET ggml-cuda)
+        list(APPEND _trellis_ggml_runtime_targets ggml-cuda)
+    endif()
+    if (TARGET ggml-vulkan)
+        list(APPEND _trellis_ggml_runtime_targets ggml-vulkan)
+    endif()
+    foreach(_target IN LISTS _trellis_ggml_runtime_targets)
+        set_target_properties(${_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endforeach()
+    unset(_trellis_ggml_runtime_targets)
+    unset(_target)
+endif()
+
 if (TRELLIS2_C_BUILD_TOOLS)
     set(MESHOPT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
     set(MESHOPT_BUILD_GLTFPACK ON CACHE BOOL "" FORCE)
@@ -148,6 +168,12 @@ set(TRELLIS2_C_SOURCES
     src/tasks/image_to_3d/shape_latent_cache.c
     src/tasks/image_to_3d/mesh_postprocess.c
     src/tasks/mesh_texturing/pipeline.c
+    src/tasks/mesh_segmentation/pipeline.c
+    src/tasks/mesh_segmentation/condition_render.c
+    src/tasks/mesh_segmentation/material_features.c
+    src/tasks/mesh_segmentation/parts_glb.c
+    src/tasks/mesh_segmentation/partition.c
+    src/tasks/mesh_segmentation/labels.c
     src/tasks/image_to_3d/model_cache.c
     src/architectures/dit_flow/dit_flow_executor.c
     src/ops/sampling/flow_sampler.c
@@ -511,7 +537,6 @@ endif()
 if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()
-
 if (TRELLIS2_C_BACKEND STREQUAL "cuda")
     set(TRELLIS_HAS_CUDA_DECODER_VALUE 1)
 else()
@@ -566,6 +591,16 @@ if (TRELLIS2_C_BUILD_TESTS)
             NAME trellis2_c_tokenskin_converter_tests
             COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_convert_tokenskin_weights.py)
         set_tests_properties(trellis2_c_tokenskin_converter_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+        add_test(
+            NAME trellis2_c_segvigen_converter_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_convert_segvigen_weights.py)
+        set_tests_properties(trellis2_c_segvigen_converter_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+        add_test(
+            NAME trellis2_c_segvigen_fixture_converter_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_convert_segvigen_fixture.py)
+        set_tests_properties(trellis2_c_segvigen_fixture_converter_tests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
         add_test(
             NAME trellis2_c_download_weights_tests
@@ -811,6 +846,74 @@ if (TRELLIS2_C_BUILD_TESTS)
         add_test(NAME trellis2_c_sparse_encoder_backend_vulkan_tests COMMAND trellis2_c_sparse_encoder_backend_tests vulkan)
         set_tests_properties(trellis2_c_sparse_encoder_backend_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
+    add_executable(trellis2_c_structured_latent_pairing_tests
+        tests/test_structured_latent_pairing.c
+    )
+    target_include_directories(trellis2_c_structured_latent_pairing_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_structured_latent_pairing_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_structured_latent_pairing_tests
+        COMMAND trellis2_c_structured_latent_pairing_tests)
+
+    add_executable(trellis2_c_mesh_parts_glb_tests
+        tests/test_mesh_parts_glb.c
+    )
+    target_include_directories(trellis2_c_mesh_parts_glb_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf")
+    target_link_libraries(trellis2_c_mesh_parts_glb_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_parts_glb_tests
+        COMMAND trellis2_c_mesh_parts_glb_tests)
+
+    add_executable(trellis2_c_mesh_partitioner_tests
+        tests/test_mesh_partitioner.c
+    )
+    target_include_directories(trellis2_c_mesh_partitioner_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation")
+    target_link_libraries(trellis2_c_mesh_partitioner_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_partitioner_tests
+        COMMAND trellis2_c_mesh_partitioner_tests)
+
+    add_executable(trellis2_c_mesh_segmentation_labels_tests
+        tests/test_mesh_segmentation_labels.c
+    )
+    target_include_directories(trellis2_c_mesh_segmentation_labels_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation")
+    target_link_libraries(trellis2_c_mesh_segmentation_labels_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_segmentation_labels_tests
+        COMMAND trellis2_c_mesh_segmentation_labels_tests)
+
+    add_executable(trellis2_c_mesh_condition_render_tests
+        tests/test_mesh_condition_render.c
+    )
+    target_include_directories(trellis2_c_mesh_condition_render_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src"
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_mesh_condition_render_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_condition_render_tests
+        COMMAND trellis2_c_mesh_condition_render_tests)
+
+    add_executable(trellis2_c_mesh_material_features_tests
+        tests/test_mesh_material_features.c
+    )
+    target_include_directories(trellis2_c_mesh_material_features_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging")
+    target_link_libraries(trellis2_c_mesh_material_features_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_material_features_tests
+        COMMAND trellis2_c_mesh_material_features_tests)
 endif()
 
 if (TRELLIS2_C_BUILD_TOOLS)
@@ -875,6 +978,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis2-texture-mesh PRIVATE m)
     endif()
 
+    add_executable(trellis2-segment-mesh tools/trellis2_segment_mesh.c)
+    target_link_libraries(trellis2-segment-mesh PRIVATE trellis2_c ggml)
+    if (UNIX)
+        target_link_libraries(trellis2-segment-mesh PRIVATE m)
+    endif()
+
     add_executable(tokenskin-rig tools/tokenskin_rig.c)
     target_link_libraries(tokenskin-rig PRIVATE trellis2_c ggml)
     if (UNIX)
@@ -889,8 +998,18 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 --trellis2 $<TARGET_FILE:trellis2-image-to-gltf>
                 --pixal3d $<TARGET_FILE:pixal3d-image-to-gltf>
                 --texturing $<TARGET_FILE:trellis2-texture-mesh>
+                --segmentation $<TARGET_FILE:trellis2-segment-mesh>
                 --tokenskin $<TARGET_FILE:tokenskin-rig>
                 --source-dir "${CMAKE_CURRENT_LIST_DIR}")
+        add_test(
+            NAME trellis2_c_mesh_segmentation_e2e_tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/tests/test_mesh_segmentation_e2e.py"
+                --cli $<TARGET_FILE:trellis2-segment-mesh>)
+        set_tests_properties(trellis2_c_mesh_segmentation_e2e_tests PROPERTIES
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            LABELS "e2e;gpu")
     endif()
 
     if (TRELLIS2_C_BUILD_TESTS AND TARGET gltfpack)
