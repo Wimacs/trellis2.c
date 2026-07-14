@@ -195,6 +195,9 @@ int trellis_image_to_gltf_cli_main(
     trellis_image_to_gltf_cli_model model,
     int argc,
     char ** argv) {
+    /* Bootstrap before any optional preprocessing path can use performance timers. */
+    trellis_runtime_init();
+
     if (model != TRELLIS_IMAGE_TO_GLTF_CLI_TRELLIS2 &&
         model != TRELLIS_IMAGE_TO_GLTF_CLI_PIXAL3D) {
         fprintf(stderr, "invalid image-to-3D CLI model\n");

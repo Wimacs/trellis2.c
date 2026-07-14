@@ -16,6 +16,10 @@
 #include <string.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <io.h>
 #define TRELLIS_ISATTY _isatty
 #define TRELLIS_FILENO _fileno
@@ -24,6 +28,30 @@
 #define TRELLIS_ISATTY isatty
 #define TRELLIS_FILENO fileno
 #endif
+
+#ifdef _WIN32
+static BOOL CALLBACK trellis_runtime_init_once(
+    PINIT_ONCE once,
+    PVOID parameter,
+    PVOID * context) {
+    (void) once;
+    (void) parameter;
+    (void) context;
+    ggml_time_init();
+    return TRUE;
+}
+#endif
+
+void trellis_runtime_init(void) {
+#ifdef _WIN32
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    (void) InitOnceExecuteOnce(&once, trellis_runtime_init_once, NULL, NULL);
+#else
+    /* ggml uses clock_gettime directly on non-Windows platforms, so its
+     * initialization hook is currently a no-op there. */
+    ggml_time_init();
+#endif
+}
 
 const char * trellis_status_string(trellis_status status) {
     switch (status) {
@@ -69,6 +97,8 @@ trellis_status trellis_backend_kind_from_name(const char * name, trellis_backend
 }
 
 trellis_status trellis_backend_init(trellis_backend_context * ctx, trellis_backend_kind kind, int device) {
+    trellis_runtime_init();
+
     if (ctx == NULL || device < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }

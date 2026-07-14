@@ -197,6 +197,8 @@ static trellis_status trellis_pipeline_image_to_gltf_impl(
     const trellis_pixal3d_options * pixal_options,
     const trellis_image_to_gltf_feature_options * feature_options,
     const char * required_family) {
+    trellis_runtime_init();
+
     if ((feature_options != NULL &&
          (feature_options->struct_size < TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_V1_SIZE ||
           feature_options->version != TRELLIS_IMAGE_TO_GLTF_FEATURE_OPTIONS_VERSION)) ||

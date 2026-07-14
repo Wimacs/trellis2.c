@@ -166,6 +166,8 @@ cleanup:
 
 trellis_status trellis_pipeline_tokenskin_rig(
     const trellis_tokenskin_rig_options * options) {
+    trellis_runtime_init();
+
     trellis_status status = validate_options(options);
     if (status != TRELLIS_STATUS_OK) return status;
 

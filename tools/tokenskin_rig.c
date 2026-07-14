@@ -76,6 +76,9 @@ static int parse_float(const char * text, float * output) {
 }
 
 int main(int argc, char ** argv) {
+    /* Mesh-load timing starts before the TokenSkin backend creates a ggml context. */
+    trellis_runtime_init();
+
     trellis_tokenskin_rig_options options = TRELLIS_TOKENSKIN_RIG_OPTIONS_INIT;
     options.output_path = "tokenskin-rigged.glb";
     for (int i = 1; i < argc; ++i) {

@@ -545,6 +545,16 @@ endif()
 if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
 
+    add_executable(trellis2_c_runtime_init_tests
+        tests/test_runtime_init.c
+    )
+    target_link_libraries(trellis2_c_runtime_init_tests PRIVATE trellis2_c ggml)
+    foreach(TRELLIS_RUNTIME_INIT_MODE image texture tokenskin)
+        add_test(
+            NAME trellis2_c_runtime_init_${TRELLIS_RUNTIME_INIT_MODE}_tests
+            COMMAND trellis2_c_runtime_init_tests ${TRELLIS_RUNTIME_INIT_MODE})
+    endforeach()
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         add_test(

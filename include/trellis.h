@@ -41,6 +41,11 @@ typedef enum trellis_status {
 
 const char * trellis_status_string(trellis_status status);
 
+/* Initializes process-wide runtime services. This function is thread-safe and
+ * idempotent; applications may call it explicitly during startup. Public
+ * pipeline and backend entry points also call it defensively. */
+void trellis_runtime_init(void);
+
 typedef enum trellis_backend_kind {
     TRELLIS_BACKEND_CPU = 0,
     TRELLIS_BACKEND_CUDA = 1,

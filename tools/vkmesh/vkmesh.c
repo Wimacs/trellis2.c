@@ -8692,9 +8692,288 @@ cleanup:
 #endif
 
 #ifndef TRELLIS_VKMESH_LIBRARY
+typedef struct vkmesh_vulkan_probe_device {
+    uint32_t physical_index;
+    VkPhysicalDeviceProperties properties;
+    uint8_t uuid[VK_UUID_SIZE];
+    char driver_name[VK_MAX_DRIVER_NAME_SIZE];
+    char driver_info[VK_MAX_DRIVER_INFO_SIZE];
+    uint64_t device_local_memory_bytes;
+    int has_compute_queue;
+    int storage_buffer_16_bit_access;
+    int usable;
+} vkmesh_vulkan_probe_device;
+
+static void vkmesh_print_json_string(const char * value) {
+    const unsigned char * cursor = (const unsigned char *) (value != NULL ? value : "");
+    putchar('"');
+    while (*cursor != '\0') {
+        switch (*cursor) {
+            case '"': fputs("\\\"", stdout); break;
+            case '\\': fputs("\\\\", stdout); break;
+            case '\b': fputs("\\b", stdout); break;
+            case '\f': fputs("\\f", stdout); break;
+            case '\n': fputs("\\n", stdout); break;
+            case '\r': fputs("\\r", stdout); break;
+            case '\t': fputs("\\t", stdout); break;
+            default:
+                if (*cursor < 0x20u) {
+                    fprintf(stdout, "\\u%04x", (unsigned int) *cursor);
+                } else {
+                    putchar((int) *cursor);
+                }
+                break;
+        }
+        ++cursor;
+    }
+    putchar('"');
+}
+
+static void vkmesh_format_vulkan_version(uint32_t version, char output[32]) {
+    snprintf(
+        output,
+        32,
+        "%u.%u.%u",
+        VK_API_VERSION_MAJOR(version),
+        VK_API_VERSION_MINOR(version),
+        VK_API_VERSION_PATCH(version));
+}
+
+static const char * vkmesh_vulkan_device_type_name(VkPhysicalDeviceType type) {
+    switch (type) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete";
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated";
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return "virtual";
+        case VK_PHYSICAL_DEVICE_TYPE_CPU: return "cpu";
+        default: return "other";
+    }
+}
+
+static int vkmesh_vulkan_device_is_hardware(VkPhysicalDeviceType type) {
+    return type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
+        type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+        type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+}
+
+static int vkmesh_vulkan_device_has_compute_queue(VkPhysicalDevice physical_device) {
+    uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count, NULL);
+    if (family_count == 0) return 0;
+    VkQueueFamilyProperties * families =
+        (VkQueueFamilyProperties *) calloc((size_t) family_count, sizeof(*families));
+    if (families == NULL) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count, families);
+    int found = 0;
+    for (uint32_t i = 0; i < family_count; ++i) {
+        if (families[i].queueCount > 0 && (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+            found = 1;
+            break;
+        }
+    }
+    free(families);
+    return found;
+}
+
+static uint64_t vkmesh_vulkan_device_local_memory(VkPhysicalDevice physical_device) {
+    VkPhysicalDeviceMemoryProperties memory;
+    memset(&memory, 0, sizeof(memory));
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &memory);
+    uint64_t largest = 0;
+    for (uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
+        if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+        const uint64_t size = (uint64_t) memory.memoryHeaps[i].size;
+        if (size > largest) largest = size;
+    }
+    return largest;
+}
+
+static void vkmesh_vulkan_probe_uuid(const uint8_t uuid[VK_UUID_SIZE], char output[VK_UUID_SIZE * 2 + 1]) {
+    static const char digits[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < VK_UUID_SIZE; ++i) {
+        output[i * 2u] = digits[uuid[i] >> 4u];
+        output[i * 2u + 1u] = digits[uuid[i] & 0x0fu];
+    }
+    output[VK_UUID_SIZE * 2u] = '\0';
+}
+
+static const char * vkmesh_vulkan_probe_reason(
+    const vkmesh_vulkan_probe_device * devices,
+    uint32_t device_count) {
+    int has_hardware = 0;
+    int has_compute = 0;
+    int has_vulkan_12_device = 0;
+    for (uint32_t i = 0; i < device_count; ++i) {
+        if (!vkmesh_vulkan_device_is_hardware(devices[i].properties.deviceType)) continue;
+        has_hardware = 1;
+        if (!devices[i].has_compute_queue) continue;
+        has_compute = 1;
+        if (devices[i].properties.apiVersion < VK_API_VERSION_1_2) continue;
+        has_vulkan_12_device = 1;
+        if (!devices[i].storage_buffer_16_bit_access) continue;
+        return NULL;
+    }
+    if (!has_hardware) return "no_hardware_device";
+    if (!has_compute) return "no_compute_queue";
+    if (!has_vulkan_12_device) return "device_api_too_old";
+    return "missing_storage_buffer_16_bit_access";
+}
+
+static int vkmesh_probe_vulkan_json(void) {
+    uint32_t loader_version = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion enumerate_instance_version =
+        (PFN_vkEnumerateInstanceVersion) vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    if (enumerate_instance_version != NULL && enumerate_instance_version(&loader_version) != VK_SUCCESS) {
+        loader_version = VK_API_VERSION_1_0;
+    }
+    char loader_version_text[32];
+    vkmesh_format_vulkan_version(loader_version, loader_version_text);
+    if (loader_version < VK_API_VERSION_1_2) {
+        fputs("{\"schemaVersion\":1,\"status\":\"unsupported\",\"loaderApiVersion\":", stdout);
+        vkmesh_print_json_string(loader_version_text);
+        fputs(",\"reasonCode\":\"loader_api_too_old\",\"devices\":[]}\n", stdout);
+        return 0;
+    }
+
+    VkApplicationInfo application_info;
+    memset(&application_info, 0, sizeof(application_info));
+    application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    application_info.pApplicationName = "Trellis Studio Vulkan probe";
+    application_info.apiVersion = VK_API_VERSION_1_2;
+    VkInstanceCreateInfo instance_info;
+    memset(&instance_info, 0, sizeof(instance_info));
+    instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instance_info.pApplicationInfo = &application_info;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkResult result = vkCreateInstance(&instance_info, NULL, &instance);
+    if (result != VK_SUCCESS) {
+        fputs("{\"schemaVersion\":1,\"status\":\"unsupported\",\"loaderApiVersion\":", stdout);
+        vkmesh_print_json_string(loader_version_text);
+        fputs(",\"reasonCode\":\"instance_create_failed\",\"devices\":[]}\n", stdout);
+        return 0;
+    }
+
+    uint32_t physical_count = 0;
+    result = vkEnumeratePhysicalDevices(instance, &physical_count, NULL);
+    if (result != VK_SUCCESS || physical_count == 0) {
+        vkDestroyInstance(instance, NULL);
+        fputs("{\"schemaVersion\":1,\"status\":\"unsupported\",\"loaderApiVersion\":", stdout);
+        vkmesh_print_json_string(loader_version_text);
+        fputs(",\"reasonCode\":\"no_physical_device\",\"devices\":[]}\n", stdout);
+        return 0;
+    }
+
+    VkPhysicalDevice * physical_devices =
+        (VkPhysicalDevice *) calloc((size_t) physical_count, sizeof(*physical_devices));
+    vkmesh_vulkan_probe_device * devices =
+        (vkmesh_vulkan_probe_device *) calloc((size_t) physical_count, sizeof(*devices));
+    if (physical_devices == NULL || devices == NULL) {
+        free(physical_devices);
+        free(devices);
+        vkDestroyInstance(instance, NULL);
+        fputs("vkmesh: Vulkan probe ran out of memory\n", stderr);
+        return 1;
+    }
+    result = vkEnumeratePhysicalDevices(instance, &physical_count, physical_devices);
+    if (result != VK_SUCCESS) {
+        free(physical_devices);
+        free(devices);
+        vkDestroyInstance(instance, NULL);
+        fputs("vkmesh: Vulkan device enumeration failed\n", stderr);
+        return 1;
+    }
+
+    uint32_t usable_count = 0;
+    for (uint32_t i = 0; i < physical_count; ++i) {
+        vkmesh_vulkan_probe_device * probe = &devices[i];
+        probe->physical_index = i;
+        VkPhysicalDeviceIDProperties id_properties;
+        VkPhysicalDeviceDriverProperties driver_properties;
+        VkPhysicalDeviceProperties2 properties2;
+        memset(&id_properties, 0, sizeof(id_properties));
+        memset(&driver_properties, 0, sizeof(driver_properties));
+        memset(&properties2, 0, sizeof(properties2));
+        id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        id_properties.pNext = &driver_properties;
+        driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties2.pNext = &id_properties;
+        vkGetPhysicalDeviceProperties2(physical_devices[i], &properties2);
+        probe->properties = properties2.properties;
+        memcpy(probe->uuid, id_properties.deviceUUID, sizeof(probe->uuid));
+        memcpy(probe->driver_name, driver_properties.driverName, sizeof(probe->driver_name));
+        probe->driver_name[sizeof(probe->driver_name) - 1u] = '\0';
+        memcpy(probe->driver_info, driver_properties.driverInfo, sizeof(probe->driver_info));
+        probe->driver_info[sizeof(probe->driver_info) - 1u] = '\0';
+
+        VkPhysicalDeviceVulkan11Features features11;
+        VkPhysicalDeviceFeatures2 features2;
+        memset(&features11, 0, sizeof(features11));
+        memset(&features2, 0, sizeof(features2));
+        features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &features11;
+        vkGetPhysicalDeviceFeatures2(physical_devices[i], &features2);
+        probe->has_compute_queue = vkmesh_vulkan_device_has_compute_queue(physical_devices[i]);
+        probe->storage_buffer_16_bit_access = features11.storageBuffer16BitAccess == VK_TRUE;
+        probe->device_local_memory_bytes = vkmesh_vulkan_device_local_memory(physical_devices[i]);
+        probe->usable = vkmesh_vulkan_device_is_hardware(probe->properties.deviceType) &&
+            probe->properties.apiVersion >= VK_API_VERSION_1_2 &&
+            probe->has_compute_queue &&
+            probe->storage_buffer_16_bit_access;
+        if (probe->usable) ++usable_count;
+    }
+    free(physical_devices);
+    vkDestroyInstance(instance, NULL);
+
+    fputs("{\"schemaVersion\":1,\"status\":", stdout);
+    vkmesh_print_json_string(usable_count > 0 ? "supported" : "unsupported");
+    fputs(",\"loaderApiVersion\":", stdout);
+    vkmesh_print_json_string(loader_version_text);
+    if (usable_count == 0) {
+        const char * reason = vkmesh_vulkan_probe_reason(devices, physical_count);
+        fputs(",\"reasonCode\":", stdout);
+        vkmesh_print_json_string(reason != NULL ? reason : "no_usable_device");
+    }
+    fputs(",\"devices\":[", stdout);
+    for (uint32_t i = 0; i < physical_count; ++i) {
+        const vkmesh_vulkan_probe_device * probe = &devices[i];
+        char uuid[VK_UUID_SIZE * 2 + 1];
+        char api_version[32];
+        char driver_version[32];
+        vkmesh_vulkan_probe_uuid(probe->uuid, uuid);
+        vkmesh_format_vulkan_version(probe->properties.apiVersion, api_version);
+        snprintf(driver_version, sizeof(driver_version), "%u", probe->properties.driverVersion);
+        if (i > 0) putchar(',');
+        fprintf(stdout, "{\"physicalIndex\":%u,\"name\":", probe->physical_index);
+        vkmesh_print_json_string(probe->properties.deviceName);
+        fputs(",\"deviceType\":", stdout);
+        vkmesh_print_json_string(vkmesh_vulkan_device_type_name(probe->properties.deviceType));
+        fputs(",\"uuid\":", stdout);
+        vkmesh_print_json_string(uuid);
+        fprintf(stdout, ",\"vendorId\":%u,\"driverName\":", probe->properties.vendorID);
+        vkmesh_print_json_string(probe->driver_name);
+        fputs(",\"driverInfo\":", stdout);
+        vkmesh_print_json_string(probe->driver_info[0] != '\0' ? probe->driver_info : driver_version);
+        fputs(",\"apiVersion\":", stdout);
+        vkmesh_print_json_string(api_version);
+        fprintf(
+            stdout,
+            ",\"memoryTotalBytes\":%" PRIu64
+            ",\"hasComputeQueue\":%s,\"storageBuffer16BitAccess\":%s,\"usable\":%s}",
+            probe->device_local_memory_bytes,
+            probe->has_compute_queue ? "true" : "false",
+            probe->storage_buffer_16_bit_access ? "true" : "false",
+            probe->usable ? "true" : "false");
+    }
+    fputs("]}\n", stdout);
+    free(devices);
+    return 0;
+}
+
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s --input in.meshbin --output out.meshbin [options]\n"
+        "       %s --probe-vulkan-json\n"
         "\n"
         "Postprocess stages:\n"
         "  --postprocess                 Run PyTorch/o-voxel TRELLIS postprocess preset\n"
@@ -8735,10 +9014,14 @@ static void print_usage(const char * argv0) {
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
         "  --projection-mesh-output FILE With --postprocess, write post-fill source meshbin for texture projection\n"
         "\n",
+        argv0,
         argv0);
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--probe-vulkan-json") == 0) {
+        return vkmesh_probe_vulkan_json();
+    }
     const char * input = NULL;
     const char * output = NULL;
     const char * projection_output = NULL;

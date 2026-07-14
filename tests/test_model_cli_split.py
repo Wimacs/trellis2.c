@@ -17,6 +17,7 @@ def run(executable: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        timeout=30,
     )
 
 
@@ -156,6 +157,74 @@ def main() -> int:
             "TRELLIS.2 mesh texturing initialized a GPU before family rejection",
             wrong_texturing_family.stdout)
 
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        triangle_path = temporary_root / "triangle.gltf"
+        triangle_path.write_text(json.dumps({
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0},
+                "indices": 1,
+                "mode": 4,
+            }]}],
+            "buffers": [{
+                "uri": (
+                    "data:application/octet-stream;base64,"
+                    "AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAA"
+                ),
+                "byteLength": 42,
+            }],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6, "target": 34963},
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "componentType": 5126,
+                    "count": 3,
+                    "type": "VEC3",
+                    "min": [0, 0, 0],
+                    "max": [1, 1, 0],
+                },
+                {
+                    "bufferView": 1,
+                    "componentType": 5123,
+                    "count": 3,
+                    "type": "SCALAR",
+                    "min": [0],
+                    "max": [0],
+                },
+            ],
+        }))
+        prepared_texturing = run(
+            args.texturing,
+            "--model",
+            str(args.source_dir / "models" / "trellis2"),
+            "--dino",
+            "must-not-be-opened-dino",
+            "--input",
+            str(triangle_path),
+            "--image",
+            "already-prepared.png",
+            "--image-prepared",
+            "--output",
+            str(temporary_root / "must-not-be-written.glb"),
+        )
+        require(prepared_texturing.returncode == 1,
+                "prepared-image texturing did not fail through the normal CLI path",
+                prepared_texturing.stdout)
+        require("trellis2-texture-mesh failed:" in prepared_texturing.stdout,
+                "prepared-image texturing terminated before CLI error handling",
+                prepared_texturing.stdout)
+        require("ggml_cuda_init" not in prepared_texturing.stdout and
+                "ggml_vulkan" not in prepared_texturing.stdout,
+                "prepared-image timer regression initialized a GPU",
+                prepared_texturing.stdout)
+
     tokenskin_help = run(args.tokenskin, "--help")
     require(tokenskin_help.returncode == 0,
             "TokenSkin --help failed", tokenskin_help.stdout)
@@ -187,6 +256,27 @@ def main() -> int:
             "ggml_vulkan" not in wrong_tokenskin_family.stdout,
             "TokenSkin parsed the mesh or initialized a GPU before family rejection",
             wrong_tokenskin_family.stdout)
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        missing_input = Path(temporary_directory) / "missing.gltf"
+        valid_tokenskin_preflight = run(
+            args.tokenskin,
+            "--model",
+            str(args.source_dir / "models" / "tokenskin"),
+            "--input",
+            str(missing_input),
+            "--output",
+            str(Path(temporary_directory) / "must-not-be-written.glb"),
+        )
+        require(valid_tokenskin_preflight.returncode == 1,
+                "TokenSkin input preflight did not fail through the normal CLI path",
+                valid_tokenskin_preflight.stdout)
+        require("tokenskin-rig failed:" in valid_tokenskin_preflight.stdout,
+                "TokenSkin terminated before CLI error handling",
+                valid_tokenskin_preflight.stdout)
+        require("TokenSkin input mesh:" in valid_tokenskin_preflight.stdout,
+                "TokenSkin did not reach its expected input preflight",
+                valid_tokenskin_preflight.stdout)
 
     with tempfile.TemporaryDirectory() as temporary_directory:
         invalid_package = Path(temporary_directory)

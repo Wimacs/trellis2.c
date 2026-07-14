@@ -317,6 +317,8 @@ static trellis_status texturing_load_encoder(
 
 trellis_status trellis_pipeline_trellis2_texture_mesh(
     const trellis_mesh_texturing_options * options) {
+    trellis_runtime_init();
+
     if (options == NULL ||
         options->struct_size < TRELLIS_MESH_TEXTURING_OPTIONS_V1_SIZE ||
         options->model_dir == NULL || options->dino_dir == NULL ||

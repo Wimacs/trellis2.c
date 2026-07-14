@@ -69,6 +69,9 @@ static int parse_u32(const char * text, uint32_t * output) {
 }
 
 int main(int argc, char ** argv) {
+    /* Prepared-image execution can reach performance timers before ggml_init(). */
+    trellis_runtime_init();
+
     trellis_mesh_texturing_options options = TRELLIS_MESH_TEXTURING_OPTIONS_INIT;
     options.output_path = "textured.glb";
 
