@@ -80,7 +80,9 @@ function Write-DownloadScripts($DestinationDir) {
 @echo off
 set "HERE=%~dp0"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%download_weights.ps1" %*
-if errorlevel 1 pause
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" pause
+exit /b %EXIT_CODE%
 '@
     Set-Content -LiteralPath (Join-Path $DestinationDir "Download weights.bat") -Value $Batch -Encoding ASCII
 
@@ -103,33 +105,55 @@ $OutDir = Join-Path $Here "TRELLIS.2"
 $Downloader = Join-Path $Here "download_weights.py"
 
 function Find-Python {
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) {
-        return @($py.Source, "-3")
+    $candidates = @()
+    if (![string]::IsNullOrWhiteSpace($env:VIRTUAL_ENV)) {
+        $venvPython = Join-Path $env:VIRTUAL_ENV "Scripts\python.exe"
+        if (Test-Path -LiteralPath $venvPython) {
+            $candidates += [pscustomobject]@{ Exe = $venvPython; Prefix = @() }
+        }
     }
+
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        return @($python.Source)
+        $candidates += [pscustomobject]@{ Exe = $python.Source; Prefix = @() }
     }
     $python3 = Get-Command python3 -ErrorAction SilentlyContinue
     if ($python3) {
-        return @($python3.Source)
+        $candidates += [pscustomobject]@{ Exe = $python3.Source; Prefix = @() }
     }
-    throw "Python was not found. Install Python 3, then run this script again."
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        $candidates += [pscustomobject]@{ Exe = $py.Source; Prefix = @("-3") }
+    }
+
+    foreach ($candidate in $candidates) {
+        try {
+            & $candidate.Exe @($candidate.Prefix) -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $candidate
+            }
+        } catch {
+            continue
+        }
+    }
+    throw "A working Python 3.9+ was not found. Install Python 3, then run this script again."
 }
 
 $Python = Find-Python
-$Exe = $Python[0]
-$Prefix = @()
-if ($Python.Length -gt 1) {
-    $Prefix = $Python[1..($Python.Length - 1)]
-}
+$Exe = $Python.Exe
+$Prefix = @($Python.Prefix)
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-& $Exe @Prefix -m pip install -U "huggingface_hub[cli]"
+& $Exe @Prefix -m pip install -U huggingface_hub
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 if ($Source -eq "modelscope" -or $Source -eq "ms") {
     & $Exe @Prefix -m pip install -U modelscope
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 $Args = @($Downloader, "--source", $Source, "--output-dir", $OutDir, "--only", $Only, "--max-workers", "$MaxWorkers")
@@ -180,6 +204,7 @@ Run:
 Weights:
   No weights are included in this folder.
   The downloader writes to .\TRELLIS.2\, which the GUI auto-detects.
+  DINOv3 is downloaded anonymously from the public camenduru mirror.
   You can also run:
     powershell -ExecutionPolicy Bypass -File .\download_weights.ps1
     powershell -ExecutionPolicy Bypass -File .\download_weights.ps1 -Source modelscope

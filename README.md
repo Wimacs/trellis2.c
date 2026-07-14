@@ -88,6 +88,11 @@ python3 tools/download_weights.py --source modelscope
 
 This downloads TRELLIS.2, DINOv3, and the BiRefNet background-removal model:
 
+The default Hugging Face download uses the public
+`camenduru/dinov3-vitl16-pretrain-lvd1689m` mirror because the official Meta
+repository requires accepting an access agreement. The required model files
+are identical; use `--dino-repo` to override the source.
+
 ```text
 ../TRELLIS.2/
 |-- TRELLIS.2-4B/

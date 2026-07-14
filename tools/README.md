@@ -18,6 +18,12 @@ folder layout: `TRELLIS.2-4B/`, `dinov3-vitl16-pretrain-lvd1689m/`, and
 `--include`, or `--full` when you need a custom layout or a non-default set of
 files.
 
+On Hugging Face, DINOv3 defaults to the public
+`camenduru/dinov3-vitl16-pretrain-lvd1689m` mirror. The official Meta repository
+requires accepting an access agreement, while the required files in this mirror
+are identical and can be downloaded anonymously. Use `--dino-repo` to override
+the source.
+
 `trellis-gui` is the default local GUI. It opens without arguments; choose the
 weights folder in the window, or pass it up front:
 

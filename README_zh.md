@@ -82,6 +82,10 @@ python3 tools/download_weights.py --source modelscope
 
 会下载 TRELLIS.2、DINOv3 和 BiRefNet 背景去除模型：
 
+Hugging Face 下载默认使用公开镜像
+`camenduru/dinov3-vitl16-pretrain-lvd1689m`，因为 Meta 官方仓库需要先接受访问协议。
+所需模型文件与官方仓库一致；可通过 `--dino-repo` 覆盖下载源。
+
 ```text
 ../TRELLIS.2/
 |-- TRELLIS.2-4B/

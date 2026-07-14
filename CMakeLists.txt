@@ -557,6 +557,11 @@ if (TRELLIS2_C_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_convert_tokenskin_weights.py)
         set_tests_properties(trellis2_c_tokenskin_converter_tests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+        add_test(
+            NAME trellis2_c_download_weights_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_download_weights.py)
+        set_tests_properties(trellis2_c_download_weights_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
     endif()
 
     add_executable(trellis2_c_model_package_tests

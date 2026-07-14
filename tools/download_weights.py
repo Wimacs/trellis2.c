@@ -17,7 +17,9 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT.parent / "TRELLIS.2"
 
 DEFAULT_TRELLIS_REPO = "microsoft/TRELLIS.2-4B"
 DEFAULT_SPARSE_DECODER_REPO = "microsoft/TRELLIS-image-large"
-DEFAULT_DINO_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+# The official Meta repository requires accepting an access agreement. This
+# mirror contains the same model files and supports anonymous downloads.
+DEFAULT_DINO_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
 DEFAULT_BIREFNET_REPO = "Acly/BiRefNet-GGUF"
 
 TRELLIS_MINIMAL_PATTERNS = [
@@ -120,7 +122,7 @@ def download_from_huggingface(
     local_files_only: bool,
     max_workers: int,
 ) -> str:
-    hub = import_or_exit("huggingface_hub", 'python3 -m pip install -U "huggingface_hub[cli]"')
+    hub = import_or_exit("huggingface_hub", "python3 -m pip install -U huggingface_hub")
 
     return hub.snapshot_download(
         repo_id=spec.repo_id,
