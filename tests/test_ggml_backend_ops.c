@@ -774,7 +774,8 @@ static int test_flash_bf16_qk_exponent_range(
 
     /* Alternating channels put either Q or K outside F16's finite range while
      * keeping every BF16 dot product finite.  Narrowing either operand to F16
-     * produces infinities/NaNs; native BF16 must select key 0 and return 11. */
+     * produces infinities/NaNs; BF16 attention must select key 0 and return
+     * approximately 11 (allowing cooperative-matrix lowering roundoff). */
     for (int query = 0; query < QUERY_TOKENS; ++query) {
         for (int channel = 0; channel < HEAD_DIM; ++channel) {
             q_data[(size_t) query * HEAD_DIM + channel] =
@@ -817,14 +818,18 @@ static int test_flash_bf16_qk_exponent_range(
     CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
     ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
 
+    const float expected = 11.0f;
+    const float tolerance = 2.0e-4f * fmaxf(1.0f, fabsf(expected));
     int ok = 1;
     for (int64_t i = 0; i < q_nels; ++i) {
-        if (!isfinite(output[i]) || fabsf(output[i] - 11.0f) > 1.0e-3f) {
+        if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
             fprintf(
                 stderr,
-                "bf16 flash Q/K exponent range output[%lld]=%g expected=11\n",
+                "bf16 flash Q/K exponent range output[%lld]=%g expected=%g tolerance=%g\n",
                 (long long) i,
-                output[i]);
+                output[i],
+                expected,
+                tolerance);
             ok = 0;
             break;
         }
