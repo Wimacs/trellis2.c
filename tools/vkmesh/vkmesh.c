@@ -5457,8 +5457,8 @@ typedef struct vkmesh_simplify_result {
     int target_faces;
     int steps;
     int threshold_escalations;
-    int total_collapsed;
-    int total_removed;
+    uint64_t total_collapsed;
+    uint64_t total_removed;
     float final_threshold;
     int target_reached;
     vkmesh_simplify_stop_reason stop_reason;
@@ -5481,8 +5481,8 @@ static void vkmesh_store_simplify_result(
     int target_faces,
     int steps,
     int threshold_escalations,
-    int total_collapsed,
-    int total_removed,
+    uint64_t total_collapsed,
+    uint64_t total_removed,
     float final_threshold,
     vkmesh_simplify_stop_reason stop_reason) {
     if (result == NULL) return;
@@ -5505,7 +5505,7 @@ static void vkmesh_log_simplify_target_warning(
     fprintf(stderr,
         "vkmesh: WARNING simplify target_not_reached label=%s reason=%s initial=%" PRId64
         " target=%d final=%" PRId64 " steps=%d threshold_escalations=%d final_threshold=%.9g"
-        " collapsed=%d removed_faces=%d\n",
+        " collapsed=%" PRIu64 " removed_faces=%" PRIu64 "\n",
         label != NULL ? label : "simplify",
         vkmesh_simplify_stop_reason_name(result->stop_reason),
         result->initial_faces,
@@ -5525,8 +5525,8 @@ static int vkmesh_device_simplify(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed,
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
     vkmesh_simplify_result * result) {
     if (dm == NULL || dm->vk == NULL || dm->n_vertices == 0u || dm->n_faces == 0u) {
         return 0;
@@ -5534,8 +5534,8 @@ static int vkmesh_device_simplify(
     if (target_faces <= 0) target_faces = 1;
 
     const uint32_t initial_faces = dm->n_faces;
-    uint32_t total_collapsed_u32 = 0u;
-    uint32_t total_removed_u32 = 0u;
+    uint64_t total_collapsed_u64 = 0u;
+    uint64_t total_removed_u64 = 0u;
 
     int step = 0;
     int consecutive_no_progress = 0;
@@ -5553,9 +5553,13 @@ static int vkmesh_device_simplify(
             threshold);
         fflush(stderr);
         if (!vkmesh_device_simplify_step(dm, lambda_edge_length, lambda_skinny, threshold, &collapsed, &removed)) return 0;
-        if (total_collapsed_u32 > UINT32_MAX - collapsed || total_removed_u32 > UINT32_MAX - removed) return 0;
-        total_collapsed_u32 += collapsed;
-        total_removed_u32 += removed;
+        if (total_collapsed_u64 > UINT64_MAX - (uint64_t) collapsed ||
+            total_removed_u64 > UINT64_MAX - (uint64_t) removed) {
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            return 0;
+        }
+        total_collapsed_u64 += (uint64_t) collapsed;
+        total_removed_u64 += (uint64_t) removed;
         ++step;
         fprintf(stderr,
             "vkmesh: simplify step=%d end collapsed=%u removed_faces=%u faces=%u\n",
@@ -5593,9 +5597,8 @@ static int vkmesh_device_simplify(
         }
     }
 
-    if (total_collapsed_u32 > (uint32_t) INT_MAX || total_removed_u32 > (uint32_t) INT_MAX) return 0;
-    *total_collapsed = (int) total_collapsed_u32;
-    *total_removed = (int) total_removed_u32;
+    *total_collapsed = total_collapsed_u64;
+    *total_removed = total_removed_u64;
     vkmesh_store_simplify_result(
         result,
         initial_faces,
@@ -5617,8 +5620,8 @@ static int vkmesh_simplify_device_vulkan(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed,
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
     vkmesh_simplify_result * result) {
     if (mesh == NULL || mesh->n_vertices <= 0 || mesh->n_vertices > UINT32_MAX ||
         mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX) {
@@ -5774,8 +5777,8 @@ static int vkmesh_simplify(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed,
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
     vkmesh_simplify_result * result) {
     *total_collapsed = 0;
     *total_removed = 0;
@@ -5794,13 +5797,19 @@ static int vkmesh_simplify(
     }
     if (vkmesh_fatal_error_blocks_fallback("device Vulkan simplify")) return 0;
 
+    /* The device attempt never committed its mesh. Do not carry its counters
+       or diagnostic result into the host fallback. */
+    *total_collapsed = 0u;
+    *total_removed = 0u;
+    if (result != NULL) memset(result, 0, sizeof(*result));
+
     const int64_t initial_faces = mesh->n_faces;
     int step = 0;
     int consecutive_no_progress = 0;
     int threshold_escalations = 0;
     vkmesh_simplify_stop_reason stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
     while (mesh->n_faces > target_faces && (max_steps <= 0 || step < max_steps)) {
-        int before = (int) mesh->n_faces;
+        int64_t before = mesh->n_faces;
         int collapsed = 0;
         int removed = 0;
         fprintf(stderr,
@@ -5811,8 +5820,14 @@ static int vkmesh_simplify(
             threshold);
         fflush(stderr);
         if (!vkmesh_simplify_step(mesh, lambda_edge_length, lambda_skinny, threshold, &collapsed, &removed)) return 0;
-        *total_collapsed += collapsed;
-        *total_removed += removed;
+        if (collapsed < 0 || removed < 0 ||
+            *total_collapsed > UINT64_MAX - (uint64_t) collapsed ||
+            *total_removed > UINT64_MAX - (uint64_t) removed) {
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            return 0;
+        }
+        *total_collapsed += (uint64_t) collapsed;
+        *total_removed += (uint64_t) removed;
         ++step;
         fprintf(stderr,
             "vkmesh: simplify step=%d end collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
@@ -5839,7 +5854,7 @@ static int vkmesh_simplify(
             stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
             break;
         }
-        if (collapsed == 0 || removed == 0 || (int64_t) removed * 100ll < (int64_t) before) {
+        if (collapsed == 0 || removed == 0 || (int64_t) removed * 100ll < before) {
             if (!isfinite(threshold) || threshold > FLT_MAX / 10.0f) {
                 fprintf(stderr, "vkmesh: simplify stopped because threshold can no longer increase\n");
                 stop_reason = VKMESH_SIMPLIFY_THRESHOLD_EXHAUSTED;
@@ -8918,6 +8933,9 @@ static int vkmesh_trellis_postprocess_device_inner(
     }
 
     if (remesh) {
+        vkmesh_simplify_result remesh_simplify_result;
+        int has_remesh_simplify_result = 0;
+        memset(&remesh_simplify_result, 0, sizeof(remesh_simplify_result));
         if (projection_candidate.vertices != NULL) {
             vkmesh_device_mesh_destroy(&dm);
             if (!vkmesh_remesh_narrow_band_dc_to(
@@ -8936,10 +8954,8 @@ static int vkmesh_trellis_postprocess_device_inner(
         mesh_free(&remesh_work);
 
         if (dm.n_faces > (uint32_t) decimation_target) {
-            int collapsed = 0;
-            int removed = 0;
-            vkmesh_simplify_result simplify_result;
-            memset(&simplify_result, 0, sizeof(simplify_result));
+            uint64_t collapsed = 0u;
+            uint64_t removed = 0u;
             fprintf(stderr,
                 "vkmesh: trellis.remesh simplify begin target=%d faces=%u\n",
                 decimation_target,
@@ -8954,16 +8970,17 @@ static int vkmesh_trellis_postprocess_device_inner(
                     simplify_steps,
                     &collapsed,
                     &removed,
-                    &simplify_result)) {
+                    &remesh_simplify_result)) {
                 goto cleanup;
             }
+            has_remesh_simplify_result = 1;
             fprintf(stderr,
-                "vkmesh: trellis.remesh simplify target=%d collapsed=%d removed_faces=%d faces=%u\n",
+                "vkmesh: trellis.remesh simplify target=%d collapsed=%" PRIu64
+                " removed_faces=%" PRIu64 " faces=%u\n",
                 decimation_target,
                 collapsed,
                 removed,
                 dm.n_faces);
-            vkmesh_log_simplify_target_warning("trellis.remesh", &simplify_result);
         } else {
             fprintf(stderr,
                 "vkmesh: trellis.remesh simplify skipped faces=%u target=%d\n",
@@ -9020,18 +9037,26 @@ static int vkmesh_trellis_postprocess_device_inner(
             *projection_mesh_out = projection_candidate;
             memset(&projection_candidate, 0, sizeof(projection_candidate));
         }
+        if (has_remesh_simplify_result) {
+            vkmesh_log_simplify_target_warning("trellis.remesh", &remesh_simplify_result);
+        }
         fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
         ok = 1;
         goto cleanup;
     }
 
+    vkmesh_simplify_result pass1_simplify_result;
+    vkmesh_simplify_result pass2_simplify_result;
+    int has_pass1_simplify_result = 0;
+    int has_pass2_simplify_result = 0;
+    memset(&pass1_simplify_result, 0, sizeof(pass1_simplify_result));
+    memset(&pass2_simplify_result, 0, sizeof(pass2_simplify_result));
+
     int64_t first_target = (int64_t) decimation_target * 3;
     if (first_target > INT_MAX) first_target = INT_MAX;
     if (dm.n_faces > (uint32_t) first_target) {
-        int collapsed = 0;
-        int removed = 0;
-        vkmesh_simplify_result simplify_result;
-        memset(&simplify_result, 0, sizeof(simplify_result));
+        uint64_t collapsed = 0u;
+        uint64_t removed = 0u;
         fprintf(stderr, "vkmesh: trellis.pass1 simplify begin target=%" PRId64 " faces=%u\n", first_target, dm.n_faces);
         fflush(stderr);
         if (!vkmesh_device_simplify(
@@ -9043,16 +9068,17 @@ static int vkmesh_trellis_postprocess_device_inner(
                 simplify_steps,
                 &collapsed,
                 &removed,
-                &simplify_result)) {
+                &pass1_simplify_result)) {
             goto cleanup;
         }
+        has_pass1_simplify_result = 1;
         fprintf(stderr,
-            "vkmesh: trellis.pass1 simplify target=%" PRId64 " collapsed=%d removed_faces=%d faces=%u\n",
+            "vkmesh: trellis.pass1 simplify target=%" PRId64 " collapsed=%" PRIu64
+            " removed_faces=%" PRIu64 " faces=%u\n",
             first_target,
             collapsed,
             removed,
             dm.n_faces);
-        vkmesh_log_simplify_target_warning("trellis.pass1", &simplify_result);
     } else {
         fprintf(stderr, "vkmesh: trellis.pass1 simplify skipped faces=%u target=%" PRId64 "\n", dm.n_faces, first_target);
     }
@@ -9072,10 +9098,8 @@ static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_log_trellis_cleanup_stats("trellis.pass1", run_degenerate_cleanup, 0, NULL, &pass1_stats);
 
     if (dm.n_faces > (uint32_t) decimation_target) {
-        int collapsed = 0;
-        int removed = 0;
-        vkmesh_simplify_result simplify_result;
-        memset(&simplify_result, 0, sizeof(simplify_result));
+        uint64_t collapsed = 0u;
+        uint64_t removed = 0u;
         fprintf(stderr, "vkmesh: trellis.pass2 simplify begin target=%d faces=%u\n", decimation_target, dm.n_faces);
         fflush(stderr);
         if (!vkmesh_device_simplify(
@@ -9087,16 +9111,17 @@ static int vkmesh_trellis_postprocess_device_inner(
                 simplify_steps,
                 &collapsed,
                 &removed,
-                &simplify_result)) {
+                &pass2_simplify_result)) {
             goto cleanup;
         }
+        has_pass2_simplify_result = 1;
         fprintf(stderr,
-            "vkmesh: trellis.pass2 simplify target=%d collapsed=%d removed_faces=%d faces=%u\n",
+            "vkmesh: trellis.pass2 simplify target=%d collapsed=%" PRIu64
+            " removed_faces=%" PRIu64 " faces=%u\n",
             decimation_target,
             collapsed,
             removed,
             dm.n_faces);
-        vkmesh_log_simplify_target_warning("trellis.pass2", &simplify_result);
     } else {
         fprintf(stderr, "vkmesh: trellis.pass2 simplify skipped faces=%u target=%d\n", dm.n_faces, decimation_target);
     }
@@ -9119,6 +9144,12 @@ static int vkmesh_trellis_postprocess_device_inner(
     if (projection_mesh_out != NULL && projection_candidate.vertices != NULL) {
         *projection_mesh_out = projection_candidate;
         memset(&projection_candidate, 0, sizeof(projection_candidate));
+    }
+    if (has_pass1_simplify_result) {
+        vkmesh_log_simplify_target_warning("trellis.pass1", &pass1_simplify_result);
+    }
+    if (has_pass2_simplify_result) {
+        vkmesh_log_simplify_target_warning("trellis.pass2", &pass2_simplify_result);
     }
     fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
     ok = 1;
@@ -9146,8 +9177,8 @@ static int vkmesh_log_simplify(
     float simplify_threshold,
     int simplify_steps,
     const char * label) {
-    int collapsed = 0;
-    int removed = 0;
+    uint64_t collapsed = 0u;
+    uint64_t removed = 0u;
     vkmesh_simplify_result simplify_result;
     memset(&simplify_result, 0, sizeof(simplify_result));
     if (target_faces <= 0) target_faces = 1;
@@ -9170,7 +9201,8 @@ static int vkmesh_log_simplify(
         return 0;
     }
     fprintf(stderr,
-        "vkmesh: %s simplify target=%d collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
+        "vkmesh: %s simplify target=%d collapsed=%" PRIu64
+        " removed_faces=%" PRIu64 " faces=%" PRId64 "\n",
         label,
         target_faces,
         collapsed,
