@@ -132,6 +132,24 @@ class ConvertSegviGenFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ConversionError, "decoder frame"):
             MODULE.validate_anchor_aabb((-0.6, -0.1, -0.1), (0.4, 0.1, 0.1))
 
+    def test_anchor_limit_tracks_flex_dual_grid_resolution(self) -> None:
+        for resolution in MODULE.SUPPORTED_RESOLUTIONS:
+            with self.subTest(resolution=resolution):
+                limit = MODULE.decoder_aabb_limit(resolution)
+                minimum, maximum = MODULE.validate_anchor_aabb(
+                    (-limit + 1e-7, -0.1, -0.1),
+                    (limit - 1e-7, 0.1, 0.1),
+                    resolution,
+                )
+                self.assertLess(minimum[0], -0.5)
+                self.assertGreater(maximum[0], 0.5)
+                with self.assertRaisesRegex(MODULE.ConversionError, "decoder frame"):
+                    MODULE.validate_anchor_aabb(
+                        (-limit - 1e-4, -0.1, -0.1),
+                        (0.4, 0.1, 0.1),
+                        resolution,
+                    )
+
     @unittest.skipIf(trimesh is None, "trimesh is required for GLB anchor coverage")
     def test_glb_anchor_uses_direct_world_axes_and_official_scale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

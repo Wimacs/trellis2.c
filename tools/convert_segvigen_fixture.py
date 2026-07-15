@@ -22,7 +22,6 @@ TSLAT_VERSION = 1
 TSLAT_HEADER_BYTES = 80
 TSLAT_COORD_FRAME_TRELLIS_DECODER_V1 = 1
 TSLAT_CHANNELS = 32
-TSLAT_DECODER_AABB_LIMIT = 0.5001
 SEGVIGEN_NORMALIZED_EXTENT = 0.99999
 SUPPORTED_RESOLUTIONS = (512, 1024)
 HEADER_STRUCT = struct.Struct("<8sIIIIQII3f3fQQ")
@@ -126,8 +125,18 @@ def normalize_and_validate_fixture(
     return coords_i32, feats_f32
 
 
+def decoder_aabb_limit(resolution: int) -> float:
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise ConversionError(f"unsupported resolution: {resolution}")
+    # Match trellis_shape_latent_decoder_aabb_limit(): FlexDualGrid vertices
+    # may extend half a voxel beyond the nominal decoder cube.
+    return 0.5 + 0.5 / resolution + 8.0 * (2.0**-23)
+
+
 def validate_anchor_aabb(
-    anchor_min: Sequence[float], anchor_max: Sequence[float]
+    anchor_min: Sequence[float],
+    anchor_max: Sequence[float],
+    resolution: int = 512,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     try:
         import numpy as np
@@ -149,13 +158,11 @@ def validate_anchor_aabb(
 
     minimum_f32 = minimum.astype(np.float32)
     maximum_f32 = maximum.astype(np.float32)
-    if bool(
-        np.any(minimum_f32 < -TSLAT_DECODER_AABB_LIMIT)
-        or np.any(maximum_f32 > TSLAT_DECODER_AABB_LIMIT)
-    ):
+    limit = decoder_aabb_limit(resolution)
+    if bool(np.any(minimum_f32 < -limit) or np.any(maximum_f32 > limit)):
         raise ConversionError(
             "anchor AABB must be in the TRELLIS decoder frame "
-            f"[-{TSLAT_DECODER_AABB_LIMIT}, {TSLAT_DECODER_AABB_LIMIT}]"
+            f"[-{limit}, {limit}] at resolution {resolution}"
         )
     return (
         tuple(float(value) for value in minimum_f32),
@@ -165,6 +172,7 @@ def validate_anchor_aabb(
 
 def compute_normalized_anchor_aabb(
     glb_path: Path,
+    resolution: int = 512,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Return official SegviGen decoder-frame bounds from direct GLB world axes."""
 
@@ -199,7 +207,7 @@ def compute_normalized_anchor_aabb(
     # axis transform is applied before centering and uniform scaling.
     normalized_min = (bounds[0] - center) * scale
     normalized_max = (bounds[1] - center) * scale
-    return validate_anchor_aabb(normalized_min, normalized_max)
+    return validate_anchor_aabb(normalized_min, normalized_max, resolution)
 
 
 def _tensor_payload_bytes(coords: Any, feats: Any) -> tuple[bytes, bytes]:
@@ -225,7 +233,7 @@ def save_atomic(
         raise FileExistsError(f"output already exists (use --force): {output_path}")
     if output_path.exists() and not output_path.is_file():
         raise ConversionError(f"output path is not a regular file: {output_path}")
-    minimum, maximum = validate_anchor_aabb(anchor_min, anchor_max)
+    minimum, maximum = validate_anchor_aabb(anchor_min, anchor_max, resolution)
     n_coords = int(coords.shape[0])
     coords_payload, feats_payload = _tensor_payload_bytes(coords, feats)
     expected_coords_bytes = n_coords * 4 * 4
@@ -289,13 +297,13 @@ def convert_fixture(
             raise ConversionError("GLB anchor and output paths must be different")
         if anchor_min is not None or anchor_max is not None:
             raise ConversionError("use either --glb or an explicit anchor AABB, not both")
-        minimum, maximum = compute_normalized_anchor_aabb(glb_path)
+        minimum, maximum = compute_normalized_anchor_aabb(glb_path, resolution)
     else:
         if anchor_min is None or anchor_max is None:
             raise ConversionError(
                 "an anchor is required: pass --glb or both --anchor-min and --anchor-max"
             )
-        minimum, maximum = validate_anchor_aabb(anchor_min, anchor_max)
+        minimum, maximum = validate_anchor_aabb(anchor_min, anchor_max, resolution)
 
     fixture = load_fixture(input_path)
     coords, feats = normalize_and_validate_fixture(fixture, resolution)

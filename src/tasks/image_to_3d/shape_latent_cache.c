@@ -1,6 +1,7 @@
 #include "image_to_3d_internal.h"
 #include "trellis_platform.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,9 +11,16 @@
 #define TSLAT_VERSION 1u
 #define TSLAT_HEADER_BYTES 80u
 #define TSLAT_COORD_FRAME_TRELLIS_DECODER_V1 1u
-#define TSLAT_DECODER_AABB_LIMIT 0.5001f
 
 static const unsigned char tslat_magic[8] = {'T', 'S', 'L', 'A', 'T', '0', '1', '\0'};
+
+float trellis_shape_latent_decoder_aabb_limit(int resolution) {
+    if (resolution <= 0) return 0.0f;
+    /* flex_dual_grid.c reconstructs local coordinates in (-0.5, 1.5), so
+     * boundary voxels can extend by half a voxel. A few ULPs account for the
+     * decoder's float arithmetic without accepting a different frame. */
+    return 0.5f + 0.5f / (float) resolution + 8.0f * FLT_EPSILON;
+}
 
 static FILE * open_sibling_temporary(
     const char * path,
@@ -185,12 +193,14 @@ static int cache_info_valid(const trellis_shape_latent_cache_info * info) {
     if (info == NULL || info->version != TSLAT_VERSION ||
         (info->resolution != 512 && info->resolution != 1024) ||
         info->channels != 32 || info->n_coords <= 0) return 0;
+    const float decoder_aabb_limit =
+        trellis_shape_latent_decoder_aabb_limit(info->resolution);
     float max_extent = 0.0f;
     for (int axis = 0; axis < 3; ++axis) {
         if (!isfinite(info->anchor_aabb_min[axis]) || !isfinite(info->anchor_aabb_max[axis]) ||
             info->anchor_aabb_max[axis] < info->anchor_aabb_min[axis] ||
-            info->anchor_aabb_min[axis] < -TSLAT_DECODER_AABB_LIMIT ||
-            info->anchor_aabb_max[axis] > TSLAT_DECODER_AABB_LIMIT) return 0;
+            info->anchor_aabb_min[axis] < -decoder_aabb_limit ||
+            info->anchor_aabb_max[axis] > decoder_aabb_limit) return 0;
         const float extent = info->anchor_aabb_max[axis] - info->anchor_aabb_min[axis];
         if (extent > max_extent) max_extent = extent;
     }

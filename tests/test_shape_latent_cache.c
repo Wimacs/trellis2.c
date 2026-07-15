@@ -124,6 +124,20 @@ int main(void) {
         sizeof(written.anchor_aabb_max)) == 0);
     trellis_structured_latent_free(&loaded);
 
+    /* The decoder can place a boundary-voxel vertex half a voxel outside the
+     * nominal cube. This is valid FlexDualGrid output and must remain
+     * cacheable at every supported resolution. */
+    const float decoder_limit =
+        trellis_shape_latent_decoder_aabb_limit(source.resolution);
+    vertices[0] = -decoder_limit + 1e-7f;
+    vertices[3] = decoder_limit - 1e-7f;
+    CHECK(trellis_shape_latent_cache_write(path, &source, &mesh, NULL) ==
+        TRELLIS_STATUS_OK);
+    vertices[0] = -decoder_limit - 1e-4f;
+    CHECK(trellis_shape_latent_cache_write(path, &source, &mesh, NULL) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    fill_fixture(&source, &mesh, coords, feats, vertices, faces);
+
     /* Reusing a diagnostic output path must atomically replace the prior
      * cache on Windows as well as POSIX. */
     feats[0] = 123.25f;
