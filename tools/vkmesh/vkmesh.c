@@ -4260,6 +4260,157 @@ static int face_contains_vertex(const int32_t * f, int32_t v) {
     return f[0] == v || f[1] == v || f[2] == v;
 }
 
+enum { VKMESH_SIMPLIFY_MAX_STAR_FACES = 64 };
+
+static int simplify_topology_face_is_valid(const vkmesh_mesh * mesh, const int32_t * f) {
+    return f[0] >= 0 && f[1] >= 0 && f[2] >= 0 &&
+           f[0] < mesh->n_vertices && f[1] < mesh->n_vertices && f[2] < mesh->n_vertices &&
+           f[0] != f[1] && f[1] != f[2] && f[2] != f[0];
+}
+
+static int32_t simplify_opposite_vertex(const int32_t * f, int32_t v0, int32_t v1) {
+    if (!face_contains_vertex(f, v0) || !face_contains_vertex(f, v1)) return -1;
+    if (f[0] != v0 && f[0] != v1) return f[0];
+    if (f[1] != v0 && f[1] != v1) return f[1];
+    if (f[2] != v0 && f[2] != v1) return f[2];
+    return -1;
+}
+
+static int simplify_directed_edge_sign(const int32_t * f, int32_t v0, int32_t v1) {
+    if ((f[0] == v0 && f[1] == v1) ||
+        (f[1] == v0 && f[2] == v1) ||
+        (f[2] == v0 && f[0] == v1)) {
+        return 1;
+    }
+    if ((f[0] == v1 && f[1] == v0) ||
+        (f[1] == v1 && f[2] == v0) ||
+        (f[2] == v1 && f[0] == v0)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int simplify_vertices_are_neighbors(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    int32_t vertex,
+    int32_t candidate) {
+    int begin = v2f_offset[vertex];
+    int end = v2f_offset[vertex + 1];
+    if (begin < 0 || begin > end) return 0;
+    for (int item = begin; item < end; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) ||
+            !face_contains_vertex(f, vertex)) {
+            return 0;
+        }
+        if (face_contains_vertex(f, candidate)) return 1;
+    }
+    return 0;
+}
+
+static int simplify_face_exists(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    int32_t v0,
+    int32_t v1,
+    int32_t v2) {
+    int begin = v2f_offset[v0];
+    int end = v2f_offset[v0 + 1];
+    if (begin < 0 || begin > end) return 0;
+    for (int item = begin; item < end; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v0)) return 0;
+        if (face_contains_vertex(f, v1) && face_contains_vertex(f, v2)) return 1;
+    }
+    return 0;
+}
+
+static int simplify_collapse_link_ok(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    const uint8_t * boundary,
+    int32_t v0,
+    int32_t v1) {
+    int begin0 = v2f_offset[v0];
+    int end0 = v2f_offset[v0 + 1];
+    int begin1 = v2f_offset[v1];
+    int end1 = v2f_offset[v1 + 1];
+    if (begin0 < 0 || begin1 < 0 || begin0 > end0 || begin1 > end1) return 0;
+    int degree0 = end0 - begin0;
+    int degree1 = end1 - begin1;
+    if (degree0 <= 0 || degree1 <= 0 ||
+        degree0 > VKMESH_SIMPLIFY_MAX_STAR_FACES ||
+        degree1 > VKMESH_SIMPLIFY_MAX_STAR_FACES) {
+        return 0;
+    }
+
+    int incidence0 = 0;
+    int32_t opposites[2] = { -1, -1 };
+    int signs[2] = { 0, 0 };
+    for (int item = begin0; item < end0; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v0)) return 0;
+        if (!face_contains_vertex(f, v1)) continue;
+        if (incidence0 >= 2) return 0;
+        opposites[incidence0] = simplify_opposite_vertex(f, v0, v1);
+        signs[incidence0] = simplify_directed_edge_sign(f, v0, v1);
+        if (opposites[incidence0] < 0 || signs[incidence0] == 0) return 0;
+        ++incidence0;
+    }
+
+    int incidence1 = 0;
+    for (int item = begin1; item < end1; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v1)) return 0;
+        if (face_contains_vertex(f, v0)) ++incidence1;
+    }
+    if (incidence0 != incidence1) return 0;
+
+    if (incidence0 == 1) {
+        if (!boundary[v0] || !boundary[v1]) return 0;
+    } else if (incidence0 == 2) {
+        if (boundary[v0] || boundary[v1] || opposites[0] == opposites[1] ||
+            signs[0] == signs[1]) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+
+    for (int item = begin0; item < end0; ++item) {
+        const int32_t * f = mesh->faces + (size_t) v2f[item] * 3u;
+        for (int corner = 0; corner < 3; ++corner) {
+            int32_t candidate = f[corner];
+            if (candidate == v0 || candidate == v1 || candidate == opposites[0] ||
+                (incidence0 == 2 && candidate == opposites[1])) {
+                continue;
+            }
+            if (simplify_vertices_are_neighbors(mesh, v2f_offset, v2f, v1, candidate)) return 0;
+        }
+    }
+
+    // Vertex-only link tests permit a tetrahedron edge even though its two
+    // retained faces become duplicates after contraction.
+    if (incidence0 == 2 &&
+        simplify_face_exists(mesh, v2f_offset, v2f, v0, opposites[0], opposites[1]) &&
+        simplify_face_exists(mesh, v2f_offset, v2f, v1, opposites[0], opposites[1])) {
+        return 0;
+    }
+    return 1;
+}
+
 static int process_incident_for_simplify(
     const vkmesh_mesh * mesh,
     int32_t face_id,
@@ -4357,6 +4508,10 @@ static double simplify_edge_cost(
     vkmesh_simplify_edge * edge) {
     if (edge->v0 < 0 || edge->v1 < 0 || edge->v0 >= mesh->n_vertices ||
         edge->v1 >= mesh->n_vertices || edge->v0 == edge->v1) {
+        return INFINITY;
+    }
+    if (!simplify_collapse_link_ok(
+            mesh, v2f_offset, v2f, boundary, edge->v0, edge->v1)) {
         return INFINITY;
     }
     const float * v0 = mesh->vertices + (size_t) edge->v0 * 3u;

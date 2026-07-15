@@ -54,6 +54,201 @@ bool finite_vec3(vec3 value) {
     return !any(isnan(value)) && !any(isinf(value));
 }
 
+const uint INVALID_VERTEX = 0xffffffffu;
+const uint MAX_STAR_FACES = 64u;
+
+bool valid_topology_face(uvec3 f) {
+    return f.x < p.aux0 && f.y < p.aux0 && f.z < p.aux0 &&
+           f.x != f.y && f.y != f.z && f.z != f.x;
+}
+
+uint opposite_vertex(uvec3 f, uint v0, uint v1) {
+    if (!face_contains(f, v0) || !face_contains(f, v1)) return INVALID_VERTEX;
+    if (f.x != v0 && f.x != v1) return f.x;
+    if (f.y != v0 && f.y != v1) return f.y;
+    if (f.z != v0 && f.z != v1) return f.z;
+    return INVALID_VERTEX;
+}
+
+int directed_edge_sign(uvec3 f, uint v0, uint v1) {
+    if ((f.x == v0 && f.y == v1) ||
+        (f.y == v0 && f.z == v1) ||
+        (f.z == v0 && f.x == v1)) {
+        return 1;
+    }
+    if ((f.x == v1 && f.y == v0) ||
+        (f.y == v1 && f.z == v0) ||
+        (f.z == v1 && f.x == v0)) {
+        return -1;
+    }
+    return 0;
+}
+
+uint hash_vertex(uint v) {
+    v ^= v >> 16u;
+    v *= 0x7feb352du;
+    v ^= v >> 15u;
+    v *= 0x846ca68bu;
+    return v ^ (v >> 16u);
+}
+
+void add_neighbor_mask(inout uint mask0, inout uint mask1, uint v) {
+    uint hash = hash_vertex(v);
+    mask0 |= 1u << (hash & 31u);
+    mask1 |= 1u << ((hash >> 16u) & 31u);
+}
+
+bool maybe_neighbor(uint mask0, uint mask1, uint v) {
+    uint hash = hash_vertex(v);
+    return (mask0 & (1u << (hash & 31u))) != 0u &&
+           (mask1 & (1u << ((hash >> 16u) & 31u))) != 0u;
+}
+
+bool exact_neighbor(uint vertex, uint candidate) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + vertex];
+    uint end = scratch[ob + vertex + 1u];
+    if (begin > end || end > p.aux2) return false;
+    for (uint item = begin; item < end; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, vertex)) return false;
+        if (face_contains(f, candidate)) return true;
+    }
+    return false;
+}
+
+bool exact_face_exists(uint v0, uint v1, uint v2) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + v0];
+    uint end = scratch[ob + v0 + 1u];
+    if (begin > end || end > p.aux2) return false;
+    for (uint item = begin; item < end; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v0)) return false;
+        if (face_contains(f, v1) && face_contains(f, v2)) return true;
+    }
+    return false;
+}
+
+bool is_allowed_common_neighbor(uint candidate, uint incidence, uint opposite0, uint opposite1) {
+    return candidate == opposite0 || (incidence == 2u && candidate == opposite1);
+}
+
+bool has_forbidden_common_neighbor(
+    uint candidate,
+    uint edge_v0,
+    uint edge_v1,
+    uint incidence,
+    uint opposite0,
+    uint opposite1,
+    uint mask0,
+    uint mask1) {
+    if (candidate == edge_v0 || candidate == edge_v1 ||
+        is_allowed_common_neighbor(candidate, incidence, opposite0, opposite1)) {
+        return false;
+    }
+    // The masks are negative filters only.  A possible hit is always checked
+    // against the exact CSR, so hash collisions cannot reject a valid edge.
+    return maybe_neighbor(mask0, mask1, candidate) && exact_neighbor(edge_v1, candidate);
+}
+
+bool collapse_link_ok(uint v0, uint v1) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin0 = scratch[ob + v0];
+    uint end0 = scratch[ob + v0 + 1u];
+    uint begin1 = scratch[ob + v1];
+    uint end1 = scratch[ob + v1 + 1u];
+    if (begin0 > end0 || begin1 > end1 || end0 > p.aux2 || end1 > p.aux2) return false;
+    uint degree0 = end0 - begin0;
+    uint degree1 = end1 - begin1;
+    if (degree0 == 0u || degree1 == 0u ||
+        degree0 > MAX_STAR_FACES || degree1 > MAX_STAR_FACES) {
+        return false;
+    }
+
+    uint incidence0 = 0u;
+    uint opposite0 = INVALID_VERTEX;
+    uint opposite1 = INVALID_VERTEX;
+    int sign0 = 0;
+    int sign1 = 0;
+    for (uint item = begin0; item < end0; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v0)) return false;
+        if (!face_contains(f, v1)) continue;
+        if (incidence0 >= 2u) return false;
+        uint opposite = opposite_vertex(f, v0, v1);
+        int sign = directed_edge_sign(f, v0, v1);
+        if (opposite == INVALID_VERTEX || sign == 0) return false;
+        if (incidence0 == 0u) {
+            opposite0 = opposite;
+            sign0 = sign;
+        } else {
+            opposite1 = opposite;
+            sign1 = sign;
+        }
+        incidence0 += 1u;
+    }
+
+    uint incidence1 = 0u;
+    uint neighbor_mask0 = 0u;
+    uint neighbor_mask1 = 0u;
+    for (uint item = begin1; item < end1; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v1)) return false;
+        if (face_contains(f, v0)) incidence1 += 1u;
+        if (f.x != v0 && f.x != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.x);
+        if (f.y != v0 && f.y != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.y);
+        if (f.z != v0 && f.z != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.z);
+    }
+    if (incidence0 != incidence1) return false;
+
+    bool boundary0 = scratch[boundary_base() + v0] != 0u;
+    bool boundary1 = scratch[boundary_base() + v1] != 0u;
+    if (incidence0 == 1u) {
+        if (!boundary0 || !boundary1) return false;
+    } else if (incidence0 == 2u) {
+        if (boundary0 || boundary1 || opposite0 == opposite1 || sign0 == sign1) return false;
+    } else {
+        return false;
+    }
+
+    for (uint item = begin0; item < end0; ++item) {
+        uvec3 f = load_face(scratch[ab + item]);
+        if (has_forbidden_common_neighbor(
+                f.x, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1) ||
+            has_forbidden_common_neighbor(
+                f.y, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1) ||
+            has_forbidden_common_neighbor(
+                f.z, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1)) {
+            return false;
+        }
+    }
+
+    // Vertex-only link tests miss the tetrahedron case: both opposite
+    // vertices are allowed common neighbors, but the two retained faces
+    // become duplicates after the collapse.
+    if (incidence0 == 2u &&
+        exact_face_exists(v0, opposite0, opposite1) &&
+        exact_face_exists(v1, opposite0, opposite1)) {
+        return false;
+    }
+    return true;
+}
+
 float qem_eval(uint v0, uint v1, vec3 pos) {
     float x = pos.x;
     float y = pos.y;
@@ -153,6 +348,10 @@ void main() {
     uint cost_index = cost_base() + edge_id;
     if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) {
         scratch[cost_index] = floatBitsToUint(uintBitsToFloat(0x7f800000u));
+        return;
+    }
+    if (!collapse_link_ok(v0, v1)) {
+        scratch[cost_index] = 0x7f800000u;
         return;
     }
 

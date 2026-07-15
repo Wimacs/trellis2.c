@@ -514,6 +514,95 @@ static int test_cli_simplify_rejects_collinear_collapse(const char * vkmesh_path
     return 1;
 }
 
+static int test_cli_simplify_rejects_open_tetra_duplicate(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        -0.0001f, 0.0f, 0.0f,
+         0.0001f, 0.0f, 0.0f,
+         0.0f,    1.0f, 0.0f,
+         0.0f,    0.0f, 1.0f,
+    };
+    // Edge (0, 1) is much shorter than every other edge.  Contracting it
+    // removes the first face and turns the remaining two into the same
+    // unoriented triangle.  Vertex 3 is a forbidden common neighbor because
+    // the only shared-face opposite vertex is 2.
+    static const int32_t faces[9] = {
+        0, 1, 2,
+        0, 2, 3,
+        1, 3, 2,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_open_tetra_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_open_tetra_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 3));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "2",
+        (char *) "--simplify-steps", (char *) "1",
+        (char *) "--simplify-threshold", (char *) "0.01",
+        (char *) "--lambda-edge-length", (char *) "1",
+        (char *) "--lambda-skinny", (char *) "0",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 3);
+    CHECK_TRUE(mesh_has_valid_triangles(&mesh));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_simplify_rejects_closed_tetra_duplicate(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        -0.0001f, 0.0f, 0.0f,
+         0.0001f, 0.0f, 0.0f,
+         0.0f,    1.0f, 0.0f,
+         0.0f,    0.0f, 1.0f,
+    };
+    // For a closed tetrahedron edge (0, 1), the common-neighbor vertex set is
+    // exactly the two shared-face opposites {2, 3}.  A vertex-only link test
+    // therefore passes, but the retained faces (0, 2, 3) and (1, 2, 3) become
+    // duplicates.  The retained-face collision check must reject it.
+    static const int32_t faces[12] = {
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_closed_tetra_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_closed_tetra_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 4));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "2",
+        (char *) "--simplify-steps", (char *) "1",
+        (char *) "--simplify-threshold", (char *) "0.01",
+        (char *) "--lambda-edge-length", (char *) "1",
+        (char *) "--lambda-skinny", (char *) "0",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
+    CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
 static int test_cli_simplify_closed_manifold_progress(const char * vkmesh_path) {
     static const float vertices[18] = {
          0.0f,  0.0f,  1.0f,
@@ -966,6 +1055,8 @@ int main(int argc, char ** argv) {
     (void) test_cli_simplify(argv[1]);
     (void) test_cli_simplify_rejects_self_edge(argv[1]);
     (void) test_cli_simplify_rejects_collinear_collapse(argv[1]);
+    (void) test_cli_simplify_rejects_open_tetra_duplicate(argv[1]);
+    (void) test_cli_simplify_rejects_closed_tetra_duplicate(argv[1]);
     (void) test_cli_simplify_closed_manifold_progress(argv[1]);
     (void) test_cli_rejects_nan(argv[1]);
     (void) test_udf_workspace_chunking(argv[1]);
