@@ -282,6 +282,41 @@ static int mesh_has_valid_triangles(const test_mesh * mesh) {
     return ok;
 }
 
+static int mesh_has_well_conditioned_triangles(const test_mesh * mesh) {
+    if (!mesh_has_valid_triangles(mesh)) return 0;
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        const int32_t * f = mesh->faces + (size_t) i * 3u;
+        const float * a = mesh->vertices + (size_t) f[0] * 3u;
+        const float * b = mesh->vertices + (size_t) f[1] * 3u;
+        const float * c = mesh->vertices + (size_t) f[2] * 3u;
+        const double ab[3] = {
+            (double) b[0] - a[0], (double) b[1] - a[1], (double) b[2] - a[2],
+        };
+        const double ac[3] = {
+            (double) c[0] - a[0], (double) c[1] - a[1], (double) c[2] - a[2],
+        };
+        const double bc[3] = {
+            (double) c[0] - b[0], (double) c[1] - b[1], (double) c[2] - b[2],
+        };
+        const double cross[3] = {
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        };
+        const double ab_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        const double ac_sq = ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2];
+        const double bc_sq = bc[0] * bc[0] + bc[1] * bc[1] + bc[2] * bc[2];
+        const double max_edge_sq = fmax(ab_sq, fmax(ac_sq, bc_sq));
+        const double cross_sq =
+            cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+        if (!isfinite(max_edge_sq) || !isfinite(cross_sq) ||
+            cross_sq <= 4e-12 * max_edge_sq * max_edge_sq) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int has_compute_device(int device_index) {
     VkInstance instance = VK_NULL_HANDLE;
     VkInstanceCreateInfo info;
@@ -390,6 +425,131 @@ static int test_cli_simplify(const char * vkmesh_path) {
     CHECK_TRUE(mesh.n_faces > 0 && mesh.n_faces <= 48 && mesh.n_faces < face_count);
     CHECK_TRUE(mesh.n_vertices > 0 && mesh.n_vertices < vertex_count);
     CHECK_TRUE(mesh_has_valid_triangles(&mesh));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_simplify_rejects_self_edge(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    // The final face contributes a (0, 0) edge.  Without the self-edge
+    // guards, its zero-cost "collapse" removes the whole star around v0.
+    static const int32_t faces[15] = {
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+        0, 0, 1,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_self_edge_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_self_edge_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 5));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "4",
+        (char *) "--simplify-steps", (char *) "1",
+        (char *) "--simplify-threshold", (char *) "1e-8",
+        (char *) "--lambda-edge-length", (char *) "1",
+        (char *) "--lambda-skinny", (char *) "0",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 5);
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_simplify_rejects_collinear_collapse(const char * vkmesh_path) {
+    static const float vertices[15] = {
+        -0.01f,  0.0f, 0.0f,
+         0.01f,  0.0f, 0.0f,
+         0.0f,  -1.0f, 0.0f,
+         0.0f,   1.0f, 0.0f,
+         0.0f,   0.0f, 1.0f,
+    };
+    // Collapsing the short (0, 1) edge to its midpoint would put vertex 0 on
+    // the line through vertices 2 and 3, flattening the retained first face.
+    static const int32_t faces[6] = {
+        0, 2, 3,
+        0, 1, 4,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_collinear_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_collinear_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 5, faces, 2));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "1",
+        (char *) "--simplify-steps", (char *) "1",
+        (char *) "--simplify-threshold", (char *) "0.001",
+        (char *) "--lambda-edge-length", (char *) "1",
+        (char *) "--lambda-skinny", (char *) "0",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 5 && mesh.n_faces == 2);
+    CHECK_TRUE(mesh_has_well_conditioned_triangles(&mesh));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_simplify_closed_manifold_progress(const char * vkmesh_path) {
+    static const float vertices[18] = {
+         0.0f,  0.0f,  1.0f,
+         0.0f,  0.0f, -1.0f,
+         1.0f,  0.0f,  0.0f,
+         0.0f,  1.0f,  0.0f,
+        -1.0f,  0.0f,  0.0f,
+         0.0f, -1.0f,  0.0f,
+    };
+    static const int32_t faces[24] = {
+        0, 2, 3,  0, 3, 4,  0, 4, 5,  0, 5, 2,
+        1, 3, 2,  1, 4, 3,  1, 5, 4,  1, 2, 5,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_manifold_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_manifold_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 6, faces, 8));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "6",
+        (char *) "--simplify-steps", (char *) "1",
+        (char *) "--simplify-threshold", (char *) "100",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_faces >= 4 && mesh.n_faces < 8);
+    CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_has_well_conditioned_triangles(&mesh));
     test_mesh_free(&mesh);
     return 1;
 }
@@ -804,6 +964,9 @@ int main(int argc, char ** argv) {
     }
     (void) test_cli_cleanup(argv[1]);
     (void) test_cli_simplify(argv[1]);
+    (void) test_cli_simplify_rejects_self_edge(argv[1]);
+    (void) test_cli_simplify_rejects_collinear_collapse(argv[1]);
+    (void) test_cli_simplify_closed_manifold_progress(argv[1]);
     (void) test_cli_rejects_nan(argv[1]);
     (void) test_udf_workspace_chunking(argv[1]);
     (void) test_remesh_workspace_chunking(argv[1]);

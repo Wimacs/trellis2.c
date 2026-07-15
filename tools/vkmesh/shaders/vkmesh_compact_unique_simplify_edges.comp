@@ -42,7 +42,10 @@ void main() {
     uint src = idx * 5u;
     uint v0 = edges[src + 0u];
     uint v1 = edges[src + 1u];
-    if (v0 >= p.aux0 || v1 >= p.aux0) return;
+    // Degenerate input faces produce (v, v) edge records.  They are not
+    // collapse candidates: treating one as an edge would remove every face
+    // incident to v when the collapse kernel removes the "shared" faces.
+    if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) return;
 
     uint out_idx = atomicAdd(counter[0], 1u);
     unique_edges[out_idx * 2u + 0u] = v0;

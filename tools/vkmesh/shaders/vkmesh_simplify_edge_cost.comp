@@ -46,6 +46,14 @@ bool face_contains(uvec3 f, uint v) {
     return f.x == v || f.y == v || f.z == v;
 }
 
+bool finite_float(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+bool finite_vec3(vec3 value) {
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
 float qem_eval(uint v0, uint v1, vec3 pos) {
     float x = pos.x;
     float y = pos.y;
@@ -70,7 +78,11 @@ bool process_incident(uint face_id, uint keep_v, uint other_v, vec3 new_pos, ino
     vec3 a = load_vertex(f.x);
     vec3 b = load_vertex(f.y);
     vec3 c = load_vertex(f.z);
-    vec3 old_n = cross(b - a, c - a);
+    if (!finite_vec3(a) || !finite_vec3(b) || !finite_vec3(c) || !finite_vec3(new_pos)) return false;
+    vec3 old_e0 = c - b;
+    vec3 old_e1 = b - a;
+    vec3 old_e2 = c - a;
+    vec3 old_n = cross(old_e1, old_e2);
 
     vec3 na = (f.x == keep_v) ? new_pos : a;
     vec3 nb = (f.y == keep_v) ? new_pos : b;
@@ -78,13 +90,43 @@ bool process_incident(uint face_id, uint keep_v, uint other_v, vec3 new_pos, ino
     vec3 new_e1 = nb - na;
     vec3 new_e2 = nc - na;
     vec3 new_n = cross(new_e1, new_e2);
-    if (dot(old_n, new_n) < 0.0) return false;
+    if (!finite_vec3(old_n) || !finite_vec3(new_n)) return false;
 
     vec3 new_e0 = nc - nb;
-    float area2 = length(new_n);
-    float denom = dot(new_e0, new_e0) + dot(new_e1, new_e1) + dot(new_e2, new_e2);
-    denom = max(denom, 1.0e-24);
+    if (!finite_vec3(new_e0) || !finite_vec3(new_e1) || !finite_vec3(new_e2)) return false;
+    float edge0_sq = dot(new_e0, new_e0);
+    float edge1_sq = dot(new_e1, new_e1);
+    float edge2_sq = dot(new_e2, new_e2);
+    float new_cross_sq = dot(new_n, new_n);
+    float max_edge_sq = max(edge0_sq, max(edge1_sq, edge2_sq));
+    float min_cross_sq = 4.0e-12 * max_edge_sq * max_edge_sq;
+    float normal_dot = dot(old_n, new_n);
+    float old_edge0_sq = dot(old_e0, old_e0);
+    float old_edge1_sq = dot(old_e1, old_e1);
+    float old_edge2_sq = dot(old_e2, old_e2);
+    float old_cross_sq = dot(old_n, old_n);
+    float old_max_edge_sq = max(old_edge0_sq, max(old_edge1_sq, old_edge2_sq));
+    float old_min_cross_sq = 4.0e-12 * old_max_edge_sq * old_max_edge_sq;
+    if (!finite_float(edge0_sq) || !finite_float(edge1_sq) || !finite_float(edge2_sq) ||
+        !finite_float(new_cross_sq) || !finite_float(max_edge_sq) || !finite_float(min_cross_sq) ||
+        !finite_float(normal_dot) || !finite_float(old_edge0_sq) || !finite_float(old_edge1_sq) ||
+        !finite_float(old_edge2_sq) || !finite_float(old_cross_sq) ||
+        !finite_float(old_max_edge_sq) || !finite_float(old_min_cross_sq)) {
+        return false;
+    }
+    // Orientation is meaningful only for a well-conditioned source face.
+    // Let a collapse repair an already-degenerate input face, while the hard
+    // new-area floor below still prevents retaining or creating a flat face.
+    if (old_cross_sq > old_min_cross_sq && normal_dot <= 0.0) return false;
+    // Scale-relative hard floor: triangle area <= 1e-6 * longest_edge^2.
+    // Squared cross products avoid a sqrt in the rejection path.
+    if (new_cross_sq <= min_cross_sq) return false;
+
+    float area2 = sqrt(new_cross_sq);
+    float denom = edge0_sq + edge1_sq + edge2_sq;
+    if (!finite_float(area2) || !finite_float(denom) || denom <= 0.0) return false;
     float shape = clamp(2.0 * sqrt(3.0) * area2 / denom, 0.0, 1.0);
+    if (!finite_float(shape)) return false;
     skinny += 1.0 - shape;
     num_tri += 1u;
     return true;
@@ -109,19 +151,27 @@ void main() {
     uint v0 = edges[edge_id * 2u + 0u];
     uint v1 = edges[edge_id * 2u + 1u];
     uint cost_index = cost_base() + edge_id;
-    if (v0 >= p.aux0 || v1 >= p.aux0) {
+    if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) {
         scratch[cost_index] = floatBitsToUint(uintBitsToFloat(0x7f800000u));
         return;
     }
 
     vec3 p0 = load_vertex(v0);
     vec3 p1 = load_vertex(v1);
+    if (!finite_vec3(p0) || !finite_vec3(p1)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
     float w0 = 0.5;
     bool b0 = scratch[boundary_base() + v0] != 0u;
     bool b1 = scratch[boundary_base() + v1] != 0u;
     if (b0 && !b1) w0 = 1.0;
     else if (!b0 && b1) w0 = 0.0;
     vec3 pos = p0 * w0 + p1 * (1.0 - w0);
+    if (!finite_vec3(pos)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
 
     float cost = qem_eval(v0, v1, pos);
     float len2 = dot(p1 - p0, p1 - p0);

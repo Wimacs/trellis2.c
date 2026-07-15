@@ -1753,12 +1753,10 @@ static int compact_device_mesh_from_flags(
 
     const size_t faces_bytes = (size_t) dm->n_faces * 3u * sizeof(int32_t);
     const size_t vertex_map_bytes = (size_t) dm->n_vertices * sizeof(int32_t);
-    const size_t vertices_bytes = (size_t) dm->n_vertices * 3u * sizeof(float);
     int ok = 0;
     if (!vk_buffer_create(vk, faces_bytes, &out_faces) ||
         !vk_buffer_create(vk, sizeof(uint32_t), &counter) ||
-        !vk_buffer_create(vk, vertex_map_bytes, &vertex_map) ||
-        !vk_buffer_create(vk, vertices_bytes, &out_vertices)) {
+        !vk_buffer_create(vk, vertex_map_bytes, &vertex_map)) {
         goto cleanup;
     }
     memset(vertex_map.mapped, 0xff, vertex_map_bytes);
@@ -1791,6 +1789,8 @@ static int compact_device_mesh_from_flags(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_ASSIGN_VERTEX_MAP, assign_buffers, &push, groups)) goto cleanup;
     uint32_t vertex_count = ((const uint32_t *) counter.mapped)[0];
     if (vertex_count == 0u || vertex_count > dm->n_vertices) goto cleanup;
+    const size_t vertices_bytes = (size_t) vertex_count * 3u * sizeof(float);
+    if (!vk_buffer_create(vk, vertices_bytes, &out_vertices)) goto cleanup;
 
     vkmesh_vk_buffer remap_buffers[4];
     remap_buffers[0] = out_faces;
@@ -4037,6 +4037,10 @@ static int get_unique_simplify_edges_cpu(
     for (int64_t i = 0; i < raw_count;) {
         int64_t j = i + 1;
         while (j < raw_count && raw[j].min_v == raw[i].min_v && raw[j].max_v == raw[i].max_v) ++j;
+        if (raw[i].min_v == raw[i].max_v) {
+            i = j;
+            continue;
+        }
         edges[count].v0 = (int32_t) raw[i].min_v;
         edges[count].v1 = (int32_t) raw[i].max_v;
         edges[count].cost = INFINITY;
@@ -4204,6 +4208,13 @@ static int process_incident_for_simplify(
     const float * p0 = mesh->vertices + (size_t) f[0] * 3u;
     const float * p1 = mesh->vertices + (size_t) f[1] * 3u;
     const float * p2 = mesh->vertices + (size_t) f[2] * 3u;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(p0[axis]) || !isfinite(p1[axis]) || !isfinite(p2[axis]) ||
+            !isfinite(new_pos[axis])) {
+            return 0;
+        }
+    }
+    double old_e0[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
     double old_e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
     double old_e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
     double old_n[3] = {
@@ -4232,16 +4243,37 @@ static int process_incident_for_simplify(
         new_e1[0] * new_e2[1] - new_e1[1] * new_e2[0],
     };
     double dot_n = old_n[0] * new_n[0] + old_n[1] * new_n[1] + old_n[2] * new_n[2];
-    if (dot_n < 0.0) return 0;
+    double old_len0 = old_e0[0] * old_e0[0] + old_e0[1] * old_e0[1] + old_e0[2] * old_e0[2];
+    double old_len1 = old_e1[0] * old_e1[0] + old_e1[1] * old_e1[1] + old_e1[2] * old_e1[2];
+    double old_len2 = old_e2[0] * old_e2[0] + old_e2[1] * old_e2[1] + old_e2[2] * old_e2[2];
+    double old_cross_sq = old_n[0] * old_n[0] + old_n[1] * old_n[1] + old_n[2] * old_n[2];
+    double old_max_edge_sq = fmax(old_len0, fmax(old_len1, old_len2));
+    double old_min_cross_sq = 4e-12 * old_max_edge_sq * old_max_edge_sq;
+    if (!isfinite(old_n[0]) || !isfinite(old_n[1]) || !isfinite(old_n[2]) ||
+        !isfinite(new_n[0]) || !isfinite(new_n[1]) || !isfinite(new_n[2]) ||
+        !isfinite(dot_n) || !isfinite(old_len0) || !isfinite(old_len1) ||
+        !isfinite(old_len2) || !isfinite(old_cross_sq) || !isfinite(old_max_edge_sq) ||
+        !isfinite(old_min_cross_sq) ||
+        (old_cross_sq > old_min_cross_sq && dot_n <= 0.0)) {
+        return 0;
+    }
 
     double e0[3] = { np[2][0] - np[1][0], np[2][1] - np[1][1], np[2][2] - np[1][2] };
-    double area2 = sqrt(new_n[0] * new_n[0] + new_n[1] * new_n[1] + new_n[2] * new_n[2]);
+    double cross_sq = new_n[0] * new_n[0] + new_n[1] * new_n[1] + new_n[2] * new_n[2];
     double len0 = e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2];
     double len1 = new_e1[0] * new_e1[0] + new_e1[1] * new_e1[1] + new_e1[2] * new_e1[2];
     double len2 = new_e2[0] * new_e2[0] + new_e2[1] * new_e2[1] + new_e2[2] * new_e2[2];
+    double max_edge_sq = fmax(len0, fmax(len1, len2));
+    double min_cross_sq = 4e-12 * max_edge_sq * max_edge_sq;
+    if (!isfinite(cross_sq) || !isfinite(len0) || !isfinite(len1) || !isfinite(len2) ||
+        !isfinite(max_edge_sq) || !isfinite(min_cross_sq) || cross_sq <= min_cross_sq) {
+        return 0;
+    }
+    double area2 = sqrt(cross_sq);
     double denom = len0 + len1 + len2;
-    if (denom < 1e-24) denom = 1e-24;
+    if (!isfinite(area2) || !isfinite(denom) || denom <= 0.0) return 0;
     double shape = 2.0 * sqrt(3.0) * area2 / denom;
+    if (!isfinite(shape)) return 0;
     if (shape < 0.0) shape = 0.0;
     if (shape > 1.0) shape = 1.0;
     *skinny_cost += 1.0 - shape;
@@ -4258,6 +4290,10 @@ static double simplify_edge_cost(
     float lambda_edge_length,
     float lambda_skinny,
     vkmesh_simplify_edge * edge) {
+    if (edge->v0 < 0 || edge->v1 < 0 || edge->v0 >= mesh->n_vertices ||
+        edge->v1 >= mesh->n_vertices || edge->v0 == edge->v1) {
+        return INFINITY;
+    }
     const float * v0 = mesh->vertices + (size_t) edge->v0 * 3u;
     const float * v1 = mesh->vertices + (size_t) edge->v1 * 3u;
     float w0 = 0.5f;
@@ -4266,6 +4302,11 @@ static double simplify_edge_cost(
     edge->pos[0] = v0[0] * w0 + v1[0] * (1.0f - w0);
     edge->pos[1] = v0[1] * w0 + v1[1] * (1.0f - w0);
     edge->pos[2] = v0[2] * w0 + v1[2] * (1.0f - w0);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(v0[axis]) || !isfinite(v1[axis]) || !isfinite(edge->pos[axis])) {
+            return INFINITY;
+        }
+    }
 
     vkmesh_qem q = qems[edge->v0];
     for (int i = 0; i < 10; ++i) q.m[i] += qems[edge->v1].m[i];
@@ -4286,7 +4327,7 @@ static double simplify_edge_cost(
     }
     if (num_tri > 0) skinny /= (double) num_tri;
     cost += (double) lambda_skinny * skinny * len2;
-    return cost;
+    return isfinite(cost) && cost >= 0.0 ? cost : INFINITY;
 }
 
 static int propagate_edge_cost_to_faces(
@@ -4721,6 +4762,9 @@ static int vkmesh_device_simplify_step(
     push.n = offset_count;
     uint32_t offset_groups = (offset_count + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
+    /* Every vkmesh_dispatch submits and waits for its fence, so the degree
+       buffer has no pending users once the offset seed dispatch returns. */
+    vk_buffer_destroy(vk, &degree_buffer);
 
     if (!vkmesh_scan_u32_inclusive(
             vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter)) goto cleanup;
@@ -4750,6 +4794,8 @@ static int vkmesh_device_simplify_step(
     push.aux0 = vertex_count;
     push.aux1 = total_adj;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_ADJACENCY, adj_buffers, &push, face_groups)) goto cleanup;
+    /* scan_out only serves as the atomic cursor for adjacency construction. */
+    vk_buffer_destroy(vk, scan_out);
 
     size_t raw_edge_count = 0;
     size_t raw_edge_sort_count = 0;
@@ -4776,6 +4822,9 @@ static int vkmesh_device_simplify_step(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES, unique_buffers, &push, edge_groups)) goto cleanup;
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
+    /* The sorted 3F records are consumed completely by unique-edge compaction. */
+    vk_buffer_destroy(vk, &edges_buffer);
+    vk_buffer_destroy(vk, &edge_dummy);
 
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
@@ -4800,6 +4849,7 @@ static int vkmesh_device_simplify_step(
     push.n = offset_count;
     push.aux1 = (uint32_t) offset_base;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, offset_groups)) goto cleanup;
+    vk_buffer_destroy(vk, scan_in);
 
     copy_buffers[0] = adjacency_buffer;
     copy_buffers[1] = scratch;
@@ -4807,6 +4857,7 @@ static int vkmesh_device_simplify_step(
     push.n = total_adj;
     push.aux1 = (uint32_t) adjacency_base;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, (total_adj + 127u) / 128u)) goto cleanup;
+    vk_buffer_destroy(vk, &adjacency_buffer);
 
     copy_buffers[0] = boundary_flags;
     copy_buffers[1] = scratch;
@@ -4814,14 +4865,6 @@ static int vkmesh_device_simplify_step(
     push.n = vertex_count;
     push.aux1 = (uint32_t) boundary_base;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, vertex_groups)) goto cleanup;
-
-    /* Offsets, adjacency, and boundary flags now live in scratch. The QEM,
-       cost, winner selection, and collapse kernels no longer reference the
-       construction buffers directly. */
-    vk_buffer_destroy(vk, &degree_buffer);
-    vk_buffer_destroy(vk, &offset_a_buffer);
-    vk_buffer_destroy(vk, &offset_b_buffer);
-    vk_buffer_destroy(vk, &adjacency_buffer);
     vk_buffer_destroy(vk, &boundary_flags);
 
     vkmesh_vk_buffer fill_buffers[4];
@@ -4902,6 +4945,9 @@ static int vkmesh_device_simplify_step(
     push.aux2 = total_adj;
     push.eps = threshold;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES, collapse_buffers, &push, unique_groups)) goto cleanup;
+    /* Compaction only consumes face_keep from scratch; unique edges need not
+       overlap its output-face, vertex-map, and output-vertex allocations. */
+    vk_buffer_destroy(vk, &unique_edges);
 
     uint32_t collapsed_u32 = ((const uint32_t *) scratch.mapped)[counter_base];
     uint32_t removed_u32 = 0u;
@@ -5078,6 +5124,7 @@ static int vkmesh_simplify_step_cpu(
     for (int64_t e = 0; e < edge_count; ++e) {
         if (edges[e].cost > (double) threshold) continue;
         int32_t verts[2] = { edges[e].v0, edges[e].v1 };
+        if (verts[0] == verts[1]) continue;
         int can_collapse = !selected_vertex[verts[0]] && !selected_vertex[verts[1]];
         for (int side = 0; side < 2 && can_collapse; ++side) {
             int32_t v = verts[side];
@@ -5099,6 +5146,7 @@ static int vkmesh_simplify_step_cpu(
         if (!selected_edge[e]) continue;
         int32_t v0 = edges[e].v0;
         int32_t v1 = edges[e].v1;
+        if (v0 == v1) continue;
         memcpy(mesh->vertices + (size_t) v0 * 3u, edges[e].pos, 3u * sizeof(float));
         for (int i = v2f_offset[v0]; i < v2f_offset[v0 + 1]; ++i) {
             int face_id = v2f[i];
