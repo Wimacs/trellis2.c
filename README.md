@@ -19,6 +19,11 @@ Pixal3D, SegViGen, and TokenSkin. It includes image-to-3D generation, mesh
 texturing, automatic part decomposition, and automatic rigging. Inference runs
 entirely on native CUDA or Vulkan, with no Python or PyTorch runtime.
 
+<p align="center">
+  <a href="https://github.com/Wimacs/trellis2.c/releases/download/v0.1.0/Trellis-Studio-0.1.0-Windows-x64-Setup.exe"><img src="https://img.shields.io/badge/Download-Trellis%20Studio-0078D4?style=for-the-badge&amp;logo=windows&amp;logoColor=white" alt="Download Trellis Studio"></a>
+  <a href="https://discord.gg/HNW54eYSx"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&amp;logo=discord&amp;logoColor=white" alt="Join the Discord community"></a>
+</p>
+
 ## Build
 
 Requirements:
