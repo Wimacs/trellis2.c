@@ -5,6 +5,7 @@
 #endif
 
 #include "vkmesh_accumulate_hole_components_spv.h"
+#include "vkmesh_add_block_offsets_u32_spv.h"
 #include "vkmesh_apply_orientation_flips_spv.h"
 #include "vkmesh_assign_vertex_map_spv.h"
 #include "vkmesh_assign_corner_vertices_spv.h"
@@ -31,7 +32,7 @@
 #include "vkmesh_merge_edges_spv.h"
 #include "vkmesh_merge_face_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
-#include "vkmesh_scan_u32_stride_spv.h"
+#include "vkmesh_block_scan_u32_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
 #include "vkmesh_sort_edges_spv.h"
 #include "vkmesh_sort_face_keys_spv.h"
@@ -175,7 +176,8 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_INIT_U32_SEQUENCE,
     VKMESH_PIPE_INIT_ORIENTATION_STATE,
     VKMESH_PIPE_SEED_VERTEX_OFFSETS,
-    VKMESH_PIPE_SCAN_U32_STRIDE,
+    VKMESH_PIPE_BLOCK_SCAN_U32,
+    VKMESH_PIPE_ADD_BLOCK_OFFSETS_U32,
     VKMESH_PIPE_UNION_FACE_EDGES,
     VKMESH_PIPE_UNION_BOUNDARY_EDGES,
     VKMESH_PIPE_UNION_CORNER_EDGES,
@@ -280,7 +282,8 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_init_u32_sequence_spv, sizeof(vkmesh_init_u32_sequence_spv), "init_u32_sequence" },
     { vkmesh_init_orientation_state_spv, sizeof(vkmesh_init_orientation_state_spv), "init_orientation_state" },
     { vkmesh_seed_vertex_offsets_spv, sizeof(vkmesh_seed_vertex_offsets_spv), "seed_vertex_offsets" },
-    { vkmesh_scan_u32_stride_spv, sizeof(vkmesh_scan_u32_stride_spv), "scan_u32_stride" },
+    { vkmesh_block_scan_u32_spv, sizeof(vkmesh_block_scan_u32_spv), "block_scan_u32" },
+    { vkmesh_add_block_offsets_u32_spv, sizeof(vkmesh_add_block_offsets_u32_spv), "add_block_offsets_u32" },
     { vkmesh_union_face_edges_spv, sizeof(vkmesh_union_face_edges_spv), "union_face_edges" },
     { vkmesh_union_boundary_edges_spv, sizeof(vkmesh_union_boundary_edges_spv), "union_boundary_edges" },
     { vkmesh_union_corner_edges_spv, sizeof(vkmesh_union_corner_edges_spv), "union_corner_edges" },
@@ -1349,6 +1352,86 @@ static int vkmesh_sort_records_vulkan(
 
 cleanup:
     vk_buffer_destroy(vk, &temporary);
+    return ok;
+}
+
+#define VKMESH_SCAN_BLOCK_SIZE 256u
+#define VKMESH_SCAN_MAX_LEVELS 8u
+
+/* Inclusive scan with a fixed output buffer. Each upward pass scans blocks
+   locally and emits block sums; downward passes add the scanned parent sum. */
+static int vkmesh_scan_u32_inclusive(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * input,
+    vkmesh_vk_buffer * output,
+    uint32_t count,
+    vkmesh_vk_buffer * dummy) {
+    if (vk == NULL || input == NULL || output == NULL || dummy == NULL || count == 0u ||
+        input->bytes < (size_t) count * sizeof(uint32_t) ||
+        output->bytes < (size_t) count * sizeof(uint32_t) ||
+        dummy->bytes < sizeof(uint32_t)) {
+        return 0;
+    }
+
+    vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS];
+    uint32_t block_sum_counts[VKMESH_SCAN_MAX_LEVELS];
+    memset(block_sums, 0, sizeof(block_sums));
+    memset(block_sum_counts, 0, sizeof(block_sum_counts));
+    uint32_t level_count = 0u;
+    int ok = 0;
+
+    vkmesh_vk_buffer * level_input = input;
+    vkmesh_vk_buffer * level_output = output;
+    uint32_t level_element_count = count;
+    for (;;) {
+        uint32_t groups = (level_element_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
+        vkmesh_vk_buffer * level_block_sums = dummy;
+        if (groups > 1u) {
+            if (level_count >= VKMESH_SCAN_MAX_LEVELS ||
+                !vk_buffer_create(vk, (size_t) groups * sizeof(uint32_t), &block_sums[level_count])) {
+                goto cleanup;
+            }
+            block_sum_counts[level_count] = groups;
+            level_block_sums = &block_sums[level_count];
+        }
+
+        vkmesh_vk_buffer buffers[4];
+        buffers[0] = *level_input;
+        buffers[1] = *level_output;
+        buffers[2] = *level_block_sums;
+        buffers[3] = *dummy;
+        vkmesh_push push;
+        memset(&push, 0, sizeof(push));
+        push.n = level_element_count;
+        if (!vkmesh_dispatch(vk, VKMESH_PIPE_BLOCK_SCAN_U32, buffers, &push, groups)) goto cleanup;
+        if (groups == 1u) break;
+
+        level_element_count = groups;
+        level_input = &block_sums[level_count];
+        level_output = &block_sums[level_count];
+        ++level_count;
+    }
+
+    for (uint32_t depth = level_count; depth > 0u; --depth) {
+        vkmesh_vk_buffer * data = depth == 1u ? output : &block_sums[depth - 2u];
+        uint32_t data_count = depth == 1u ? count : block_sum_counts[depth - 2u];
+        vkmesh_vk_buffer buffers[4];
+        buffers[0] = *data;
+        buffers[1] = block_sums[depth - 1u];
+        buffers[2] = *dummy;
+        buffers[3] = *dummy;
+        vkmesh_push push;
+        memset(&push, 0, sizeof(push));
+        push.n = data_count;
+        uint32_t groups = (data_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
+        if (!vkmesh_dispatch(vk, VKMESH_PIPE_ADD_BLOCK_OFFSETS_U32, buffers, &push, groups)) goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &block_sums[i]);
+    }
     return ok;
 }
 
@@ -3711,22 +3794,9 @@ static int build_vertex_face_adjacency_vulkan(const vkmesh_mesh * mesh, int ** o
     uint32_t offset_groups = (offset_count + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
 
-    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = dummy_buffer;
-        scan_buffers[3] = dummy_buffer;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    if (!vkmesh_scan_u32_inclusive(
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &dummy_buffer)) goto cleanup;
+    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
 
     int * offset = (int *) calloc((size_t) mesh->n_vertices + 1u, sizeof(*offset));
     if (offset == NULL) goto cleanup;
@@ -4344,22 +4414,10 @@ static int vkmesh_simplify_step_vulkan(
     uint32_t offset_groups = (offset_count + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
 
-    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = counter;
-        scan_buffers[3] = counter;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    if (!vkmesh_scan_u32_inclusive(
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter)) goto cleanup;
+    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
+    vkmesh_vk_buffer * scan_out = &offset_a_buffer;
 
     const uint32_t total_adj = ((const uint32_t *) scan_in->mapped)[vertex_count];
     if (total_adj != face_count * 3u) goto cleanup;
@@ -4664,22 +4722,10 @@ static int vkmesh_device_simplify_step(
     uint32_t offset_groups = (offset_count + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
 
-    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = counter;
-        scan_buffers[3] = counter;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    if (!vkmesh_scan_u32_inclusive(
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter)) goto cleanup;
+    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
+    vkmesh_vk_buffer * scan_out = &offset_a_buffer;
 
     const uint32_t total_adj = ((const uint32_t *) scan_in->mapped)[vertex_count];
     if (total_adj != face_count * 3u) goto cleanup;
@@ -7052,23 +7098,8 @@ static int vkmesh_scan_flags_to_offsets(
     uint32_t groups = (push.n + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, groups)) return 0;
 
-    vkmesh_vk_buffer * scan_in = offsets_a;
-    vkmesh_vk_buffer * scan_out = offsets_b;
-    for (uint64_t stride = 1u; stride < (uint64_t) push.n; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = *dummy;
-        scan_buffers[3] = *dummy;
-        memset(&push, 0, sizeof(push));
-        push.n = count + 1u;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, groups)) return 0;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
-    *offsets_out = scan_in;
+    if (!vkmesh_scan_u32_inclusive(vk, offsets_a, offsets_b, count + 1u, dummy)) return 0;
+    *offsets_out = offsets_b;
     return 1;
 }
 

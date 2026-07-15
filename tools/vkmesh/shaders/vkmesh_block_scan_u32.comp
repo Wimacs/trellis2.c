@@ -1,0 +1,65 @@
+#version 450
+
+// Inclusive scan of one 256-element block per workgroup. The final lane also
+// emits the block sum used by the next hierarchy level.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer InData {
+    uint in_data[];
+};
+
+layout(binding = 1) buffer OutData {
+    uint out_data[];
+};
+
+layout(binding = 2) buffer BlockSums {
+    uint block_sums[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+const uint BLOCK_SIZE = 256u;
+shared uint ping_values[BLOCK_SIZE];
+shared uint pong_values[BLOCK_SIZE];
+
+uint shared_load(bool ping_is_source, uint index) {
+    return ping_is_source ? ping_values[index] : pong_values[index];
+}
+
+void shared_store(bool ping_is_destination, uint index, uint value) {
+    if (ping_is_destination) ping_values[index] = value;
+    else pong_values[index] = value;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint index = gl_WorkGroupID.x * BLOCK_SIZE + lane;
+    ping_values[lane] = index < p.n ? in_data[index] : 0u;
+    memoryBarrierShared();
+    barrier();
+
+    bool ping_is_source = true;
+    for (uint offset = 1u; offset < BLOCK_SIZE; offset <<= 1u) {
+        uint value = shared_load(ping_is_source, lane);
+        if (lane >= offset) value += shared_load(ping_is_source, lane - offset);
+        shared_store(!ping_is_source, lane, value);
+        memoryBarrierShared();
+        barrier();
+        ping_is_source = !ping_is_source;
+    }
+
+    uint value = shared_load(ping_is_source, lane);
+    if (index < p.n) out_data[index] = value;
+    if (lane == BLOCK_SIZE - 1u) block_sums[gl_WorkGroupID.x] = value;
+}
