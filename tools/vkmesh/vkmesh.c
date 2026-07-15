@@ -18,6 +18,7 @@
 #include "vkmesh_copy_u32_spv.h"
 #include "vkmesh_degenerate_faces_spv.h"
 #include "vkmesh_expand_edges_spv.h"
+#include "vkmesh_expand_simplify_edge_keys_spv.h"
 #include "vkmesh_face_keys_spv.h"
 #include "vkmesh_fill_u32_spv.h"
 #include "vkmesh_component_area_spv.h"
@@ -30,11 +31,13 @@
 #include "vkmesh_mark_hole_faces_spv.h"
 #include "vkmesh_mark_hole_roots_spv.h"
 #include "vkmesh_merge_edges_spv.h"
+#include "vkmesh_merge_simplify_edge_keys_spv.h"
 #include "vkmesh_merge_face_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
 #include "vkmesh_block_scan_u32_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
 #include "vkmesh_sort_edges_spv.h"
+#include "vkmesh_sort_simplify_edge_keys_spv.h"
 #include "vkmesh_sort_face_keys_spv.h"
 #include "vkmesh_simplify_best_edge_spv.h"
 #include "vkmesh_simplify_collapse_edges_spv.h"
@@ -153,11 +156,14 @@ typedef struct vkmesh_vk_buffer {
 
 typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_EXPAND_EDGES = 0,
+    VKMESH_PIPE_EXPAND_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_DEGENERATE_FACES,
     VKMESH_PIPE_FACE_KEYS,
     VKMESH_PIPE_SORT_EDGES,
+    VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_SORT_FACE_KEYS,
     VKMESH_PIPE_MERGE_EDGES,
+    VKMESH_PIPE_MERGE_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_MERGE_FACE_KEYS,
     VKMESH_PIPE_MARK_DUPLICATE_FACES,
     VKMESH_PIPE_MARK_BOUNDARY_EDGES,
@@ -259,11 +265,14 @@ typedef struct vkmesh_shader_blob {
 
 static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_expand_edges_spv, sizeof(vkmesh_expand_edges_spv), "expand_edges" },
+    { vkmesh_expand_simplify_edge_keys_spv, sizeof(vkmesh_expand_simplify_edge_keys_spv), "expand_simplify_edge_keys" },
     { vkmesh_degenerate_faces_spv, sizeof(vkmesh_degenerate_faces_spv), "degenerate_faces" },
     { vkmesh_face_keys_spv, sizeof(vkmesh_face_keys_spv), "face_keys" },
     { vkmesh_sort_edges_spv, sizeof(vkmesh_sort_edges_spv), "sort_edges" },
+    { vkmesh_sort_simplify_edge_keys_spv, sizeof(vkmesh_sort_simplify_edge_keys_spv), "sort_simplify_edge_keys" },
     { vkmesh_sort_face_keys_spv, sizeof(vkmesh_sort_face_keys_spv), "sort_face_keys" },
     { vkmesh_merge_edges_spv, sizeof(vkmesh_merge_edges_spv), "merge_edges" },
+    { vkmesh_merge_simplify_edge_keys_spv, sizeof(vkmesh_merge_simplify_edge_keys_spv), "merge_simplify_edge_keys" },
     { vkmesh_merge_face_keys_spv, sizeof(vkmesh_merge_face_keys_spv), "merge_face_keys" },
     { vkmesh_mark_duplicate_faces_spv, sizeof(vkmesh_mark_duplicate_faces_spv), "mark_duplicate_faces" },
     { vkmesh_mark_boundary_edges_spv, sizeof(vkmesh_mark_boundary_edges_spv), "mark_boundary_edges" },
@@ -1258,6 +1267,9 @@ static int vkmesh_sort_records_vulkan(
     if (pipeline_kind == VKMESH_PIPE_SORT_EDGES) {
         record_size = sizeof(vkmesh_edge);
         merge_pipeline = VKMESH_PIPE_MERGE_EDGES;
+    } else if (pipeline_kind == VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS) {
+        record_size = 2u * sizeof(uint32_t);
+        merge_pipeline = VKMESH_PIPE_MERGE_SIMPLIFY_EDGE_KEYS;
     } else if (pipeline_kind == VKMESH_PIPE_SORT_FACE_KEYS) {
         record_size = sizeof(vkmesh_face_key);
         merge_pipeline = VKMESH_PIPE_MERGE_FACE_KEYS;
@@ -1542,6 +1554,50 @@ static int expand_edges_device(
     }
     *edge_count_out = edge_count;
     *edge_sort_count_out = edge_count;
+    return 1;
+}
+
+static int expand_simplify_edge_keys_device(
+    vkmesh_vk * vk,
+    const vkmesh_mesh * mesh,
+    vkmesh_vk_buffer * faces_buffer,
+    vkmesh_vk_buffer * vertices_buffer,
+    vkmesh_vk_buffer * edge_keys_buffer_out,
+    size_t * edge_count_out) {
+    memset(edge_keys_buffer_out, 0, sizeof(*edge_keys_buffer_out));
+    *edge_count_out = 0;
+    if (vk == NULL || mesh == NULL || faces_buffer == NULL || vertices_buffer == NULL ||
+        mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX / 3u) {
+        return 0;
+    }
+
+    const size_t edge_count = (size_t) mesh->n_faces * 3u;
+    const size_t edge_keys_bytes = edge_count * 2u * sizeof(uint32_t);
+    if (!vk_buffer_create_uninitialized(vk, edge_keys_bytes, edge_keys_buffer_out)) return 0;
+
+    /* The key expansion shader uses faces and the key output. Vertices also
+       provide a valid existing descriptor for its intentionally unused slots,
+       avoiding a separate four-byte dummy allocation. */
+    vkmesh_vk_buffer buffers[4];
+    buffers[0] = *faces_buffer;
+    buffers[1] = *vertices_buffer;
+    buffers[2] = *edge_keys_buffer_out;
+    buffers[3] = *vertices_buffer;
+    vkmesh_push push;
+    memset(&push, 0, sizeof(push));
+    push.n = (uint32_t) mesh->n_faces;
+    uint32_t groups = ((uint32_t) mesh->n_faces + 127u) / 128u;
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_SIMPLIFY_EDGE_KEYS, buffers, &push, groups) ||
+        !vkmesh_sort_records_vulkan(
+            vk,
+            edge_keys_buffer_out,
+            vertices_buffer,
+            edge_count,
+            VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS)) {
+        vk_buffer_destroy(vk, edge_keys_buffer_out);
+        return 0;
+    }
+    *edge_count_out = edge_count;
     return 1;
 }
 
@@ -3939,14 +3995,12 @@ static int get_unique_simplify_edges_vulkan(
     vkmesh_vk_buffer faces_buffer;
     vkmesh_vk_buffer vertices_buffer;
     vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer dummy_buffer;
     vkmesh_vk_buffer unique_buffer;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
     memset(&faces_buffer, 0, sizeof(faces_buffer));
     memset(&vertices_buffer, 0, sizeof(vertices_buffer));
     memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&dummy_buffer, 0, sizeof(dummy_buffer));
     memset(&unique_buffer, 0, sizeof(unique_buffer));
     memset(&boundary_flags, 0, sizeof(boundary_flags));
     memset(&counter, 0, sizeof(counter));
@@ -3956,10 +4010,9 @@ static int get_unique_simplify_edges_vulkan(
     const size_t boundary_bytes = (size_t) mesh->n_vertices * sizeof(uint32_t);
     int ok = 0;
     size_t raw_count = 0;
-    size_t raw_sort_count = 0;
 
-    if (!vk_buffer_create(vk, faces_bytes, &faces_buffer) ||
-        !vk_buffer_create(vk, vertices_bytes, &vertices_buffer) ||
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &faces_buffer) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &vertices_buffer) ||
         !vk_buffer_create(vk, boundary_bytes, &boundary_flags) ||
         !vk_buffer_create(vk, sizeof(uint32_t), &counter)) {
         goto cleanup;
@@ -3967,18 +4020,17 @@ static int get_unique_simplify_edges_vulkan(
     memcpy(faces_buffer.mapped, mesh->faces, faces_bytes);
     memcpy(vertices_buffer.mapped, mesh->vertices, vertices_bytes);
 
-    if (!expand_edges_device(
+    if (!expand_simplify_edge_keys_device(
             vk,
             mesh,
             &faces_buffer,
             &vertices_buffer,
             &edges_buffer,
-            &dummy_buffer,
-            &raw_count,
-            &raw_sort_count)) {
+            &raw_count)) {
         goto cleanup;
     }
-    if (!vk_buffer_create(vk, raw_count * 2u * sizeof(uint32_t), &unique_buffer)) goto cleanup;
+    if (!vk_buffer_create_uninitialized(
+            vk, raw_count * 2u * sizeof(uint32_t), &unique_buffer)) goto cleanup;
 
     vkmesh_vk_buffer buffers[4];
     buffers[0] = edges_buffer;
@@ -4022,7 +4074,6 @@ cleanup:
     vk_buffer_destroy(vk, &faces_buffer);
     vk_buffer_destroy(vk, &vertices_buffer);
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &dummy_buffer);
     vk_buffer_destroy(vk, &unique_buffer);
     vk_buffer_destroy(vk, &boundary_flags);
     vk_buffer_destroy(vk, &counter);
@@ -4407,7 +4458,6 @@ static int vkmesh_simplify_step_vulkan(
     vkmesh_vk_buffer offset_b_buffer;
     vkmesh_vk_buffer adjacency_buffer;
     vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer edge_dummy;
     vkmesh_vk_buffer unique_edges;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
@@ -4419,7 +4469,6 @@ static int vkmesh_simplify_step_vulkan(
     memset(&offset_b_buffer, 0, sizeof(offset_b_buffer));
     memset(&adjacency_buffer, 0, sizeof(adjacency_buffer));
     memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&edge_dummy, 0, sizeof(edge_dummy));
     memset(&unique_edges, 0, sizeof(unique_edges));
     memset(&boundary_flags, 0, sizeof(boundary_flags));
     memset(&counter, 0, sizeof(counter));
@@ -4500,8 +4549,13 @@ static int vkmesh_simplify_step_vulkan(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_ADJACENCY, adj_buffers, &push, face_groups)) goto cleanup;
 
     size_t raw_edge_count = 0;
-    size_t raw_edge_sort_count = 0;
-    if (!expand_edges_device(vk, mesh, &faces_buffer, &vertices_buffer, &edges_buffer, &edge_dummy, &raw_edge_count, &raw_edge_sort_count)) {
+    if (!expand_simplify_edge_keys_device(
+            vk,
+            mesh,
+            &faces_buffer,
+            &vertices_buffer,
+            &edges_buffer,
+            &raw_edge_count)) {
         goto cleanup;
     }
     if (raw_edge_count > UINT32_MAX) goto cleanup;
@@ -4526,11 +4580,10 @@ static int vkmesh_simplify_step_vulkan(
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
 
-    /* The sorted 3F edge records are only needed to construct the compact
+    /* The sorted 3F edge keys are only needed to construct the compact
        unique-edge array. Releasing them before the packed simplify scratch is
        allocated keeps the two largest transient phases from overlapping. */
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
 
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
@@ -4693,7 +4746,6 @@ cleanup:
     vk_buffer_destroy(vk, &offset_b_buffer);
     vk_buffer_destroy(vk, &adjacency_buffer);
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
     vk_buffer_destroy(vk, &unique_edges);
     vk_buffer_destroy(vk, &boundary_flags);
     vk_buffer_destroy(vk, &counter);
@@ -4726,7 +4778,6 @@ static int vkmesh_device_simplify_step(
     vkmesh_vk_buffer offset_b_buffer;
     vkmesh_vk_buffer adjacency_buffer;
     vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer edge_dummy;
     vkmesh_vk_buffer unique_edges;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
@@ -4736,7 +4787,6 @@ static int vkmesh_device_simplify_step(
     memset(&offset_b_buffer, 0, sizeof(offset_b_buffer));
     memset(&adjacency_buffer, 0, sizeof(adjacency_buffer));
     memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&edge_dummy, 0, sizeof(edge_dummy));
     memset(&unique_edges, 0, sizeof(unique_edges));
     memset(&boundary_flags, 0, sizeof(boundary_flags));
     memset(&counter, 0, sizeof(counter));
@@ -4816,8 +4866,13 @@ static int vkmesh_device_simplify_step(
     vk_buffer_destroy(vk, scan_out);
 
     size_t raw_edge_count = 0;
-    size_t raw_edge_sort_count = 0;
-    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &raw_edge_count, &raw_edge_sort_count)) {
+    if (!expand_simplify_edge_keys_device(
+            vk,
+            &view,
+            &dm->faces,
+            &dm->vertices,
+            &edges_buffer,
+            &raw_edge_count)) {
         goto cleanup;
     }
     if (raw_edge_count > UINT32_MAX) goto cleanup;
@@ -4841,9 +4896,8 @@ static int vkmesh_device_simplify_step(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES, unique_buffers, &push, edge_groups)) goto cleanup;
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
-    /* The sorted 3F records are consumed completely by unique-edge compaction. */
+    /* The sorted 3F edge keys are consumed completely by unique-edge compaction. */
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
 
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
@@ -4983,7 +5037,6 @@ cleanup:
     vk_buffer_destroy(vk, &offset_b_buffer);
     vk_buffer_destroy(vk, &adjacency_buffer);
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
     vk_buffer_destroy(vk, &unique_edges);
     vk_buffer_destroy(vk, &boundary_flags);
     vk_buffer_destroy(vk, &counter);

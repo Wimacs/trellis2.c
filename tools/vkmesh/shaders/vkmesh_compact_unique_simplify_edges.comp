@@ -11,12 +11,12 @@ layout(push_constant) uniform Push {
     float rel_eps;
 } p;
 
-layout(binding = 0) readonly buffer Edges {
-    uint edges[];
+layout(std430, binding = 0) readonly buffer EdgeKeys {
+    uvec2 edge_keys[];
 };
 
-layout(binding = 1) buffer UniqueEdges {
-    uint unique_edges[];
+layout(std430, binding = 1) buffer UniqueEdges {
+    uvec2 unique_edges[];
 };
 
 layout(binding = 2) buffer BoundaryFlags {
@@ -28,10 +28,7 @@ layout(binding = 3) buffer Counter {
 };
 
 bool same_edge(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
-    return edges[abase + 0u] == edges[bbase + 0u] &&
-           edges[abase + 1u] == edges[bbase + 1u];
+    return all(equal(edge_keys[a], edge_keys[b]));
 }
 
 void main() {
@@ -39,17 +36,16 @@ void main() {
     if (idx >= p.n) return;
     if (idx > 0u && same_edge(idx - 1u, idx)) return;
 
-    uint src = idx * 5u;
-    uint v0 = edges[src + 0u];
-    uint v1 = edges[src + 1u];
-    // Degenerate input faces produce (v, v) edge records.  They are not
+    uvec2 edge = edge_keys[idx];
+    uint v0 = edge.x;
+    uint v1 = edge.y;
+    // Degenerate input faces produce (v, v) edge keys.  They are not
     // collapse candidates: treating one as an edge would remove every face
     // incident to v when the collapse kernel removes the "shared" faces.
     if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) return;
 
     uint out_idx = atomicAdd(counter[0], 1u);
-    unique_edges[out_idx * 2u + 0u] = v0;
-    unique_edges[out_idx * 2u + 1u] = v1;
+    unique_edges[out_idx] = edge;
 
     bool same_next = idx + 1u < p.n && same_edge(idx, idx + 1u);
     if (!same_next) {
