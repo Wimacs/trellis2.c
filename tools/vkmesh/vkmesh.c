@@ -28,6 +28,8 @@
 #include "vkmesh_mark_duplicate_faces_spv.h"
 #include "vkmesh_mark_hole_faces_spv.h"
 #include "vkmesh_mark_hole_roots_spv.h"
+#include "vkmesh_merge_edges_spv.h"
+#include "vkmesh_merge_face_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
 #include "vkmesh_scan_u32_stride_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
@@ -154,6 +156,8 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_FACE_KEYS,
     VKMESH_PIPE_SORT_EDGES,
     VKMESH_PIPE_SORT_FACE_KEYS,
+    VKMESH_PIPE_MERGE_EDGES,
+    VKMESH_PIPE_MERGE_FACE_KEYS,
     VKMESH_PIPE_MARK_DUPLICATE_FACES,
     VKMESH_PIPE_MARK_BOUNDARY_EDGES,
     VKMESH_PIPE_BOUNDARY_DEGREE_OWNER,
@@ -257,6 +261,8 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_face_keys_spv, sizeof(vkmesh_face_keys_spv), "face_keys" },
     { vkmesh_sort_edges_spv, sizeof(vkmesh_sort_edges_spv), "sort_edges" },
     { vkmesh_sort_face_keys_spv, sizeof(vkmesh_sort_face_keys_spv), "sort_face_keys" },
+    { vkmesh_merge_edges_spv, sizeof(vkmesh_merge_edges_spv), "merge_edges" },
+    { vkmesh_merge_face_keys_spv, sizeof(vkmesh_merge_face_keys_spv), "merge_face_keys" },
     { vkmesh_mark_duplicate_faces_spv, sizeof(vkmesh_mark_duplicate_faces_spv), "mark_duplicate_faces" },
     { vkmesh_mark_boundary_edges_spv, sizeof(vkmesh_mark_boundary_edges_spv), "mark_boundary_edges" },
     { vkmesh_boundary_degree_owner_spv, sizeof(vkmesh_boundary_degree_owner_spv), "boundary_degree_owner" },
@@ -1221,36 +1227,7 @@ static int vkmesh_dispatch_pair(
     return ok;
 }
 
-static size_t next_power_of_two_size(size_t n) {
-    size_t p = 1;
-    while (p < n) {
-        if (p > SIZE_MAX / 2) return 0;
-        p *= 2;
-    }
-    return p;
-}
-
-/* Bitonic sort passes recorded per submission. The full ladder is O(log2(n)^2)
-   dependent dispatches -- ~250 of them for a few million edge records -- and
-   recording all of them into one command buffer makes a single GPU job long
-   enough to overrun the kernel's compute-ring lockup timeout on a slow device,
-   which wedges the GPU and kills the display along with it. 0 keeps the whole
-   ladder in one submission. */
-#define VKMESH_DEFAULT_SORT_FLUSH_PASSES 8u
-
-static uint32_t vkmesh_resolve_sort_flush_passes(void) {
-    const char * env = getenv("TRELLIS_VKMESH_SORT_FLUSH_PASSES");
-    if (env != NULL && env[0] != '\0') {
-        int parsed = 0;
-        if (parse_int_arg(env, &parsed) && parsed >= 0) {
-            return (uint32_t) parsed;
-        }
-        fprintf(stderr,
-            "vkmesh: ignoring invalid TRELLIS_VKMESH_SORT_FLUSH_PASSES='%s'\n",
-            env);
-    }
-    return VKMESH_DEFAULT_SORT_FLUSH_PASSES;
-}
+#define VKMESH_SORT_TILE_SIZE 256u
 
 static int vkmesh_sort_records_vulkan(
     vkmesh_vk * vk,
@@ -1261,65 +1238,118 @@ static int vkmesh_sort_records_vulkan(
     if (record_count <= 1) return 1;
     if (record_count > UINT32_MAX) return 0;
 
+    size_t record_size = 0;
+    vkmesh_pipeline_kind merge_pipeline = VKMESH_PIPE_COUNT;
+    if (pipeline_kind == VKMESH_PIPE_SORT_EDGES) {
+        record_size = sizeof(vkmesh_edge);
+        merge_pipeline = VKMESH_PIPE_MERGE_EDGES;
+    } else if (pipeline_kind == VKMESH_PIPE_SORT_FACE_KEYS) {
+        record_size = sizeof(vkmesh_face_key);
+        merge_pipeline = VKMESH_PIPE_MERGE_FACE_KEYS;
+    } else {
+        return 0;
+    }
+    if (record_count > SIZE_MAX / record_size || records->bytes < record_count * record_size) return 0;
+
+    uint32_t merge_passes = 0u;
+    for (size_t width = VKMESH_SORT_TILE_SIZE; width < record_count; width <<= 1u) {
+        ++merge_passes;
+    }
+
+    vkmesh_vk_buffer temporary;
+    memset(&temporary, 0, sizeof(temporary));
+    int ok = 0;
+    if (merge_passes > 0u && !vk_buffer_create(vk, record_count * record_size, &temporary)) goto cleanup;
+
+    /* Both sort pipelines keep the same descriptors for the entire batch.
+       Push parity chooses the source/destination without descriptor updates. */
     vkmesh_vk_buffer buffers[4];
     buffers[0] = *records;
-    buffers[1] = *dummy;
+    buffers[1] = merge_passes > 0u ? temporary : *records;
     buffers[2] = *dummy;
     buffers[3] = *dummy;
     vkmesh_update_descriptor_set(vk, buffers);
-    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
+    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) goto cleanup;
 
     VkCommandBufferBeginInfo begin;
     memset(&begin, 0, sizeof(begin));
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
+    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) goto cleanup;
 
+    vkmesh_push push;
+    memset(&push, 0, sizeof(push));
+    push.n = (uint32_t) record_count;
+    push.aux1 = merge_passes & 1u;
+    uint32_t groups = (uint32_t) ((record_count + VKMESH_SORT_TILE_SIZE - 1u) / VKMESH_SORT_TILE_SIZE);
+    vkCmdBindDescriptorSets(
+        vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout,
+        0, 1, &vk->descriptor_set, 0, NULL);
     vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
-    vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
+    vkCmdPushConstants(
+        vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, sizeof(push), &push);
+    vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    uint32_t groups = (uint32_t) ((record_count + 255u) / 256u);
-    const uint32_t flush_every = vkmesh_resolve_sort_flush_passes();
-    uint32_t recorded = 0;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    if (merge_passes > 0u) {
+        vkCmdPipelineBarrier(
+            vk->command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[merge_pipeline]);
+    }
+
+    uint32_t source_is_temporary = merge_passes & 1u;
+    uint32_t pass_index = 0u;
+    for (size_t width = VKMESH_SORT_TILE_SIZE; width < record_count; width <<= 1u) {
+        memset(&push, 0, sizeof(push));
+        push.n = (uint32_t) record_count;
+        push.aux0 = (uint32_t) width;
+        push.aux1 = source_is_temporary;
+        vkCmdPushConstants(
+            vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(push), &push);
+        vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+        source_is_temporary ^= 1u;
+        ++pass_index;
+        if (pass_index < merge_passes) {
+            vkCmdPipelineBarrier(
+                vk->command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &barrier, 0, NULL, 0, NULL);
+        }
+    }
+    if (source_is_temporary != 0u || pass_index != merge_passes) {
+        (void) vkEndCommandBuffer(vk->command_buffer);
+        goto cleanup;
+    }
+
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(
+        vk->command_buffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) goto cleanup;
 
     VkSubmitInfo submit;
     memset(&submit, 0, sizeof(submit));
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
+    ok = vkmesh_submit_and_wait(vk, &submit);
 
-    for (size_t k = 2u; k <= record_count; k <<= 1u) {
-        for (size_t j = k >> 1u; j > 0u; j >>= 1u) {
-            vkmesh_push push;
-            memset(&push, 0, sizeof(push));
-            push.n = (uint32_t) record_count;
-            push.aux0 = (uint32_t) k;
-            push.aux1 = (uint32_t) j;
-            vkCmdPushConstants(vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-            vkCmdDispatch(vk->command_buffer, groups, 1, 1);
-            vkCmdPipelineBarrier(
-                vk->command_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                0, 1, &barrier, 0, NULL, 0, NULL);
-            ++recorded;
-            if (flush_every == 0 || (recorded % flush_every) != 0) continue;
-
-            /* Each pass depends on the previous one, so submitting here and
-               waiting preserves the ordering the barrier gave us. */
-            if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
-            if (!vkmesh_submit_and_wait(vk, &submit)) return 0;
-            if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
-            if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
-            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
-            vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
-        }
-    }
-    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
-    return vkmesh_submit_and_wait(vk, &submit);
+cleanup:
+    vk_buffer_destroy(vk, &temporary);
+    return ok;
 }
 
 static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_out, int64_t * edge_count_out) {
@@ -1340,9 +1370,8 @@ static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_ou
     const size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
     const size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
     const size_t edge_count = (size_t) mesh->n_faces * 3u;
-    const size_t edge_sort_count = next_power_of_two_size(edge_count);
-    if (edge_sort_count == 0 || edge_sort_count > UINT32_MAX) goto cleanup;
-    const size_t edges_bytes = edge_sort_count * sizeof(vkmesh_edge);
+    if (edge_count > UINT32_MAX) goto cleanup;
+    const size_t edges_bytes = edge_count * sizeof(vkmesh_edge);
     if (!vk_buffer_create(vk, faces_bytes, &buffers[0]) ||
         !vk_buffer_create(vk, vertices_bytes, &buffers[1]) ||
         !vk_buffer_create(vk, edges_bytes, &buffers[2]) ||
@@ -1351,21 +1380,12 @@ static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_ou
     }
     memcpy(buffers[0].mapped, mesh->faces, faces_bytes);
     memcpy(buffers[1].mapped, mesh->vertices, vertices_bytes);
-    vkmesh_edge * mapped_edges = (vkmesh_edge *) buffers[2].mapped;
-    for (size_t i = edge_count; i < edge_sort_count; ++i) {
-        mapped_edges[i].min_v = UINT32_MAX;
-        mapped_edges[i].max_v = UINT32_MAX;
-        mapped_edges[i].a = UINT32_MAX;
-        mapped_edges[i].b = UINT32_MAX;
-        mapped_edges[i].face = UINT32_MAX;
-    }
-
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = (uint32_t) ((mesh->n_faces + 127) / 128);
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_EDGES, buffers, &push, groups)) goto cleanup;
-    if (!vkmesh_sort_records_vulkan(vk, &buffers[2], &buffers[3], edge_sort_count, VKMESH_PIPE_SORT_EDGES)) goto cleanup;
+    if (!vkmesh_sort_records_vulkan(vk, &buffers[2], &buffers[3], edge_count, VKMESH_PIPE_SORT_EDGES)) goto cleanup;
 
     vkmesh_edge * edges = (vkmesh_edge *) malloc(edge_count * sizeof(vkmesh_edge));
     if (edges == NULL) goto cleanup;
@@ -1399,23 +1419,13 @@ static int expand_edges_device(
     }
 
     const size_t edge_count = (size_t) mesh->n_faces * 3u;
-    const size_t edge_sort_count = next_power_of_two_size(edge_count);
-    if (edge_sort_count == 0 || edge_sort_count > UINT32_MAX) return 0;
-    const size_t edges_bytes = edge_sort_count * sizeof(vkmesh_edge);
+    if (edge_count > UINT32_MAX) return 0;
+    const size_t edges_bytes = edge_count * sizeof(vkmesh_edge);
     if (!vk_buffer_create(vk, edges_bytes, edges_buffer_out) ||
         !vk_buffer_create(vk, 4u * sizeof(uint32_t), dummy_buffer_out)) {
         vk_buffer_destroy(vk, edges_buffer_out);
         vk_buffer_destroy(vk, dummy_buffer_out);
         return 0;
-    }
-
-    vkmesh_edge * mapped_edges = (vkmesh_edge *) edges_buffer_out->mapped;
-    for (size_t i = edge_count; i < edge_sort_count; ++i) {
-        mapped_edges[i].min_v = UINT32_MAX;
-        mapped_edges[i].max_v = UINT32_MAX;
-        mapped_edges[i].a = UINT32_MAX;
-        mapped_edges[i].b = UINT32_MAX;
-        mapped_edges[i].face = UINT32_MAX;
     }
 
     vkmesh_vk_buffer buffers[4];
@@ -1428,13 +1438,13 @@ static int expand_edges_device(
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = (uint32_t) ((mesh->n_faces + 127) / 128);
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_EDGES, buffers, &push, groups) ||
-        !vkmesh_sort_records_vulkan(vk, edges_buffer_out, dummy_buffer_out, edge_sort_count, VKMESH_PIPE_SORT_EDGES)) {
+        !vkmesh_sort_records_vulkan(vk, edges_buffer_out, dummy_buffer_out, edge_count, VKMESH_PIPE_SORT_EDGES)) {
         vk_buffer_destroy(vk, edges_buffer_out);
         vk_buffer_destroy(vk, dummy_buffer_out);
         return 0;
     }
     *edge_count_out = edge_count;
-    *edge_sort_count_out = edge_sort_count;
+    *edge_sort_count_out = edge_count;
     return 1;
 }
 
@@ -1935,21 +1945,12 @@ static int vkmesh_device_remove_duplicate_faces(vkmesh_device_mesh * dm, uint32_
     memset(&flags, 0, sizeof(flags));
     memset(&dummy, 0, sizeof(dummy));
     int ok = 0;
-    size_t sort_count = next_power_of_two_size((size_t) dm->n_faces);
-    if (sort_count == 0 || sort_count > UINT32_MAX) goto cleanup;
+    size_t sort_count = (size_t) dm->n_faces;
     if (!vk_buffer_create(vk, sort_count * sizeof(vkmesh_face_key), &keys) ||
         !vk_buffer_create(vk, (size_t) dm->n_faces * sizeof(uint32_t), &flags) ||
         !vk_buffer_create(vk, 4u * sizeof(uint32_t), &dummy)) {
         goto cleanup;
     }
-    vkmesh_face_key * mapped = (vkmesh_face_key *) keys.mapped;
-    for (size_t i = (size_t) dm->n_faces; i < sort_count; ++i) {
-        mapped[i].v0 = -1;
-        mapped[i].v1 = -1;
-        mapped[i].v2 = -1;
-        mapped[i].face = -1;
-    }
-
     vkmesh_vk_buffer key_buffers[4];
     key_buffers[0] = dm->faces;
     key_buffers[1] = dummy;
@@ -2468,8 +2469,7 @@ static int compute_duplicate_compacted_mesh_vulkan(
     vkmesh_vk_buffer buffers[4];
     memset(buffers, 0, sizeof(buffers));
     int ok = 0;
-    size_t sort_count = next_power_of_two_size((size_t) mesh->n_faces);
-    if (sort_count == 0 || sort_count > UINT32_MAX) goto cleanup;
+    size_t sort_count = (size_t) mesh->n_faces;
     size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
     size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
     size_t keys_bytes = sort_count * sizeof(vkmesh_face_key);
@@ -2482,14 +2482,6 @@ static int compute_duplicate_compacted_mesh_vulkan(
     }
     memcpy(buffers[0].mapped, mesh->faces, faces_bytes);
     memcpy(buffers[1].mapped, mesh->vertices, vertices_bytes);
-    vkmesh_face_key * mapped = (vkmesh_face_key *) buffers[2].mapped;
-    for (size_t i = (size_t) mesh->n_faces; i < sort_count; ++i) {
-        mapped[i].v0 = -1;
-        mapped[i].v1 = -1;
-        mapped[i].v2 = -1;
-        mapped[i].face = -1;
-    }
-
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) mesh->n_faces;
