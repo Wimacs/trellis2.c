@@ -263,6 +263,11 @@ typedef struct trellis_shape_latent_cache_info {
     float anchor_aabb_max[3];
 } trellis_shape_latent_cache_info;
 
+/* FlexDualGrid vertices may extend half a voxel beyond the nominal
+ * [-0.5, 0.5] decoder cube. Keep every cache consumer on the exact same
+ * resolution-dependent envelope. */
+float trellis_shape_latent_decoder_aabb_limit(int resolution);
+
 trellis_status trellis_shape_latent_cache_write(
     const char * path,
     const trellis_structured_latent * latent,

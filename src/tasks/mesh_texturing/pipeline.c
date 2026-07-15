@@ -14,8 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEXTURING_DECODER_AABB_LIMIT 0.5001f
-
 static const char * texturing_sparse_backend_name(trellis_sparse_backend_kind kind) {
     switch (kind) {
         case TRELLIS_SPARSE_BACKEND_CUDA: return "cuda";
@@ -196,6 +194,8 @@ static trellis_status texturing_load_and_normalize_mesh(
     }
 
     const double scale = target_max_extent / raw_max_extent;
+    const float decoder_aabb_limit = trellis_shape_latent_decoder_aabb_limit(
+        cache_info != NULL ? cache_info->resolution : 512);
     for (size_t vertex = 0; vertex < asset.vertex_count; ++vertex) {
         float * position = asset.positions + vertex * 3u;
         const double decoder[3] = {
@@ -209,12 +209,12 @@ static trellis_status texturing_load_and_normalize_mesh(
         }
         if (!isfinite(position[0]) || !isfinite(position[1]) ||
             !isfinite(position[2]) ||
-            position[0] < -TEXTURING_DECODER_AABB_LIMIT ||
-            position[0] > TEXTURING_DECODER_AABB_LIMIT ||
-            position[1] < -TEXTURING_DECODER_AABB_LIMIT ||
-            position[1] > TEXTURING_DECODER_AABB_LIMIT ||
-            position[2] < -TEXTURING_DECODER_AABB_LIMIT ||
-            position[2] > TEXTURING_DECODER_AABB_LIMIT) {
+            position[0] < -decoder_aabb_limit ||
+            position[0] > decoder_aabb_limit ||
+            position[1] < -decoder_aabb_limit ||
+            position[1] > decoder_aabb_limit ||
+            position[2] < -decoder_aabb_limit ||
+            position[2] > decoder_aabb_limit) {
             status = TRELLIS_STATUS_PARSE_ERROR;
             goto cleanup;
         }

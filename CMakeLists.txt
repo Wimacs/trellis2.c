@@ -724,6 +724,18 @@ if (TRELLIS2_C_BUILD_TESTS)
         NAME trellis2_c_shape_latent_cache_tests
         COMMAND trellis2_c_shape_latent_cache_tests)
 
+    add_executable(trellis2_c_mesh_segmentation_normalization_tests
+        tests/test_mesh_segmentation_normalization.c
+    )
+    target_include_directories(trellis2_c_mesh_segmentation_normalization_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_rigging"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/mesh_segmentation")
+    target_link_libraries(trellis2_c_mesh_segmentation_normalization_tests PRIVATE trellis2_c)
+    add_test(
+        NAME trellis2_c_mesh_segmentation_normalization_tests
+        COMMAND trellis2_c_mesh_segmentation_normalization_tests)
+
     add_executable(trellis2_c_gltf_axes_tests
         tests/test_gltf_axes.c
     )

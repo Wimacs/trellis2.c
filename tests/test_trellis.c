@@ -601,6 +601,28 @@ static void test_flexible_dual_grid_mesh_host(void) {
     CHECK_TRUE(mesh.faces[0] == 0 && mesh.faces[1] == 1 && mesh.faces[2] == 3);
     CHECK_TRUE(mesh.faces[3] == 3 && mesh.faces[4] == 1 && mesh.faces[5] == 2);
     trellis_mesh_free(&mesh);
+
+    int32_t invalid_coords[16];
+    memcpy(invalid_coords, coords, sizeof(invalid_coords));
+    invalid_coords[0] = 1;
+    CHECK_TRUE(trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+        invalid_coords, feats, 4, 7, 4, &mesh) == TRELLIS_STATUS_PARSE_ERROR);
+    invalid_coords[0] = 0;
+    invalid_coords[1] = -1;
+    CHECK_TRUE(trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+        invalid_coords, feats, 4, 7, 4, &mesh) == TRELLIS_STATUS_PARSE_ERROR);
+    invalid_coords[1] = 4;
+    CHECK_TRUE(trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+        invalid_coords, feats, 4, 7, 4, &mesh) == TRELLIS_STATUS_PARSE_ERROR);
+    memcpy(invalid_coords, coords, sizeof(invalid_coords));
+    memcpy(invalid_coords + 4, invalid_coords, 4u * sizeof(int32_t));
+    CHECK_TRUE(trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+        invalid_coords, feats, 4, 7, 4, &mesh) == TRELLIS_STATUS_PARSE_ERROR);
+    float invalid_feats[4 * 7];
+    memcpy(invalid_feats, feats, sizeof(invalid_feats));
+    invalid_feats[3] = NAN;
+    CHECK_TRUE(trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
+        coords, invalid_feats, 4, 7, 4, &mesh) == TRELLIS_STATUS_PARSE_ERROR);
 }
 
 static void test_timestep_mlp_cuda(void) {

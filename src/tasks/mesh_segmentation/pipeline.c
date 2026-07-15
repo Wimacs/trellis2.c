@@ -10,6 +10,7 @@
 #include "condition_render.h"
 #include "labels.h"
 #include "material_features.h"
+#include "normalization.h"
 #include "partition.h"
 #include "parts_glb.h"
 
@@ -22,7 +23,6 @@
 #include <sys/stat.h>
 
 #define SEGMENTATION_NORMALIZED_EXTENT 0.99999
-#define SEGMENTATION_AABB_LIMIT 0.5001f
 
 static int segmentation_copy_path(
     char * output,
@@ -413,10 +413,48 @@ static trellis_status segmentation_read_latent_cache(
     return TRELLIS_STATUS_OK;
 }
 
-/* SegviGen's released data pipeline normalizes flattened glTF world
- * coordinates directly. It does not apply the inverse TRELLIS export-axis
- * rotation used by the image-to-3D texturing task. */
-static trellis_status segmentation_normalize_asset_mesh(
+typedef enum segmentation_asset_frame {
+    SEGMENTATION_ASSET_FRAME_WORLD = 0,
+    SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF = 1,
+} segmentation_asset_frame;
+
+static void segmentation_position_in_decoder_frame(
+    const float position[3],
+    segmentation_asset_frame frame,
+    double decoder[3]) {
+    if (frame == SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF) {
+        /* Inverse of the TRELLIS glTF export transform:
+         * (x,y,z)_gltf -> (x,-z,y)_decoder. */
+        decoder[0] = (double) position[0];
+        decoder[1] = (double) -position[2];
+        decoder[2] = (double) position[1];
+        return;
+    }
+    decoder[0] = (double) position[0];
+    decoder[1] = (double) position[1];
+    decoder[2] = (double) position[2];
+}
+
+static double segmentation_extent_ratio_drift(
+    const double extent[3],
+    double max_extent,
+    const double anchor_extent[3],
+    double anchor_max_extent) {
+    double drift = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        const double axis_drift = fabs(
+            extent[axis] / max_extent -
+            anchor_extent[axis] / anchor_max_extent);
+        if (axis_drift > drift) drift = axis_drift;
+    }
+    return drift;
+}
+
+/* SegviGen's released data pipeline consumes flattened glTF world axes, while
+ * image-to-3D caches are anchored before TRELLIS' glTF export-axis rotation.
+ * Evaluate both frames against the cache anchor and use the compatible one;
+ * uncached assets retain the official direct-world behavior. */
+trellis_status trellis_mesh_segmentation_normalize_asset_mesh(
     const trellis_mesh_rigging_asset * asset,
     const trellis_shape_latent_cache_info * cache_anchor,
     trellis_mesh_host * mesh_out) {
@@ -431,22 +469,38 @@ static trellis_status segmentation_normalize_asset_mesh(
     }
     memset(mesh_out, 0, sizeof(*mesh_out));
 
-    double raw_min[3] = {0.0, 0.0, 0.0};
-    double raw_max[3] = {0.0, 0.0, 0.0};
+    double frame_min[2][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    double frame_max[2][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
     for (size_t vertex = 0; vertex < asset->vertex_count; ++vertex) {
         const float * position = asset->positions + vertex * 3u;
-        for (int axis = 0; axis < 3; ++axis) {
-            if (!isfinite(position[axis])) return TRELLIS_STATUS_PARSE_ERROR;
-            if (vertex == 0 || position[axis] < raw_min[axis]) raw_min[axis] = position[axis];
-            if (vertex == 0 || position[axis] > raw_max[axis]) raw_max[axis] = position[axis];
+        for (int frame_index = 0; frame_index < 2; ++frame_index) {
+            double decoder[3];
+            segmentation_position_in_decoder_frame(
+                position,
+                (segmentation_asset_frame) frame_index,
+                decoder);
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!isfinite(decoder[axis])) return TRELLIS_STATUS_PARSE_ERROR;
+                if (vertex == 0 || decoder[axis] < frame_min[frame_index][axis]) {
+                    frame_min[frame_index][axis] = decoder[axis];
+                }
+                if (vertex == 0 || decoder[axis] > frame_max[frame_index][axis]) {
+                    frame_max[frame_index][axis] = decoder[axis];
+                }
+            }
         }
     }
+    segmentation_asset_frame selected_frame = SEGMENTATION_ASSET_FRAME_WORLD;
     double raw_center[3];
     double raw_extent[3];
     double raw_max_extent = 0.0;
     for (int axis = 0; axis < 3; ++axis) {
-        raw_center[axis] = (raw_min[axis] + raw_max[axis]) * 0.5;
-        raw_extent[axis] = raw_max[axis] - raw_min[axis];
+        raw_center[axis] =
+            (frame_min[SEGMENTATION_ASSET_FRAME_WORLD][axis] +
+             frame_max[SEGMENTATION_ASSET_FRAME_WORLD][axis]) * 0.5;
+        raw_extent[axis] =
+            frame_max[SEGMENTATION_ASSET_FRAME_WORLD][axis] -
+            frame_min[SEGMENTATION_ASSET_FRAME_WORLD][axis];
         if (raw_extent[axis] > raw_max_extent) raw_max_extent = raw_extent[axis];
     }
     if (!(raw_max_extent > 0.0) || !isfinite(raw_max_extent)) {
@@ -458,7 +512,8 @@ static trellis_status segmentation_normalize_asset_mesh(
     if (cache_anchor != NULL) {
         double anchor_extent[3];
         double anchor_max_extent = 0.0;
-        double ratio_drift = 0.0;
+        double frame_extent[2][3];
+        double frame_max_extent[2] = {0.0, 0.0};
         for (int axis = 0; axis < 3; ++axis) {
             target_center[axis] =
                 ((double) cache_anchor->anchor_aabb_min[axis] +
@@ -469,22 +524,46 @@ static trellis_status segmentation_normalize_asset_mesh(
             if (anchor_extent[axis] > anchor_max_extent) {
                 anchor_max_extent = anchor_extent[axis];
             }
+            for (int frame_index = 0; frame_index < 2; ++frame_index) {
+                frame_extent[frame_index][axis] =
+                    frame_max[frame_index][axis] - frame_min[frame_index][axis];
+                if (frame_extent[frame_index][axis] > frame_max_extent[frame_index]) {
+                    frame_max_extent[frame_index] = frame_extent[frame_index][axis];
+                }
+            }
         }
         if (!(anchor_max_extent > 0.0) || !isfinite(anchor_max_extent)) {
             return TRELLIS_STATUS_PARSE_ERROR;
         }
-        for (int axis = 0; axis < 3; ++axis) {
-            const double drift = fabs(
-                raw_extent[axis] / raw_max_extent -
-                anchor_extent[axis] / anchor_max_extent);
-            if (drift > ratio_drift) ratio_drift = drift;
-        }
-        if (ratio_drift > 0.05) {
+        const double world_drift = segmentation_extent_ratio_drift(
+            frame_extent[SEGMENTATION_ASSET_FRAME_WORLD],
+            frame_max_extent[SEGMENTATION_ASSET_FRAME_WORLD],
+            anchor_extent,
+            anchor_max_extent);
+        const double trellis_gltf_drift = segmentation_extent_ratio_drift(
+            frame_extent[SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF],
+            frame_max_extent[SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF],
+            anchor_extent,
+            anchor_max_extent);
+        selected_frame = trellis_gltf_drift + 1e-9 < world_drift ?
+            SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF :
+            SEGMENTATION_ASSET_FRAME_WORLD;
+        const double selected_drift = selected_frame ==
+                SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF ?
+            trellis_gltf_drift : world_drift;
+        if (selected_drift > 0.05) {
             TRELLIS_ERROR(
                 "mesh segmentation: latent cache belongs to incompatible geometry "
-                "(normalized extent drift %.2f%% > 5%%)",
-                ratio_drift * 100.0);
+                "(world drift %.2f%%, inverse TRELLIS glTF drift %.2f%%; both > 5%%)",
+                world_drift * 100.0,
+                trellis_gltf_drift * 100.0);
             return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        raw_max_extent = frame_max_extent[selected_frame];
+        for (int axis = 0; axis < 3; ++axis) {
+            raw_extent[axis] = frame_extent[selected_frame][axis];
+            raw_center[axis] =
+                (frame_min[selected_frame][axis] + frame_max[selected_frame][axis]) * 0.5;
         }
         target_max_extent = anchor_max_extent;
     }
@@ -497,13 +576,19 @@ static trellis_status segmentation_normalize_asset_mesh(
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
     const double scale = target_max_extent / raw_max_extent;
+    const float decoder_aabb_limit = trellis_shape_latent_decoder_aabb_limit(
+        cache_anchor != NULL ? cache_anchor->resolution : 512);
     for (size_t vertex = 0; vertex < asset->vertex_count; ++vertex) {
+        double decoder[3];
+        segmentation_position_in_decoder_frame(
+            asset->positions + vertex * 3u,
+            selected_frame,
+            decoder);
         for (int axis = 0; axis < 3; ++axis) {
             const float value = (float) (
-                ((double) asset->positions[vertex * 3u + (size_t) axis] -
-                 raw_center[axis]) * scale + target_center[axis]);
-            if (!isfinite(value) || value < -SEGMENTATION_AABB_LIMIT ||
-                value > SEGMENTATION_AABB_LIMIT) {
+                (decoder[axis] - raw_center[axis]) * scale + target_center[axis]);
+            if (!isfinite(value) || value < -decoder_aabb_limit ||
+                value > decoder_aabb_limit) {
                 free(vertices);
                 free(faces);
                 return TRELLIS_STATUS_PARSE_ERROR;
@@ -525,10 +610,13 @@ static trellis_status segmentation_normalize_asset_mesh(
     mesh_out->n_vertices = (int64_t) asset->vertex_count;
     mesh_out->n_faces = (int64_t) asset->triangle_count;
     TRELLIS_INFO(
-        "mesh segmentation: normalized world geometry vertices=%lld triangles=%lld scale=%.9g%s",
+        "mesh segmentation: normalized geometry vertices=%lld triangles=%lld "
+        "scale=%.9g frame=%s%s",
         (long long) mesh_out->n_vertices,
         (long long) mesh_out->n_faces,
         scale,
+        selected_frame == SEGMENTATION_ASSET_FRAME_TRELLIS_GLTF ?
+            "inverse-trellis-gltf" : "world",
         cache_anchor != NULL ? " (latent anchor aligned)" : "");
     return TRELLIS_STATUS_OK;
 }
@@ -783,6 +871,7 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
     int graph_backend_initialized = 0;
     int cpu_weight_backend_initialized = 0;
     int cuda_initialized = 0;
+    int shape_cache_anchor_hit = 0;
     int shape_cache_hit = 0;
     int texture_cache_hit = 0;
     int segmentation_cache_hit = 0;
@@ -898,11 +987,18 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         segmentation_path_is_set(options->texture_latent_path);
     const int segmentation_cache_requested =
         segmentation_path_is_set(options->segmentation_latent_path);
+    /* A shape latent can only be reused when its paired fixed-state latent is
+     * also cached with the exact same sparse coordinates. With a shape cache
+     * alone, retain its decoder-frame AABB for axis alignment but re-encode
+     * shape and source texture together from the current (possibly remeshed)
+     * GLB. */
+    const int shape_cache_reuse_requested = shape_cache_requested &&
+        (texture_cache_requested || segmentation_cache_requested);
     if (!segmentation_component_is(
             &base_package,
             "shape_decoder",
             "sparse_unet_vae_decoder") ||
-        (!shape_cache_requested && !segmentation_component_is(
+        (!shape_cache_reuse_requested && !segmentation_component_is(
             &base_package,
             "shape_encoder",
             "sparse_unet_vae_encoder")) ||
@@ -951,7 +1047,15 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
             &shape_latent,
             &shape_cache_info);
         if (status != TRELLIS_STATUS_OK) goto cleanup;
-        shape_cache_hit = 1;
+        shape_cache_anchor_hit = 1;
+        if (shape_cache_reuse_requested) {
+            shape_cache_hit = 1;
+        } else {
+            TRELLIS_INFO(
+                "mesh segmentation: shape latent cache anchor matched; "
+                "re-encoding shape with source texture to preserve sparse coordinates");
+            trellis_structured_latent_free(&shape_latent);
+        }
     }
     if (options->texture_latent_path != NULL &&
         options->texture_latent_path[0] != '\0') {
@@ -1102,10 +1206,10 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
             gltf_error);
         goto cleanup;
     }
-    const trellis_shape_latent_cache_info * cache_anchor = shape_cache_hit ?
+    const trellis_shape_latent_cache_info * cache_anchor = shape_cache_anchor_hit ?
         &shape_cache_info : (segmentation_cache_hit ?
             &segmentation_cache_info : (texture_cache_hit ? &texture_cache_info : NULL));
-    status = segmentation_normalize_asset_mesh(
+    status = trellis_mesh_segmentation_normalize_asset_mesh(
         &asset,
         cache_anchor,
         &normalized_mesh);

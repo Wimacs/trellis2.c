@@ -181,6 +181,34 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
         return TRELLIS_STATUS_OK;
     }
 
+    for (int64_t i = 0; i < n; ++i) {
+        if (coords[i * 4] != 0 ||
+            coords[i * 4 + 1] < 0 || coords[i * 4 + 1] >= resolution ||
+            coords[i * 4 + 2] < 0 || coords[i * 4 + 2] >= resolution ||
+            coords[i * 4 + 3] < 0 || coords[i * 4 + 3] >= resolution) {
+            TRELLIS_ERROR(
+                "flex dual grid: invalid decoder coordinate row=%lld "
+                "bxyz=(%d,%d,%d,%d) resolution=%d",
+                (long long) i,
+                coords[i * 4],
+                coords[i * 4 + 1],
+                coords[i * 4 + 2],
+                coords[i * 4 + 3],
+                resolution);
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        const float * f = feats + (size_t) i * (size_t) channels;
+        for (int channel = 0; channel < 7; ++channel) {
+            if (!isfinite(f[channel])) {
+                TRELLIS_ERROR(
+                    "flex dual grid: non-finite decoder logit row=%lld channel=%d",
+                    (long long) i,
+                    channel);
+                return TRELLIS_STATUS_PARSE_ERROR;
+            }
+        }
+    }
+
     trellis_status status = TRELLIS_STATUS_OK;
     fdg_hash h;
     if (!fdg_hash_init(&h, n)) {
@@ -189,6 +217,7 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
 
     float * vertices = (float *) malloc((size_t) n * 3u * sizeof(float));
     float * weights = (float *) malloc((size_t) n * sizeof(float));
+    int32_t * faces = NULL;
     if (vertices == NULL || weights == NULL) {
         free(vertices);
         free(weights);
@@ -201,6 +230,16 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
         const int32_t x = coords[i * 4 + 1];
         const int32_t y = coords[i * 4 + 2];
         const int32_t z = coords[i * 4 + 3];
+        if (fdg_hash_lookup(&h, x, y, z) >= 0) {
+            TRELLIS_ERROR(
+                "flex dual grid: duplicate decoder coordinate row=%lld xyz=(%d,%d,%d)",
+                (long long) i,
+                x,
+                y,
+                z);
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
         if (!fdg_hash_insert(&h, x, y, z, (int32_t) i)) {
             status = TRELLIS_STATUS_OUT_OF_MEMORY;
             goto cleanup;
@@ -226,7 +265,6 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
     }
 
     int64_t face_count = quads * 2;
-    int32_t * faces = NULL;
     if (face_count > 0) {
         faces = (int32_t *) malloc((size_t) face_count * 3u * sizeof(int32_t));
         if (faces == NULL) {
