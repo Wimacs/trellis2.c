@@ -150,6 +150,7 @@ set(TRELLIS2_C_SOURCES
     src/architectures/tokenskin/fsq_cvae.c
     src/architectures/tokenskin/qwen3.c
     src/tasks/mesh_rigging/gltf_io.c
+    src/tasks/mesh_rigging/source_appearance.c
     src/tasks/mesh_rigging/preprocess.c
     src/tasks/mesh_rigging/tokenizer.c
     src/tasks/mesh_rigging/tokenskin_features.c

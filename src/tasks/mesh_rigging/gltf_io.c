@@ -156,11 +156,68 @@ static void transform_position(const float matrix[16], const float input[3], flo
     output[2] = matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14];
 }
 
-static float matrix_linear_determinant(const float matrix[16]) {
+static double matrix_linear_determinant(const float matrix[16]) {
     return
-        matrix[0] * (matrix[5] * matrix[10] - matrix[9] * matrix[6]) -
-        matrix[4] * (matrix[1] * matrix[10] - matrix[9] * matrix[2]) +
-        matrix[8] * (matrix[1] * matrix[6] - matrix[5] * matrix[2]);
+        (double) matrix[0] * ((double) matrix[5] * matrix[10] - (double) matrix[9] * matrix[6]) -
+        (double) matrix[4] * ((double) matrix[1] * matrix[10] - (double) matrix[9] * matrix[2]) +
+        (double) matrix[8] * ((double) matrix[1] * matrix[6] - (double) matrix[5] * matrix[2]);
+}
+
+static int matrix_linear_is_singular(const float matrix[16]) {
+    double scale = 0.0;
+    static const int elements[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+    for (size_t i = 0; i < 9u; ++i) {
+        const double magnitude = fabs((double) matrix[elements[i]]);
+        if (magnitude > scale) scale = magnitude;
+    }
+    if (!(scale > 0.0) || !isfinite(scale)) return 1;
+    const double a = matrix[0] / scale;
+    const double b = matrix[4] / scale;
+    const double c = matrix[8] / scale;
+    const double d = matrix[1] / scale;
+    const double e = matrix[5] / scale;
+    const double f = matrix[9] / scale;
+    const double g = matrix[2] / scale;
+    const double h = matrix[6] / scale;
+    const double i = matrix[10] / scale;
+    const double determinant =
+        a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    return !isfinite(determinant) || fabs(determinant) <= 64.0 * DBL_EPSILON;
+}
+
+/* Applies inverse-transpose(linear(matrix)) without constructing an inverse.
+ * The cofactor matrix is the inverse-transpose up to a common determinant
+ * scale, which normalization removes. */
+static int transform_normal(const float matrix[16], const float input[3], float output[3]) {
+    const double determinant = matrix_linear_determinant(matrix);
+    if (matrix_linear_is_singular(matrix)) return 0;
+    double transformed[3];
+    transformed[0] =
+        ((double) matrix[5] * matrix[10] - (double) matrix[9] * matrix[6]) * input[0] +
+        ((double) matrix[9] * matrix[2] - (double) matrix[1] * matrix[10]) * input[1] +
+        ((double) matrix[1] * matrix[6] - (double) matrix[5] * matrix[2]) * input[2];
+    transformed[1] =
+        ((double) matrix[8] * matrix[6] - (double) matrix[4] * matrix[10]) * input[0] +
+        ((double) matrix[0] * matrix[10] - (double) matrix[8] * matrix[2]) * input[1] +
+        ((double) matrix[4] * matrix[2] - (double) matrix[0] * matrix[6]) * input[2];
+    transformed[2] =
+        ((double) matrix[4] * matrix[9] - (double) matrix[8] * matrix[5]) * input[0] +
+        ((double) matrix[8] * matrix[1] - (double) matrix[0] * matrix[9]) * input[1] +
+        ((double) matrix[0] * matrix[5] - (double) matrix[4] * matrix[1]) * input[2];
+    if (determinant < 0.0f) {
+        transformed[0] = -transformed[0];
+        transformed[1] = -transformed[1];
+        transformed[2] = -transformed[2];
+    }
+    const double length = sqrt(
+        transformed[0] * transformed[0] +
+        transformed[1] * transformed[1] +
+        transformed[2] * transformed[2]);
+    if (!(length > 0.0) || !isfinite(length)) return 0;
+    output[0] = (float) (transformed[0] / length);
+    output[1] = (float) (transformed[1] / length);
+    output[2] = (float) (transformed[2] / length);
+    return isfinite(output[0]) && isfinite(output[1]) && isfinite(output[2]);
 }
 
 static trellis_status read_primitive_index(
@@ -308,6 +365,148 @@ static void compute_normals_and_bounds(trellis_mesh_rigging_asset * asset) {
     }
 }
 
+static trellis_status preserve_source_shading_attributes(
+    const cgltf_data * data,
+    trellis_mesh_rigging_asset * asset,
+    char * error,
+    size_t error_size) {
+    for (size_t primitive_index = 0;
+         primitive_index < asset->primitive_count;
+         ++primitive_index) {
+        trellis_mesh_rigging_primitive_range * range =
+            &asset->primitives[primitive_index];
+        if (!range->has_source_normal && !range->has_source_tangent) continue;
+        if (range->source_node_index >= (size_t) data->nodes_count ||
+            range->source_mesh_index >= (size_t) data->meshes_count ||
+            range->source_primitive_index >= (size_t)
+                data->meshes[range->source_mesh_index].primitives_count) {
+            set_error(error, error_size, "source shading mapping is inconsistent");
+            return TRELLIS_STATUS_PARSE_ERROR;
+        }
+        const cgltf_node * node = &data->nodes[range->source_node_index];
+        const cgltf_primitive * primitive =
+            &data->meshes[range->source_mesh_index].primitives[
+                range->source_primitive_index];
+        float world[16];
+        cgltf_node_transform_world(node, world);
+        const double determinant = matrix_linear_determinant(world);
+        if (matrix_linear_is_singular(world)) {
+            set_error(
+                error,
+                error_size,
+                "node %zu has a singular transform that cannot preserve NORMAL/TANGENT",
+                range->source_node_index);
+            return TRELLIS_STATUS_NOT_IMPLEMENTED;
+        }
+
+        const cgltf_accessor * normal = cgltf_find_accessor(
+            primitive, cgltf_attribute_type_normal, 0);
+        if (range->has_source_normal) {
+            if (normal == NULL || normal->type != cgltf_type_vec3 ||
+                (size_t) normal->count != range->vertex_count) {
+                set_error(error, error_size, "source NORMAL accessor mapping is inconsistent");
+                return TRELLIS_STATUS_PARSE_ERROR;
+            }
+            for (size_t vertex = 0; vertex < range->vertex_count; ++vertex) {
+                float local[3];
+                float transformed[3];
+                if (!cgltf_accessor_read_float(normal, (cgltf_size) vertex, local, 3u) ||
+                    !isfinite(local[0]) || !isfinite(local[1]) || !isfinite(local[2]) ||
+                    !transform_normal(world, local, transformed)) {
+                    set_error(
+                        error,
+                        error_size,
+                        "failed to preserve finite NORMAL %zu from primitive %zu",
+                        vertex,
+                        primitive_index);
+                    return TRELLIS_STATUS_PARSE_ERROR;
+                }
+                memcpy(
+                    asset->normals + (range->first_vertex + vertex) * 3u,
+                    transformed,
+                    sizeof(transformed));
+            }
+        }
+
+        if (range->has_source_tangent) {
+            const cgltf_accessor * tangent = cgltf_find_accessor(
+                primitive, cgltf_attribute_type_tangent, 0);
+            if (asset->tangents == NULL || tangent == NULL ||
+                tangent->type != cgltf_type_vec4 ||
+                (size_t) tangent->count != range->vertex_count) {
+                set_error(error, error_size, "source TANGENT accessor mapping is inconsistent");
+                return TRELLIS_STATUS_PARSE_ERROR;
+            }
+            for (size_t vertex = 0; vertex < range->vertex_count; ++vertex) {
+                float local[4];
+                double transformed[3];
+                if (!cgltf_accessor_read_float(tangent, (cgltf_size) vertex, local, 4u) ||
+                    !isfinite(local[0]) || !isfinite(local[1]) ||
+                    !isfinite(local[2]) || !isfinite(local[3])) {
+                    set_error(
+                        error,
+                        error_size,
+                        "failed to read finite TANGENT %zu from primitive %zu",
+                        vertex,
+                        primitive_index);
+                    return TRELLIS_STATUS_PARSE_ERROR;
+                }
+                transformed[0] =
+                    (double) world[0] * local[0] +
+                    (double) world[4] * local[1] +
+                    (double) world[8] * local[2];
+                transformed[1] =
+                    (double) world[1] * local[0] +
+                    (double) world[5] * local[1] +
+                    (double) world[9] * local[2];
+                transformed[2] =
+                    (double) world[2] * local[0] +
+                    (double) world[6] * local[1] +
+                    (double) world[10] * local[2];
+                const float * final_normal =
+                    asset->normals + (range->first_vertex + vertex) * 3u;
+                const double projection =
+                    transformed[0] * final_normal[0] +
+                    transformed[1] * final_normal[1] +
+                    transformed[2] * final_normal[2];
+                transformed[0] -= projection * final_normal[0];
+                transformed[1] -= projection * final_normal[1];
+                transformed[2] -= projection * final_normal[2];
+                const double tangent_length = sqrt(
+                    transformed[0] * transformed[0] +
+                    transformed[1] * transformed[1] +
+                    transformed[2] * transformed[2]);
+                if (!(tangent_length > 0.0) || !isfinite(tangent_length)) {
+                    set_error(
+                        error,
+                        error_size,
+                        "TANGENT %zu from primitive %zu collapses under the world transform",
+                        vertex,
+                        primitive_index);
+                    return TRELLIS_STATUS_PARSE_ERROR;
+                }
+                float * output =
+                    asset->tangents + (range->first_vertex + vertex) * 4u;
+                output[0] = (float) (transformed[0] / tangent_length);
+                output[1] = (float) (transformed[1] / tangent_length);
+                output[2] = (float) (transformed[2] / tangent_length);
+                output[3] = determinant < 0.0f ? -local[3] : local[3];
+                if (!isfinite(output[0]) || !isfinite(output[1]) ||
+                    !isfinite(output[2]) || !isfinite(output[3])) {
+                    set_error(
+                        error,
+                        error_size,
+                        "world-space TANGENT %zu from primitive %zu is non-finite",
+                        vertex,
+                        primitive_index);
+                    return TRELLIS_STATUS_PARSE_ERROR;
+                }
+            }
+        }
+    }
+    return TRELLIS_STATUS_OK;
+}
+
 void trellis_mesh_rigging_asset_free(trellis_mesh_rigging_asset * asset) {
     if (asset == NULL) {
         return;
@@ -315,12 +514,19 @@ void trellis_mesh_rigging_asset_free(trellis_mesh_rigging_asset * asset) {
     free(asset->source_path);
     free(asset->positions);
     free(asset->normals);
+    free(asset->tangents);
     if (asset->texcoords != NULL) {
         for (size_t set = 0; set < asset->texcoord_set_count; ++set) {
             free(asset->texcoords[set]);
         }
     }
     free(asset->texcoords);
+    if (asset->colors != NULL) {
+        for (size_t set = 0; set < asset->color_set_count; ++set) {
+            free(asset->colors[set]);
+        }
+    }
+    free(asset->colors);
     free(asset->face_normals);
     free(asset->triangles);
     free(asset->primitives);
@@ -366,6 +572,8 @@ trellis_status trellis_mesh_rigging_gltf_load(
     size_t triangle_count = 0;
     size_t primitive_count = 0;
     uint64_t texcoord_sets_used = 0;
+    uint64_t color_sets_used = 0;
+    int tangents_used = 0;
     trellis_status status = TRELLIS_STATUS_OK;
     for (size_t node_index = 0; node_index < (size_t) data->nodes_count; ++node_index) {
         const cgltf_node * node = &data->nodes[node_index];
@@ -383,21 +591,29 @@ trellis_status trellis_mesh_rigging_gltf_load(
                  attribute_index < (size_t) primitive->attributes_count;
                  ++attribute_index) {
                 const cgltf_attribute * attribute = &primitive->attributes[attribute_index];
-                if (attribute->type != cgltf_attribute_type_texcoord) {
+                if (attribute->type == cgltf_attribute_type_tangent) {
+                    tangents_used = 1;
                     continue;
                 }
+                if (attribute->type != cgltf_attribute_type_texcoord &&
+                    attribute->type != cgltf_attribute_type_color) continue;
                 if (attribute->index < 0 || attribute->index >= 64) {
                     set_error(
                         error_out,
                         error_size,
-                        "TEXCOORD_%d on node %zu primitive %zu exceeds the 64-set preservation limit",
+                        "%s_%d on node %zu primitive %zu exceeds the 64-set preservation limit",
+                        attribute->type == cgltf_attribute_type_texcoord ? "TEXCOORD" : "COLOR",
                         attribute->index,
                         node_index,
                         primitive_index);
                     cgltf_free(data);
                     return TRELLIS_STATUS_NOT_IMPLEMENTED;
                 }
-                texcoord_sets_used |= UINT64_C(1) << (unsigned) attribute->index;
+                if (attribute->type == cgltf_attribute_type_texcoord) {
+                    texcoord_sets_used |= UINT64_C(1) << (unsigned) attribute->index;
+                } else {
+                    color_sets_used |= UINT64_C(1) << (unsigned) attribute->index;
+                }
             }
             size_t primitive_vertices = 0;
             size_t primitive_triangles = 0;
@@ -444,6 +660,16 @@ trellis_status trellis_mesh_rigging_gltf_load(
     asset.source_path = duplicate_string(path);
     asset.positions = (float *) malloc(position_values * sizeof(float));
     asset.normals = (float *) malloc(position_values * sizeof(float));
+    if (tangents_used) {
+        size_t tangent_values = 0;
+        if (!multiply_size(vertex_count, 4u, &tangent_values)) {
+            set_error(error_out, error_size, "tangent allocation size overflow");
+            trellis_mesh_rigging_asset_free(&asset);
+            cgltf_free(data);
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+        asset.tangents = (float *) calloc(tangent_values, sizeof(float));
+    }
     asset.face_normals = (float *) malloc(triangle_values * sizeof(float));
     asset.triangles = (uint32_t *) malloc(triangle_values * sizeof(uint32_t));
     asset.primitives = (trellis_mesh_rigging_primitive_range *) calloc(
@@ -477,9 +703,36 @@ trellis_status trellis_mesh_rigging_gltf_load(
             }
         }
     }
+    if (color_sets_used != 0) {
+        for (size_t set = 64u; set > 0; --set) {
+            if ((color_sets_used & (UINT64_C(1) << (set - 1u))) != 0) {
+                asset.color_set_count = set;
+                break;
+            }
+        }
+        asset.colors = (float **) calloc(
+            asset.color_set_count, sizeof(*asset.colors));
+        if (asset.colors != NULL) {
+            size_t color_values = 0;
+            if (!multiply_size(vertex_count, 4u, &color_values)) {
+                set_error(error_out, error_size, "vertex-color allocation size overflow");
+                trellis_mesh_rigging_asset_free(&asset);
+                cgltf_free(data);
+                return TRELLIS_STATUS_OUT_OF_MEMORY;
+            }
+            for (size_t set = 0; set < asset.color_set_count; ++set) {
+                if ((color_sets_used & (UINT64_C(1) << set)) != 0) {
+                    asset.colors[set] = (float *) calloc(
+                        color_values, sizeof(float));
+                }
+            }
+        }
+    }
     if (asset.source_path == NULL || asset.positions == NULL || asset.normals == NULL ||
         asset.face_normals == NULL || asset.triangles == NULL || asset.primitives == NULL ||
-        (texcoord_sets_used != 0 && asset.texcoords == NULL)) {
+        (tangents_used && asset.tangents == NULL) ||
+        (texcoord_sets_used != 0 && asset.texcoords == NULL) ||
+        (color_sets_used != 0 && asset.colors == NULL)) {
         set_error(error_out, error_size, "out of memory allocating flattened mesh");
         trellis_mesh_rigging_asset_free(&asset);
         cgltf_free(data);
@@ -489,6 +742,15 @@ trellis_status trellis_mesh_rigging_gltf_load(
         if ((texcoord_sets_used & (UINT64_C(1) << set)) != 0 &&
             asset.texcoords[set] == NULL) {
             set_error(error_out, error_size, "out of memory allocating flattened texture coordinates");
+            trellis_mesh_rigging_asset_free(&asset);
+            cgltf_free(data);
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    for (size_t set = 0; set < asset.color_set_count; ++set) {
+        if ((color_sets_used & (UINT64_C(1) << set)) != 0 &&
+            asset.colors[set] == NULL) {
+            set_error(error_out, error_size, "out of memory allocating flattened vertex colors");
             trellis_mesh_rigging_asset_free(&asset);
             cgltf_free(data);
             return TRELLIS_STATUS_OUT_OF_MEMORY;
@@ -593,6 +855,81 @@ trellis_status trellis_mesh_rigging_gltf_load(
                 }
                 primitive_texcoord_mask |= UINT64_C(1) << set;
             }
+            const cgltf_accessor * source_normal = cgltf_find_accessor(
+                primitive, cgltf_attribute_type_normal, 0);
+            if (source_normal != NULL &&
+                (source_normal->type != cgltf_type_vec3 ||
+                 (size_t) source_normal->count != primitive_vertices)) {
+                set_error(
+                    error_out,
+                    error_size,
+                    "NORMAL on node %zu primitive %zu must be a VEC3 with %zu elements",
+                    node_index,
+                    primitive_index,
+                    primitive_vertices);
+                status = TRELLIS_STATUS_PARSE_ERROR;
+                goto cleanup;
+            }
+            const cgltf_accessor * source_tangent = cgltf_find_accessor(
+                primitive, cgltf_attribute_type_tangent, 0);
+            if (source_tangent != NULL &&
+                (source_tangent->type != cgltf_type_vec4 ||
+                 (size_t) source_tangent->count != primitive_vertices)) {
+                set_error(
+                    error_out,
+                    error_size,
+                    "TANGENT on node %zu primitive %zu must be a VEC4 with %zu elements",
+                    node_index,
+                    primitive_index,
+                    primitive_vertices);
+                status = TRELLIS_STATUS_PARSE_ERROR;
+                goto cleanup;
+            }
+            uint64_t primitive_color_mask = 0;
+            uint64_t primitive_color_vec4_mask = 0;
+            for (size_t set = 0; set < asset.color_set_count; ++set) {
+                const cgltf_accessor * color = cgltf_find_accessor(
+                    primitive, cgltf_attribute_type_color, (cgltf_int) set);
+                if (color == NULL) continue;
+                if ((color->type != cgltf_type_vec3 && color->type != cgltf_type_vec4) ||
+                    (size_t) color->count != primitive_vertices) {
+                    set_error(
+                        error_out,
+                        error_size,
+                        "COLOR_%zu on node %zu primitive %zu must be a VEC3/VEC4 with %zu elements",
+                        set,
+                        node_index,
+                        primitive_index,
+                        primitive_vertices);
+                    status = TRELLIS_STATUS_PARSE_ERROR;
+                    goto cleanup;
+                }
+                const size_t components = color->type == cgltf_type_vec4 ? 4u : 3u;
+                for (size_t vertex = 0; vertex < primitive_vertices; ++vertex) {
+                    float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    if (!cgltf_accessor_read_float(
+                            color, (cgltf_size) vertex, value, components) ||
+                        !isfinite(value[0]) || !isfinite(value[1]) ||
+                        !isfinite(value[2]) || !isfinite(value[3])) {
+                        set_error(
+                            error_out,
+                            error_size,
+                            "failed to read finite COLOR_%zu element %zu from node %zu primitive %zu",
+                            set,
+                            vertex,
+                            node_index,
+                            primitive_index);
+                        status = TRELLIS_STATUS_PARSE_ERROR;
+                        goto cleanup;
+                    }
+                    memcpy(
+                        asset.colors[set] + (vertex_cursor + vertex) * 4u,
+                        value,
+                        sizeof(value));
+                }
+                primitive_color_mask |= UINT64_C(1) << set;
+                if (components == 4u) primitive_color_vec4_mask |= UINT64_C(1) << set;
+            }
             status = append_primitive_triangles(
                 primitive,
                 primitive_vertices,
@@ -619,7 +956,11 @@ trellis_status trellis_mesh_rigging_gltf_load(
             range->source_position_accessor_index = (size_t) (position - data->accessors);
             range->source_material_index = primitive->material != NULL ?
                 (size_t) (primitive->material - data->materials) : SIZE_MAX;
+            range->has_source_normal = source_normal != NULL;
+            range->has_source_tangent = source_tangent != NULL;
             range->texcoord_mask = primitive_texcoord_mask;
+            range->color_mask = primitive_color_mask;
+            range->color_vec4_mask = primitive_color_vec4_mask;
             vertex_cursor += primitive_vertices;
             triangle_cursor += primitive_triangles;
         }
@@ -632,6 +973,9 @@ trellis_status trellis_mesh_rigging_gltf_load(
     }
 
     compute_normals_and_bounds(&asset);
+    status = preserve_source_shading_attributes(
+        data, &asset, error_out, error_size);
+    if (status != TRELLIS_STATUS_OK) goto cleanup;
     *asset_out = asset;
     cgltf_free(data);
     return TRELLIS_STATUS_OK;

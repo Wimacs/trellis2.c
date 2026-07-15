@@ -27,6 +27,12 @@ typedef struct trellis_mesh_rigging_primitive_range {
     /* Bit N is set when the source primitive contains TEXCOORD_N.  The
      * corresponding flattened values live in asset->texcoords[N]. */
     uint64_t texcoord_mask;
+    int has_source_normal;
+    int has_source_tangent;
+    /* COLOR_n values are expanded to float4 in asset->colors[N]. The vec4
+     * mask distinguishes source VEC4 colors from source VEC3 colors. */
+    uint64_t color_mask;
+    uint64_t color_vec4_mask;
 } trellis_mesh_rigging_primitive_range;
 
 /* Task-private, inference-oriented representation of a glTF asset.  Positions
@@ -36,12 +42,20 @@ typedef struct trellis_mesh_rigging_primitive_range {
 typedef struct trellis_mesh_rigging_asset {
     char * source_path;
     float * positions;     /* [vertex_count, 3], world space */
-    float * normals;       /* [vertex_count, 3], area-weighted unit normals */
+    /* [vertex_count, 3], source normals transformed by the inverse-transpose
+     * world matrix when supplied, otherwise area-weighted generated normals. */
+    float * normals;
+    /* Optional source TANGENT, transformed to world space and orthogonalized
+     * against the final normal. */
+    float * tangents;      /* [vertex_count, 4] or NULL */
     /* One optional [vertex_count, 2] float array per source TEXCOORD set.
      * Gaps are NULL.  Flattening keeps accessor element order, so these UVs
      * can be emitted alongside the generated JOINTS_0/WEIGHTS_0 attributes. */
     float ** texcoords;
     size_t texcoord_set_count;
+    /* Optional source COLOR_n arrays, expanded to [vertex_count, 4]. */
+    float ** colors;
+    size_t color_set_count;
     float * face_normals;  /* [triangle_count, 3], unit normals */
     uint32_t * triangles;  /* [triangle_count, 3], indices into positions */
     trellis_mesh_rigging_primitive_range * primitives;
@@ -53,7 +67,7 @@ typedef struct trellis_mesh_rigging_asset {
 } trellis_mesh_rigging_asset;
 
 #define TRELLIS_MESH_RIGGING_ASSET_INIT \
-    { NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, \
+    { NULL, NULL, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, NULL, 0, 0, 0, \
       { 0, 0, 0 }, { 0, 0, 0 } }
 
 /* Loads .glb or .gltf (including external/data-URI buffers), expands indexed or

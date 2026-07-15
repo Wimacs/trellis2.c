@@ -310,7 +310,12 @@ def scene_triangle_multiset(
     return triangles
 
 
-def verify_parts(document: dict[str, Any], binary: bytes, expected_faces: int) -> int:
+def verify_parts(
+    document: dict[str, Any],
+    binary: bytes,
+    expected_faces: int,
+    source_material_count: int,
+) -> int:
     scenes = document.get("scenes", [])
     nodes = document.get("nodes", [])
     if (document.get("scene", 0) != 0 or len(scenes) != 1 or
@@ -328,7 +333,6 @@ def verify_parts(document: dict[str, Any], binary: bytes, expected_faces: int) -
     if len(nodes) != len(children) + 1 or len(document.get("meshes", [])) != len(children):
         raise AssertionError("parts GLB must have one node and one mesh per part")
     mesh_indices: list[int] = []
-    material_indices: list[int] = []
     part_ids: list[int] = []
     total_faces = 0
     for expected_part_id, child_index in enumerate(children):
@@ -345,25 +349,31 @@ def verify_parts(document: dict[str, Any], binary: bytes, expected_faces: int) -
         if mesh_index < 0 or mesh_index >= len(meshes):
             raise AssertionError("part node references an invalid mesh")
         primitives = document["meshes"][mesh_index].get("primitives", [])
-        if len(primitives) != 1 or not isinstance(primitives[0].get("material"), int):
-            raise AssertionError("each part mesh must have one materialized primitive")
-        material_index = primitives[0]["material"]
-        if material_index < 0 or material_index >= len(document.get("materials", [])):
-            raise AssertionError("part primitive references an invalid material")
+        if not primitives:
+            raise AssertionError("each part mesh must have at least one primitive")
         mesh_indices.append(mesh_index)
-        material_indices.append(material_index)
         part_ids.append(part_id)
-        total_faces += len(primitive_triangles(
-            document, binary, primitives[0], IDENTITY_MATRIX
-        ))
+        for primitive in primitives:
+            material_index = primitive.get("material")
+            if (not isinstance(material_index, int) or material_index < 0 or
+                    material_index >= len(document.get("materials", []))):
+                raise AssertionError("part primitive references an invalid material")
+            total_faces += len(primitive_triangles(
+                document, binary, primitive, IDENTITY_MATRIX
+            ))
     if len(set(mesh_indices)) != len(children):
         raise AssertionError("each part node must own a distinct mesh")
     if sorted(part_ids) != list(range(len(children))):
         raise AssertionError("part ids must be dense and zero-based")
-    if len(document.get("materials", [])) != len(children):
-        raise AssertionError("each part must own a material")
-    if sorted(material_indices) != list(range(len(children))):
-        raise AssertionError("part materials must be unique and one-to-one")
+    output_material_count = len(document.get("materials", []))
+    expected_material_counts = {
+        max(source_material_count, 1),
+        source_material_count + 1,
+    }
+    if output_material_count not in expected_material_counts:
+        raise AssertionError(
+            "parts must share source materials, with at most one implicit-material fallback"
+        )
     if total_faces != expected_faces:
         raise AssertionError(
             f"parts contain {total_faces} faces, expected exactly {expected_faces}"
@@ -424,7 +434,12 @@ def main() -> int:
                 f"automatic SegviGen pipeline exited {completed.returncode}"
             )
         output_document, output_binary = read_glb(output)
-        part_count = verify_parts(output_document, output_binary, expected_faces)
+        part_count = verify_parts(
+            output_document,
+            output_binary,
+            expected_faces,
+            len(input_document.get("materials", [])),
+        )
         output_triangles = scene_triangle_multiset(output_document, output_binary)
         if output_triangles != input_triangles:
             missing = sum((input_triangles - output_triangles).values())

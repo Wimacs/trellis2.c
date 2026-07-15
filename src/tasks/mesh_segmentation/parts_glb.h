@@ -13,7 +13,12 @@ extern "C" {
 /* Writes one self-contained GLB with an assembly root and one independently
  * selectable node+mesh per dense part id. Geometry remains in the flattened
  * source glTF world coordinate system. Each input face is emitted exactly
- * once, and vertices shared across part boundaries are duplicated. */
+ * once, and vertices shared across part boundaries are duplicated. A part is
+ * split into one primitive per source primitive instance so original material
+ * assignments and vertex-attribute layouts remain intact. Source materials,
+ * textures, samplers, and images are retained; images are embedded in the GLB.
+ * Unsupported lossless-preservation cases fail explicitly rather than falling
+ * back to per-part debug colors. */
 trellis_status trellis_mesh_segmentation_write_parts_glb(
     const char * path,
     const trellis_mesh_rigging_asset * asset,
