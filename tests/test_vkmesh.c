@@ -377,6 +377,45 @@ static int test_cli_cleanup(const char * vkmesh_path) {
     return 1;
 }
 
+static int test_cli_remove_relative_degenerate_face(const char * vkmesh_path) {
+    static const float vertices[18] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        2.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        2.0f, 1.0e-13f, 0.0f,
+    };
+    static const int32_t faces[6] = {
+        0, 1, 2,
+        3, 4, 5,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_relative_degenerate_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_relative_degenerate_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 6, faces, 2));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--remove-degenerate-faces",
+        (char *) "--degenerate-abs", (char *) "1e-24",
+        (char *) "--degenerate-rel", (char *) "1e-12",
+        (char *) "--no-fill-holes", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 3 && mesh.n_faces == 1);
+    CHECK_TRUE(mesh_has_well_conditioned_triangles(&mesh));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
 static int test_cli_simplify(const char * vkmesh_path) {
     enum { grid_size = 9, vertex_count = grid_size * grid_size,
            face_count = (grid_size - 1) * (grid_size - 1) * 2 };
@@ -1125,6 +1164,7 @@ int main(int argc, char ** argv) {
         return 77;
     }
     (void) test_cli_cleanup(argv[1]);
+    (void) test_cli_remove_relative_degenerate_face(argv[1]);
     (void) test_cli_simplify(argv[1]);
     (void) test_cli_simplify_rejects_self_edge(argv[1]);
     (void) test_cli_simplify_rejects_collinear_collapse(argv[1]);

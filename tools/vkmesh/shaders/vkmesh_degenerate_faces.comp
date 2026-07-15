@@ -47,6 +47,9 @@ void main() {
     vec3 e2 = a - c;
     float max_edge_len = max(max(length(e0), length(e1)), length(e2));
     float area = 0.5 * length(cross(e0, c - a));
-    float thresh = min(p.rel_eps * max_edge_len * max_edge_len, p.eps);
+    // Reject a face when it violates either the absolute floor or the
+    // scale-relative floor.  Taking min() here made the tiny default absolute
+    // epsilon effectively disable the relative test on ordinary meshes.
+    float thresh = max(p.rel_eps * max_edge_len * max_edge_len, p.eps);
     out_data[face_id] = area >= thresh ? 1u : 0u;
 }
