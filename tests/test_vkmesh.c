@@ -1042,6 +1042,79 @@ static int test_api_validation(void) {
     return 1;
 }
 
+static int test_api_workspace_oom_is_fatal(void) {
+    enum { VERTEX_COUNT = 65536, FACE_COUNT = 100000 };
+    const size_t vertex_words = (size_t) VERTEX_COUNT * 3u;
+    const size_t face_words = (size_t) FACE_COUNT * 3u;
+    const size_t vertex_bytes = vertex_words * sizeof(float);
+    const size_t face_bytes = face_words * sizeof(int32_t);
+    float * vertices = (float *) malloc(vertex_bytes);
+    float * vertices_before = (float *) malloc(vertex_bytes);
+    int32_t * faces = (int32_t *) malloc(face_bytes);
+    int32_t * faces_before = (int32_t *) malloc(face_bytes);
+    if (vertices == NULL || vertices_before == NULL || faces == NULL || faces_before == NULL) {
+        free(vertices);
+        free(vertices_before);
+        free(faces);
+        free(faces_before);
+        CHECK_TRUE(0 && "workspace OOM test fixture allocation");
+    }
+
+    for (int i = 0; i < VERTEX_COUNT; ++i) {
+        vertices[(size_t) i * 3u + 0u] = (float) (i % 257) / 257.0f;
+        vertices[(size_t) i * 3u + 1u] = (float) ((i / 257) % 257) / 257.0f;
+        vertices[(size_t) i * 3u + 2u] = (float) (i % 31) / 31.0f;
+    }
+    for (int i = 0; i < FACE_COUNT; ++i) {
+        int32_t base = (int32_t) (((uint32_t) i * 3u) % (VERTEX_COUNT - 2u));
+        faces[(size_t) i * 3u + 0u] = base;
+        faces[(size_t) i * 3u + 1u] = base + 1;
+        faces[(size_t) i * 3u + 2u] = base + 2;
+    }
+    memcpy(vertices_before, vertices, vertex_bytes);
+    memcpy(faces_before, faces, face_bytes);
+
+    trellis_mesh_host input;
+    trellis_mesh_host output;
+    trellis_mesh_host projection;
+    trellis_vkmesh_postprocess_options options;
+    memset(&input, 0, sizeof(input));
+    memset(&output, 0, sizeof(output));
+    memset(&projection, 0, sizeof(projection));
+    memset(&options, 0, sizeof(options));
+    input.vertices = vertices;
+    input.faces = faces;
+    input.n_vertices = VERTEX_COUNT;
+    input.n_faces = FACE_COUNT;
+    options.no_simplify = 1;
+    options.device = 0;
+    options.gpu_workspace_budget_mib = 1;
+
+    trellis_status status = trellis_vkmesh_postprocess(
+        &input, &output, &projection, &options);
+    const int input_unchanged =
+        input.vertices == vertices && input.faces == faces &&
+        input.n_vertices == VERTEX_COUNT && input.n_faces == FACE_COUNT &&
+        memcmp(vertices, vertices_before, vertex_bytes) == 0 &&
+        memcmp(faces, faces_before, face_bytes) == 0;
+    const int outputs_empty =
+        output.vertices == NULL && output.faces == NULL &&
+        output.n_vertices == 0 && output.n_faces == 0 &&
+        projection.vertices == NULL && projection.faces == NULL &&
+        projection.n_vertices == 0 && projection.n_faces == 0;
+
+    trellis_mesh_free(&output);
+    trellis_mesh_free(&projection);
+    free(vertices);
+    free(vertices_before);
+    free(faces);
+    free(faces_before);
+    CHECK_TRUE(status == TRELLIS_STATUS_OUT_OF_MEMORY);
+    CHECK_TRUE(input_unchanged);
+    CHECK_TRUE(outputs_empty);
+    return 1;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/vkmesh\n", argv[0]);
@@ -1063,6 +1136,7 @@ int main(int argc, char ** argv) {
     (void) test_remesh_workspace_chunking(argv[1]);
     (void) test_api_concurrent();
     (void) test_api_validation();
+    (void) test_api_workspace_oom_is_fatal();
     (void) test_gltf_bake();
     if (g_failures != 0) {
         fprintf(stderr, "vkmesh tests failed: %d failure(s)\n", g_failures);

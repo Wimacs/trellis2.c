@@ -337,9 +337,43 @@ typedef enum vkmesh_error_kind {
 } vkmesh_error_kind;
 
 static VKMESH_THREAD_LOCAL vkmesh_error_kind g_vkmesh_last_error = VKMESH_ERROR_NONE;
+static VKMESH_THREAD_LOCAL int g_vkmesh_fatal_error_reported = 0;
 
 static void vkmesh_set_error(vkmesh_error_kind error) {
-    g_vkmesh_last_error = error;
+    if (error != VKMESH_ERROR_NONE && g_vkmesh_last_error == VKMESH_ERROR_NONE) {
+        g_vkmesh_last_error = error;
+    }
+}
+
+static void vkmesh_begin_operation(void) {
+    g_vkmesh_last_error = VKMESH_ERROR_NONE;
+    g_vkmesh_fatal_error_reported = 0;
+}
+
+static const char * vkmesh_error_name(vkmesh_error_kind error) {
+    switch (error) {
+        case VKMESH_ERROR_INVALID_ARGUMENT: return "invalid argument";
+        case VKMESH_ERROR_OUT_OF_MEMORY: return "out of memory";
+        case VKMESH_ERROR_VULKAN_UNAVAILABLE: return "Vulkan unavailable";
+        case VKMESH_ERROR_VULKAN: return "Vulkan runtime error";
+        default: return "no explicit error";
+    }
+}
+
+/* A zero error preserves the existing algorithm-alternate behavior. Once a
+   concrete failure has been recorded, retrying the same workload through
+   another Vulkan-heavy path only hides the cause and can turn OOM into a
+   minutes-long CPU/Vulkan retry chain. */
+static int vkmesh_fatal_error_blocks_fallback(const char * stage) {
+    if (g_vkmesh_last_error == VKMESH_ERROR_NONE) return 0;
+    if (!g_vkmesh_fatal_error_reported) {
+        fprintf(stderr,
+            "vkmesh: %s failed with %s; refusing fallback\n",
+            stage != NULL ? stage : "operation",
+            vkmesh_error_name(g_vkmesh_last_error));
+        g_vkmesh_fatal_error_reported = 1;
+    }
+    return 1;
 }
 
 static int vkmesh_check_vk_result(const char * operation, VkResult result) {
@@ -917,19 +951,24 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
     VkResult result = vkCreateInstance(&instance_info, NULL, &vk->instance);
-    if (!vkmesh_check_vk_result("vkCreateInstance", result)) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+    if (result != VK_SUCCESS) {
+        if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        }
+        (void) vkmesh_check_vk_result("vkCreateInstance", result);
         return 0;
     }
 
     uint32_t physical_count = 0;
     result = vkEnumeratePhysicalDevices(vk->instance, &physical_count, NULL);
     if (result != VK_SUCCESS || physical_count == 0) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         if (result != VK_SUCCESS) {
+            if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+            }
             (void) vkmesh_check_vk_result("vkEnumeratePhysicalDevices(count)", result);
-            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         } else {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
             fprintf(stderr, "vkmesh: no Vulkan physical devices\n");
         }
         return 0;
@@ -1004,8 +1043,11 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     result = vkCreateDevice(vk->physical_device, &device_info, NULL, &vk->device);
-    if (!vkmesh_check_vk_result("vkCreateDevice", result)) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+    if (result != VK_SUCCESS) {
+        if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        }
+        (void) vkmesh_check_vk_result("vkCreateDevice", result);
         return 0;
     }
     vkGetDeviceQueue(vk->device, vk->queue_family, 0, &vk->queue);
@@ -1102,8 +1144,7 @@ static int vkmesh_submit_and_wait(vkmesh_vk * vk, const VkSubmitInfo * submit) {
         result = vkWaitForFences(vk->device, 1, &vk->completion_fence, VK_TRUE, UINT64_MAX);
     }
     if (result != VK_SUCCESS) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN);
-        fprintf(stderr, "vkmesh: Vulkan submit/wait failed: VkResult=%d\n", (int) result);
+        (void) vkmesh_check_vk_result("Vulkan submit/wait", result);
         return 0;
     }
     return 1;
@@ -1142,12 +1183,14 @@ static int vkmesh_dispatch(
     const vkmesh_push * push,
     uint32_t groups_x) {
     vkmesh_update_descriptor_set(vk, buffers);
-    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
+    VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (!vkmesh_check_vk_result("vkResetCommandBuffer", result)) return 0;
 
     VkCommandBufferBeginInfo begin;
     memset(&begin, 0, sizeof(begin));
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+    if (!vkmesh_check_vk_result("vkBeginCommandBuffer", result)) return 0;
     vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
     vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
     vkCmdPushConstants(vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push), push);
@@ -1162,7 +1205,8 @@ static int vkmesh_dispatch(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
         0, 1, &barrier, 0, NULL, 0, NULL);
-    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkEndCommandBuffer", result)) return 0;
 
     VkSubmitInfo submit;
     memset(&submit, 0, sizeof(submit));
@@ -1196,11 +1240,13 @@ static int vkmesh_dispatch_pair(
     vkmesh_update_descriptor_set_handle(vk, sets[1], second_buffers);
 
     int ok = 0;
-    if (vkResetCommandBuffer(vk->command_buffer, 0) == VK_SUCCESS) {
+    result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (vkmesh_check_vk_result("vkResetCommandBuffer(batch)", result)) {
         VkCommandBufferBeginInfo begin;
         memset(&begin, 0, sizeof(begin));
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        if (vkBeginCommandBuffer(vk->command_buffer, &begin) == VK_SUCCESS) {
+        result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+        if (vkmesh_check_vk_result("vkBeginCommandBuffer(batch)", result)) {
             vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[first_kind]);
             vkCmdBindDescriptorSets(
                 vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &sets[0], 0, NULL);
@@ -1236,7 +1282,8 @@ static int vkmesh_dispatch_pair(
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                 0, 1, &barrier, 0, NULL, 0, NULL);
-            if (vkEndCommandBuffer(vk->command_buffer) == VK_SUCCESS) {
+            result = vkEndCommandBuffer(vk->command_buffer);
+            if (vkmesh_check_vk_result("vkEndCommandBuffer(batch)", result)) {
                 VkSubmitInfo submit;
                 memset(&submit, 0, sizeof(submit));
                 submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1297,12 +1344,14 @@ static int vkmesh_sort_records_vulkan(
     buffers[2] = *dummy;
     buffers[3] = *dummy;
     vkmesh_update_descriptor_set(vk, buffers);
-    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) goto cleanup;
+    VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (!vkmesh_check_vk_result("vkResetCommandBuffer(sort)", result)) goto cleanup;
 
     VkCommandBufferBeginInfo begin;
     memset(&begin, 0, sizeof(begin));
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) goto cleanup;
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+    if (!vkmesh_check_vk_result("vkBeginCommandBuffer(sort)", result)) goto cleanup;
 
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
@@ -1366,7 +1415,8 @@ static int vkmesh_sort_records_vulkan(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
         0, 1, &barrier, 0, NULL, 0, NULL);
-    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) goto cleanup;
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkEndCommandBuffer(sort)", result)) goto cleanup;
 
     VkSubmitInfo submit;
     memset(&submit, 0, sizeof(submit));
@@ -2962,6 +3012,7 @@ static int get_boundary_edges(
     vkmesh_boundary_edge ** boundary_out,
     int64_t * boundary_count_out) {
     if (get_boundary_edges_vulkan(mesh, boundary_out, boundary_count_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("boundary-edge Vulkan path")) return 0;
     return get_boundary_edges_fallback(mesh, boundary_out, boundary_count_out);
 }
 
@@ -3104,6 +3155,7 @@ static int get_manifold_face_pairs(
     vkmesh_face_pair ** pairs_out,
     int64_t * pair_count_out) {
     if (get_manifold_face_pairs_vulkan(mesh, pairs_out, pair_count_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("manifold-pair Vulkan path")) return 0;
     return get_manifold_face_pairs_cpu(mesh, pairs_out, pair_count_out);
 }
 
@@ -3379,6 +3431,7 @@ static int vkmesh_repair_non_manifold_edges_cpu(vkmesh_mesh * mesh, int * old_ve
 
 static int vkmesh_repair_non_manifold_edges(vkmesh_mesh * mesh, int * old_vertices, int * new_vertices) {
     if (vkmesh_repair_non_manifold_edges_vulkan(mesh, old_vertices, new_vertices)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("non-manifold repair Vulkan path")) return 0;
     return vkmesh_repair_non_manifold_edges_cpu(mesh, old_vertices, new_vertices);
 }
 
@@ -3403,9 +3456,11 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
             vkmesh_device_mesh_destroy(&dm);
             if (owns_vk) vkmesh_vk_destroy(vk);
             if (ok) return 1;
+            if (vkmesh_fatal_error_blocks_fallback("device connected-components path")) return 0;
             fprintf(stderr, "vkmesh: device connected-components pass failed, falling back\n");
         }
     }
+    if (vkmesh_fatal_error_blocks_fallback("device connected-components initialization")) return 0;
     if (mesh->n_vertices > 0 && mesh->n_vertices <= INT32_MAX) {
         vkmesh_vk local_vk;
         vkmesh_vk * vk = NULL;
@@ -3545,9 +3600,11 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
             vk_buffer_destroy(vk, &keep_flags);
             if (owns_vk) vkmesh_vk_destroy(vk);
             if (ok) return 1;
+            if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan connected-components path")) return 0;
             fprintf(stderr, "vkmesh: Vulkan connected-components pass failed, falling back to CPU\n");
         }
     }
+    if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan connected-components initialization")) return 0;
 
     vkmesh_face_pair * pairs = NULL;
     int64_t pair_count = 0;
@@ -3795,6 +3852,7 @@ static int vkmesh_unify_face_orientations_cpu(vkmesh_mesh * mesh, int * flipped_
 
 static int vkmesh_unify_face_orientations(vkmesh_mesh * mesh, int * flipped_faces) {
     if (vkmesh_unify_face_orientations_vulkan(mesh, flipped_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("orientation Vulkan path")) return 0;
     return vkmesh_unify_face_orientations_cpu(mesh, flipped_faces);
 }
 
@@ -3969,6 +4027,7 @@ static int build_vertex_face_adjacency_cpu(const vkmesh_mesh * mesh, int ** offs
 
 static int build_vertex_face_adjacency(const vkmesh_mesh * mesh, int ** offset_out, int ** adj_out) {
     if (build_vertex_face_adjacency_vulkan(mesh, offset_out, adj_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("vertex-face adjacency Vulkan path")) return 0;
     return build_vertex_face_adjacency_cpu(mesh, offset_out, adj_out);
 }
 
@@ -4132,6 +4191,7 @@ static int get_unique_simplify_edges(
     int64_t * edge_count_out,
     uint8_t ** vertex_boundary_out) {
     if (get_unique_simplify_edges_vulkan(mesh, edges_out, edge_count_out, vertex_boundary_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("simplify edge-key Vulkan path")) return 0;
     return get_unique_simplify_edges_cpu(mesh, edges_out, edge_count_out, vertex_boundary_out);
 }
 
@@ -5389,9 +5449,11 @@ static int vkmesh_simplify_step_cpu(
             if (f[2] == v1) f[2] = v0;
         }
     }
-    if (!mesh_remove_faces_by_mask_vulkan(mesh, keep_face, removed_faces) &&
-        !mesh_remove_faces_by_mask(mesh, keep_face, removed_faces)) {
-        goto cleanup;
+    if (!mesh_remove_faces_by_mask_vulkan(mesh, keep_face, removed_faces)) {
+        if (vkmesh_fatal_error_blocks_fallback("simplify face compaction Vulkan path") ||
+            !mesh_remove_faces_by_mask(mesh, keep_face, removed_faces)) {
+            goto cleanup;
+        }
     }
     ok = 1;
 
@@ -5418,6 +5480,7 @@ static int vkmesh_simplify_step(
     if (vkmesh_simplify_step_vulkan(mesh, lambda_edge_length, lambda_skinny, threshold, collapsed_edges, removed_faces)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("per-step Vulkan simplify")) return 0;
     return vkmesh_simplify_step_cpu(mesh, lambda_edge_length, lambda_skinny, threshold, collapsed_edges, removed_faces);
 }
 
@@ -5444,6 +5507,7 @@ static int vkmesh_simplify(
             total_removed)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("device Vulkan simplify")) return 0;
 
     int step = 0;
     int consecutive_no_progress = 0;
@@ -8001,7 +8065,9 @@ static int vkmesh_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, int *
     *filled_loops = 0;
     *added_faces = 0;
     if (vkmesh_fill_holes_device_vulkan(mesh, max_hole_perimeter, filled_loops, added_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("device hole-fill path")) return 0;
     if (vkmesh_fill_holes_vulkan(mesh, max_hole_perimeter, filled_loops, added_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan hole-fill path")) return 0;
     vkmesh_boundary_edge * boundary = NULL;
     uint32_t * parents = NULL;
     uint32_t * comp_edges = NULL;
@@ -8018,6 +8084,7 @@ static int vkmesh_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, int *
             &comp_perim,
             &comp_mid,
             &boundary_count_i64)) {
+        if (vkmesh_fatal_error_blocks_fallback("Vulkan hole-component path")) return 0;
         return vkmesh_fill_holes_cpu(mesh, max_hole_perimeter, filled_loops, added_faces);
     }
     if (boundary_count_i64 <= 0) {
@@ -8686,6 +8753,7 @@ static int vkmesh_trellis_postprocess_inner(
             remesh_project)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("TRELLIS device postprocess")) return 0;
 
     if (decimation_target <= 0) decimation_target = 1000000;
     fprintf(stderr,
@@ -8754,12 +8822,14 @@ static int vkmesh_trellis_postprocess_inner(
             0,
             NULL,
             "trellis.pass1")) {
+        if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass1 device cleanup")) return 0;
         if (!vkmesh_log_duplicate_degenerate_device_cluster(
                 mesh,
                 run_degenerate_cleanup,
                 degenerate_abs,
                 degenerate_rel,
                 "trellis.pass1")) {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass1 duplicate/degenerate cleanup")) return 0;
             if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass1")) return 0;
             if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass1")) return 0;
         }
@@ -8796,12 +8866,14 @@ static int vkmesh_trellis_postprocess_inner(
             "trellis.pass2")) {
         final_orientation_done = 1;
     } else {
+        if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass2 device cleanup")) return 0;
         if (!vkmesh_log_duplicate_degenerate_device_cluster(
                 mesh,
                 run_degenerate_cleanup,
                 degenerate_abs,
                 degenerate_rel,
                 "trellis.pass2")) {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass2 duplicate/degenerate cleanup")) return 0;
             if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass2")) return 0;
             if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass2")) return 0;
         }
@@ -8857,6 +8929,7 @@ static int vkmesh_trellis_postprocess(
     vkmesh_vk vk;
     if (!vkmesh_vk_init(&vk)) {
         vkmesh_vk_destroy(&vk);
+        (void) vkmesh_fatal_error_blocks_fallback("TRELLIS Vulkan initialization");
         return 0;
     }
     g_active_vkmesh_vk = &vk;
@@ -9015,7 +9088,7 @@ trellis_status trellis_vkmesh_postprocess(
     const int previous_workspace_budget_mib = g_vkmesh_workspace_budget_mib;
     g_vkmesh_device_index = options != NULL ? options->device : 0;
     g_vkmesh_workspace_budget_mib = options != NULL ? options->gpu_workspace_budget_mib : 0;
-    g_vkmesh_last_error = VKMESH_ERROR_NONE;
+    vkmesh_begin_operation();
 
     if (!vkmesh_trellis_postprocess(
             &work,
@@ -9600,6 +9673,7 @@ int main(int argc, char ** argv) {
     }
     g_vkmesh_device_index = device;
     g_vkmesh_workspace_budget_mib = gpu_workspace_budget_mib;
+    vkmesh_begin_operation();
 
     vkmesh_mesh mesh;
     memset(&mesh, 0, sizeof(mesh));
