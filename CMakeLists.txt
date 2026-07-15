@@ -1043,7 +1043,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
             set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
             add_custom_command(
                 OUTPUT "${SPV}"
-                COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -O -fshader-stage=compute --target-env=vulkan1.2
                         "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}"
                         -o "${SPV}"
                 DEPENDS "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}"

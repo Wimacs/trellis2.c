@@ -214,6 +214,8 @@ typedef struct vkmesh_vk {
     size_t workspace_budget_bytes;
     size_t workspace_current_bytes;
     size_t workspace_peak_bytes;
+    uint32_t workspace_memory_type;
+    int workspace_memory_type_reported;
 } vkmesh_vk;
 
 typedef struct vkmesh_device_mesh {
@@ -594,15 +596,21 @@ static int write_meshbin(const char * path, const vkmesh_mesh * mesh) {
     return 1;
 }
 
-static uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits, VkMemoryPropertyFlags flags) {
+static uint32_t find_memory_type(
+    VkPhysicalDevice physical,
+    uint32_t type_bits,
+    VkMemoryPropertyFlags required_flags,
+    VkMemoryPropertyFlags preferred_flags) {
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(physical, &props);
+    uint32_t fallback = UINT32_MAX;
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-        if ((type_bits & (1u << i)) != 0 && (props.memoryTypes[i].propertyFlags & flags) == flags) {
-            return i;
-        }
+        if ((type_bits & (1u << i)) == 0 ||
+            (props.memoryTypes[i].propertyFlags & required_flags) != required_flags) continue;
+        if (fallback == UINT32_MAX) fallback = i;
+        if ((props.memoryTypes[i].propertyFlags & preferred_flags) == preferred_flags) return i;
     }
-    return UINT32_MAX;
+    return fallback;
 }
 
 static int vkmesh_device_supports_memory_budget(VkPhysicalDevice physical) {
@@ -656,13 +664,24 @@ static size_t vkmesh_resolve_workspace_budget(VkPhysicalDevice physical) {
     if (has_budget) props2.pNext = &budget_props;
     vkGetPhysicalDeviceMemoryProperties2(physical, &props2);
 
+    const VkMemoryPropertyFlags required =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    int has_preferred_type = 0;
+    for (uint32_t i = 0; i < props2.memoryProperties.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags flags = props2.memoryProperties.memoryTypes[i].propertyFlags;
+        if ((flags & required) == required && (flags & preferred) == preferred) {
+            has_preferred_type = 1;
+            break;
+        }
+    }
+
     VkDeviceSize best_heap_budget = 0;
     VkDeviceSize best_heap_available = 0;
     for (uint32_t i = 0; i < props2.memoryProperties.memoryTypeCount; ++i) {
         const VkMemoryType * type = &props2.memoryProperties.memoryTypes[i];
-        const VkMemoryPropertyFlags required =
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         if ((type->propertyFlags & required) != required) continue;
+        if (has_preferred_type && (type->propertyFlags & preferred) != preferred) continue;
         const uint32_t heap_index = type->heapIndex;
         VkDeviceSize heap_budget = has_budget ?
             budget_props.heapBudget[heap_index] : props2.memoryProperties.memoryHeaps[heap_index].size;
@@ -722,13 +741,28 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
     uint32_t memory_type = find_memory_type(
         vk->physical_device,
         req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (memory_type == UINT32_MAX) {
         vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         fprintf(stderr, "vkmesh: selected device has no host-visible coherent storage-buffer memory type\n");
         vkDestroyBuffer(vk->device, out->buffer, NULL);
         memset(out, 0, sizeof(*out));
         return 0;
+    }
+    if (!vk->workspace_memory_type_reported) {
+        VkPhysicalDeviceMemoryProperties memory_props;
+        vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &memory_props);
+        const VkMemoryType * type = &memory_props.memoryTypes[memory_type];
+        vk->workspace_memory_type = memory_type;
+        vk->workspace_memory_type_reported = 1;
+        fprintf(stderr,
+            "vkmesh: workspace memory type=%u heap=%u device_local=%d host_visible=%d coherent=%d\n",
+            memory_type,
+            type->heapIndex,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0);
     }
 
     VkMemoryAllocateInfo alloc_info;
@@ -756,8 +790,8 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
 static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b) {
     if (b == NULL) return;
     if (b->mapped != NULL) vkUnmapMemory(vk->device, b->memory);
-    if (b->memory != VK_NULL_HANDLE) vkFreeMemory(vk->device, b->memory, NULL);
     if (b->buffer != VK_NULL_HANDLE) vkDestroyBuffer(vk->device, b->buffer, NULL);
+    if (b->memory != VK_NULL_HANDLE) vkFreeMemory(vk->device, b->memory, NULL);
     if (vk != NULL && b->allocation_bytes <= vk->workspace_current_bytes) {
         vk->workspace_current_bytes -= b->allocation_bytes;
     }
@@ -8833,7 +8867,6 @@ static int vkmesh_probe_vulkan_json(void) {
         fputs(",\"reasonCode\":\"loader_api_too_old\",\"devices\":[]}\n", stdout);
         return 0;
     }
-
     VkApplicationInfo application_info;
     memset(&application_info, 0, sizeof(application_info));
     application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
