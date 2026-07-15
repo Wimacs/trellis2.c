@@ -27,17 +27,6 @@ layout(binding = 3) buffer AreaBits {
     uint area_bits[];
 };
 
-void atomicAddFloat(uint index, float value) {
-    uint old_bits = area_bits[index];
-    for (uint i = 0u; i < 64u; ++i) {
-        float old_value = uintBitsToFloat(old_bits);
-        uint new_bits = floatBitsToUint(old_value + value);
-        uint prev = atomicCompSwap(area_bits[index], old_bits, new_bits);
-        if (prev == old_bits) return;
-        old_bits = prev;
-    }
-}
-
 void main() {
     uint face_id = gl_GlobalInvocationID.x;
     if (face_id >= p.n) return;
@@ -49,5 +38,7 @@ void main() {
     vec3 b = vec3(vertices[ib * 3u + 0u], vertices[ib * 3u + 1u], vertices[ib * 3u + 2u]);
     vec3 c = vec3(vertices[ic * 3u + 0u], vertices[ic * 3u + 1u], vertices[ic * 3u + 2u]);
     float area = 0.5 * length(cross(b - a, c - a));
-    atomicAddFloat(parents[face_id], area);
+    /* Write one uncontended value per face. The host performs the small final
+       reduction by component root, avoiding an unbounded same-root CAS storm. */
+    area_bits[face_id] = floatBitsToUint(area);
 }

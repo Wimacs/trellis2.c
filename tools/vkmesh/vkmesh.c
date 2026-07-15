@@ -26,7 +26,6 @@
 #include "vkmesh_init_u32_sequence_spv.h"
 #include "vkmesh_init_orientation_state_spv.h"
 #include "vkmesh_mark_boundary_edges_spv.h"
-#include "vkmesh_mark_component_keep_spv.h"
 #include "vkmesh_mark_duplicate_faces_spv.h"
 #include "vkmesh_mark_hole_faces_spv.h"
 #include "vkmesh_mark_hole_roots_spv.h"
@@ -107,6 +106,8 @@ typedef struct vkmesh_face_pair {
     uint32_t v0;
     uint32_t v1;
 } vkmesh_face_pair;
+
+enum { VKMESH_COMPONENT_MAX_UNION_PASSES = 32 };
 
 typedef struct vkmesh_qem {
     double m[10];
@@ -200,7 +201,6 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_ASSIGN_CORNER_VERTICES,
     VKMESH_PIPE_WRITE_REPAIRED_MESH,
     VKMESH_PIPE_COMPONENT_AREA,
-    VKMESH_PIPE_MARK_COMPONENT_KEEP,
     VKMESH_PIPE_MARK_HOLE_ROOTS,
     VKMESH_PIPE_MARK_HOLE_FACES,
     VKMESH_PIPE_WRITE_HOLE_VERTICES,
@@ -309,7 +309,6 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_assign_corner_vertices_spv, sizeof(vkmesh_assign_corner_vertices_spv), "assign_corner_vertices" },
     { vkmesh_write_repaired_mesh_spv, sizeof(vkmesh_write_repaired_mesh_spv), "write_repaired_mesh" },
     { vkmesh_component_area_spv, sizeof(vkmesh_component_area_spv), "component_area" },
-    { vkmesh_mark_component_keep_spv, sizeof(vkmesh_mark_component_keep_spv), "mark_component_keep" },
     { vkmesh_mark_hole_roots_spv, sizeof(vkmesh_mark_hole_roots_spv), "mark_hole_roots" },
     { vkmesh_mark_hole_faces_spv, sizeof(vkmesh_mark_hole_faces_spv), "mark_hole_faces" },
     { vkmesh_write_hole_vertices_spv, sizeof(vkmesh_write_hole_vertices_spv), "write_hole_vertices" },
@@ -334,6 +333,7 @@ typedef enum vkmesh_error_kind {
     VKMESH_ERROR_OUT_OF_MEMORY,
     VKMESH_ERROR_VULKAN_UNAVAILABLE,
     VKMESH_ERROR_VULKAN,
+    VKMESH_ERROR_ALGORITHM,
 } vkmesh_error_kind;
 
 static VKMESH_THREAD_LOCAL vkmesh_error_kind g_vkmesh_last_error = VKMESH_ERROR_NONE;
@@ -356,6 +356,7 @@ static const char * vkmesh_error_name(vkmesh_error_kind error) {
         case VKMESH_ERROR_OUT_OF_MEMORY: return "out of memory";
         case VKMESH_ERROR_VULKAN_UNAVAILABLE: return "Vulkan unavailable";
         case VKMESH_ERROR_VULKAN: return "Vulkan runtime error";
+        case VKMESH_ERROR_ALGORITHM: return "algorithm failure";
         default: return "no explicit error";
     }
 }
@@ -1709,6 +1710,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
     if (referenced == NULL || map == NULL) {
         free(referenced);
         free(map);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
         return 0;
     }
     for (int64_t i = 0; i < mesh->n_faces; ++i) {
@@ -1730,6 +1732,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
         if (new_vertices == NULL) {
             free(referenced);
             free(map);
+            vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
             return 0;
         }
         if (mesh->has_uvs && mesh->uvs != NULL) {
@@ -1738,6 +1741,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
                 free(new_vertices);
                 free(referenced);
                 free(map);
+                vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
                 return 0;
             }
         }
@@ -1776,7 +1780,10 @@ static int mesh_remove_faces_by_mask(vkmesh_mesh * mesh, const uint8_t * keep_ma
     int32_t * new_faces = NULL;
     if (keep_count > 0) {
         new_faces = (int32_t *) malloc((size_t) keep_count * 3u * sizeof(int32_t));
-        if (new_faces == NULL) return 0;
+        if (new_faces == NULL) {
+            vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+            return 0;
+        }
     }
     int64_t dst = 0;
     for (int64_t i = 0; i < mesh->n_faces; ++i) {
@@ -1833,6 +1840,7 @@ static int vkmesh_device_mesh_download(vkmesh_device_mesh * dm, vkmesh_mesh * me
     if (vertices == NULL || faces == NULL) {
         free(vertices);
         free(faces);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
         return 0;
     }
     memcpy(vertices, dm->vertices.mapped, (size_t) dm->n_vertices * 3u * sizeof(float));
@@ -2261,6 +2269,69 @@ cleanup:
     return ok;
 }
 
+static int vkmesh_mark_components_by_area_host(
+    const vkmesh_vk_buffer * parents,
+    const vkmesh_vk_buffer * face_area_bits,
+    vkmesh_vk_buffer * keep_flags,
+    uint32_t face_count,
+    float min_area) {
+    if (parents == NULL || face_area_bits == NULL || keep_flags == NULL ||
+        parents->mapped == NULL || face_area_bits->mapped == NULL || keep_flags->mapped == NULL ||
+        face_count == 0u ||
+        parents->bytes < (size_t) face_count * sizeof(uint32_t) ||
+        face_area_bits->bytes < (size_t) face_count * sizeof(uint32_t) ||
+        keep_flags->bytes < (size_t) face_count * sizeof(uint32_t)) {
+        return 0;
+    }
+
+    double * component_area = (double *) calloc((size_t) face_count, sizeof(*component_area));
+    uint32_t * host_words =
+        (uint32_t *) malloc((size_t) face_count * 2u * sizeof(*host_words));
+    if (component_area == NULL || host_words == NULL) {
+        free(component_area);
+        free(host_words);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    const size_t words_bytes = (size_t) face_count * sizeof(*host_words);
+    memcpy(host_words, parents->mapped, words_bytes);
+    memcpy(host_words + face_count, face_area_bits->mapped, words_bytes);
+    const uint32_t * parent_data = host_words;
+    const uint32_t * area_data = host_words + face_count;
+    int ok = 1;
+    for (uint32_t face = 0u; face < face_count; ++face) {
+        const uint32_t root = parent_data[face];
+        float face_area = 0.0f;
+        memcpy(&face_area, &area_data[face], sizeof(face_area));
+        if (root >= face_count || !isfinite(face_area) || face_area < 0.0f) {
+            ok = 0;
+            break;
+        }
+        component_area[root] += (double) face_area;
+    }
+    if (ok) {
+        uint32_t * keep_data = host_words + face_count;
+        uint32_t kept_faces = 0u;
+        for (uint32_t face = 0u; face < face_count; ++face) {
+            keep_data[face] = component_area[parent_data[face]] >= (double) min_area ? 1u : 0u;
+            kept_faces += keep_data[face];
+        }
+        if (kept_faces == 0u) {
+            fprintf(stderr,
+                "vkmesh: all connected components are below min_area=%.9g faces=%u\n",
+                min_area,
+                face_count);
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            ok = 0;
+        } else {
+            memcpy(keep_flags->mapped, keep_data, words_bytes);
+        }
+    }
+    free(component_area);
+    free(host_words);
+    return ok;
+}
+
 static int vkmesh_device_remove_small_connected_components(
     vkmesh_device_mesh * dm,
     float min_area,
@@ -2290,13 +2361,13 @@ static int vkmesh_device_remove_small_connected_components(
     size_t edge_count = 0;
     size_t edge_sort_count = 0;
     int ok = 0;
-    if (!vk_buffer_create(vk, parents_bytes, &parents) ||
-        !vk_buffer_create(vk, sizeof(uint32_t), &changed) ||
-        !vk_buffer_create(vk, parents_bytes, &area_bits) ||
-        !vk_buffer_create(vk, parents_bytes, &keep_flags)) {
+    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &edge_count, &edge_sort_count)) {
         goto cleanup;
     }
-    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &edge_count, &edge_sort_count)) {
+    if (!vk_buffer_create_uninitialized(vk, parents_bytes, &parents) ||
+        !vk_buffer_create(vk, sizeof(uint32_t), &changed) ||
+        !vk_buffer_create(vk, parents_bytes, &area_bits) ||
+        !vk_buffer_create_uninitialized(vk, parents_bytes, &keep_flags)) {
         goto cleanup;
     }
 
@@ -2323,7 +2394,7 @@ static int vkmesh_device_remove_small_connected_components(
     compress_buffers[3] = changed;
     uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
     int converged = 0;
-    for (int iter = 0; iter < 32; ++iter) {
+    for (int iter = 0; iter < VKMESH_COMPONENT_MAX_UNION_PASSES; ++iter) {
         ((uint32_t *) changed.mapped)[0] = 0u;
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
@@ -2348,15 +2419,14 @@ static int vkmesh_device_remove_small_connected_components(
     push.n = dm->n_faces;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPONENT_AREA, area_buffers, &push, face_groups)) goto cleanup;
 
-    vkmesh_vk_buffer mark_buffers[4];
-    mark_buffers[0] = parents;
-    mark_buffers[1] = area_bits;
-    mark_buffers[2] = keep_flags;
-    mark_buffers[3] = changed;
-    memset(&push, 0, sizeof(push));
-    push.n = dm->n_faces;
-    push.eps = min_area;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_MARK_COMPONENT_KEEP, mark_buffers, &push, face_groups)) goto cleanup;
+    if (!vkmesh_mark_components_by_area_host(
+            &parents, &area_bits, &keep_flags, dm->n_faces, min_area)) goto cleanup;
+
+    vk_buffer_destroy(vk, &edges_buffer);
+    vk_buffer_destroy(vk, &edge_dummy);
+    vk_buffer_destroy(vk, &parents);
+    vk_buffer_destroy(vk, &changed);
+    vk_buffer_destroy(vk, &area_bits);
     if (!compact_device_mesh_from_flags(dm, &keep_flags, 0u, removed_faces)) goto cleanup;
     ok = 1;
 
@@ -2796,6 +2866,45 @@ cleanup:
     return ok;
 }
 
+static int vkmesh_remove_degenerate_faces_cpu(
+    vkmesh_mesh * mesh,
+    float abs_thresh,
+    float rel_thresh,
+    int * removed_faces) {
+    if (removed_faces != NULL) *removed_faces = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_vertices <= 0) return 0;
+    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
+    if (keep == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    int64_t keep_count = 0;
+    for (int64_t face = 0; face < mesh->n_faces; ++face) {
+        const int32_t * f = mesh->faces + (size_t) face * 3u;
+        int valid = f[0] != f[1] && f[1] != f[2] && f[2] != f[0];
+        if (valid) {
+            const double max_edge = fmax(
+                edge_length(mesh, f[0], f[1]),
+                fmax(edge_length(mesh, f[1], f[2]), edge_length(mesh, f[2], f[0])));
+            const double threshold = fmax(
+                (double) abs_thresh,
+                (double) rel_thresh * max_edge * max_edge);
+            valid = face_area(mesh, face) >= threshold;
+        }
+        keep[face] = valid ? 1u : 0u;
+        keep_count += valid;
+    }
+    if (keep_count == 0) {
+        fprintf(stderr, "vkmesh: degenerate cleanup rejected every face\n");
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        free(keep);
+        return 0;
+    }
+    const int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
+    free(keep);
+    return ok;
+}
+
 static int vkmesh_remove_degenerate_faces(vkmesh_mesh * mesh, float abs_thresh, float rel_thresh, int * removed_faces) {
     *removed_faces = 0;
     float * new_vertices = NULL;
@@ -2818,6 +2927,53 @@ static int vkmesh_remove_degenerate_faces(vkmesh_mesh * mesh, float abs_thresh, 
     mesh->vertex_capacity = new_vertex_count;
     mesh->face_capacity = keep_count;
     mesh->has_uvs = 0;
+    return 1;
+}
+
+static int compare_vkmesh_edges(const void * lhs_ptr, const void * rhs_ptr) {
+    const vkmesh_edge * lhs = (const vkmesh_edge *) lhs_ptr;
+    const vkmesh_edge * rhs = (const vkmesh_edge *) rhs_ptr;
+    if (lhs->min_v != rhs->min_v) return lhs->min_v < rhs->min_v ? -1 : 1;
+    if (lhs->max_v != rhs->max_v) return lhs->max_v < rhs->max_v ? -1 : 1;
+    if (lhs->face != rhs->face) return lhs->face < rhs->face ? -1 : 1;
+    if (lhs->a != rhs->a) return lhs->a < rhs->a ? -1 : 1;
+    if (lhs->b != rhs->b) return lhs->b < rhs->b ? -1 : 1;
+    return 0;
+}
+
+static int get_sorted_edges_cpu(
+    const vkmesh_mesh * mesh,
+    vkmesh_edge ** edges_out,
+    int64_t * edge_count_out) {
+    if (edges_out == NULL || edge_count_out == NULL) return 0;
+    *edges_out = NULL;
+    *edge_count_out = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_faces > INT32_MAX) return 0;
+    const size_t edge_count = (size_t) mesh->n_faces * 3u;
+    if (edge_count > SIZE_MAX / sizeof(vkmesh_edge)) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    vkmesh_edge * edges = (vkmesh_edge *) malloc(edge_count * sizeof(*edges));
+    if (edges == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    for (int64_t face = 0; face < mesh->n_faces; ++face) {
+        const int32_t * f = mesh->faces + (size_t) face * 3u;
+        const uint32_t vertices[3] = { (uint32_t) f[0], (uint32_t) f[1], (uint32_t) f[2] };
+        for (uint32_t edge = 0u; edge < 3u; ++edge) {
+            vkmesh_edge * dst = edges + (size_t) face * 3u + edge;
+            dst->a = vertices[edge];
+            dst->b = vertices[(edge + 1u) % 3u];
+            dst->min_v = dst->a < dst->b ? dst->a : dst->b;
+            dst->max_v = dst->a > dst->b ? dst->a : dst->b;
+            dst->face = (uint32_t) face;
+        }
+    }
+    qsort(edges, edge_count, sizeof(*edges), compare_vkmesh_edges);
+    *edges_out = edges;
+    *edge_count_out = (int64_t) edge_count;
     return 1;
 }
 
@@ -3117,7 +3273,7 @@ static int get_manifold_face_pairs_cpu(
     *pair_count_out = 0;
     vkmesh_edge * edges = NULL;
     int64_t edge_count = 0;
-    if (!get_sorted_edges(mesh, &edges, &edge_count)) return 0;
+    if (!get_sorted_edges_cpu(mesh, &edges, &edge_count)) return 0;
     vkmesh_face_pair * pairs = NULL;
     int64_t count = 0;
     int64_t capacity = 0;
@@ -3131,6 +3287,7 @@ static int get_manifold_face_pairs_cpu(
                 if (next == NULL) {
                     free(edges);
                     free(pairs);
+                    vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
                     return 0;
                 }
                 pairs = next;
@@ -3435,6 +3592,56 @@ static int vkmesh_repair_non_manifold_edges(vkmesh_mesh * mesh, int * old_vertic
     return vkmesh_repair_non_manifold_edges_cpu(mesh, old_vertices, new_vertices);
 }
 
+static int vkmesh_remove_small_connected_components_cpu(
+    vkmesh_mesh * mesh,
+    float min_area,
+    int * removed_faces) {
+    if (removed_faces != NULL) *removed_faces = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_faces > INT32_MAX) return 0;
+    vkmesh_face_pair * pairs = NULL;
+    int64_t pair_count = 0;
+    if (!get_manifold_face_pairs_cpu(mesh, &pairs, &pair_count)) return 0;
+    int * parent = (int *) malloc((size_t) mesh->n_faces * sizeof(int));
+    double * comp_area = (double *) calloc((size_t) mesh->n_faces, sizeof(double));
+    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
+    if (parent == NULL || comp_area == NULL || keep == NULL) {
+        free(pairs);
+        free(parent);
+        free(comp_area);
+        free(keep);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    for (int64_t i = 0; i < mesh->n_faces; ++i) parent[i] = (int) i;
+    for (int64_t i = 0; i < pair_count; ++i) uf_union(parent, pairs[i].f0, pairs[i].f1);
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        comp_area[uf_find(parent, (int) i)] += face_area(mesh, i);
+    }
+    int64_t keep_count = 0;
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        keep[i] = comp_area[uf_find(parent, (int) i)] >= (double) min_area ? 1u : 0u;
+        keep_count += keep[i] != 0u;
+    }
+    if (keep_count == 0) {
+        fprintf(stderr,
+            "vkmesh: all connected components are below min_area=%.9g faces=%" PRId64 "\n",
+            min_area,
+            mesh->n_faces);
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        free(pairs);
+        free(parent);
+        free(comp_area);
+        free(keep);
+        return 0;
+    }
+    const int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
+    free(pairs);
+    free(parent);
+    free(comp_area);
+    free(keep);
+    return ok;
+}
+
 static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float min_area, int * removed_faces) {
     *removed_faces = 0;
     if (mesh->n_faces <= 0 || mesh->n_faces > INT32_MAX) return 0;
@@ -3522,7 +3729,7 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
                         uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
                         uint32_t face_groups = (uint32_t) ((mesh->n_faces + 127) / 128);
                         int converged = 0;
-                        for (int iter = 0; iter < 32; ++iter) {
+                        for (int iter = 0; iter < VKMESH_COMPONENT_MAX_UNION_PASSES; ++iter) {
                             ((uint32_t *) changed.mapped)[0] = 0u;
                             memset(&push, 0, sizeof(push));
                             push.n = (uint32_t) edge_count;
@@ -3546,15 +3753,12 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
                             memset(&push, 0, sizeof(push));
                             push.n = (uint32_t) mesh->n_faces;
                             if (vkmesh_dispatch(vk, VKMESH_PIPE_COMPONENT_AREA, area_buffers, &push, face_groups)) {
-                                vkmesh_vk_buffer mark_buffers[4];
-                                mark_buffers[0] = parents;
-                                mark_buffers[1] = area_bits;
-                                mark_buffers[2] = keep_flags;
-                                mark_buffers[3] = changed;
-                                memset(&push, 0, sizeof(push));
-                                push.n = (uint32_t) mesh->n_faces;
-                                push.eps = min_area;
-                                if (vkmesh_dispatch(vk, VKMESH_PIPE_MARK_COMPONENT_KEEP, mark_buffers, &push, face_groups)) {
+                                if (vkmesh_mark_components_by_area_host(
+                                        &parents,
+                                        &area_bits,
+                                        &keep_flags,
+                                        (uint32_t) mesh->n_faces,
+                                        min_area)) {
                                     float * new_vertices = NULL;
                                     int64_t new_vertex_count = 0;
                                     int32_t * new_faces = NULL;
@@ -3606,26 +3810,7 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
     }
     if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan connected-components initialization")) return 0;
 
-    vkmesh_face_pair * pairs = NULL;
-    int64_t pair_count = 0;
-    if (!get_manifold_face_pairs(mesh, &pairs, &pair_count)) return 0;
-    int * parent = (int *) malloc((size_t) mesh->n_faces * sizeof(int));
-    double * comp_area = (double *) calloc((size_t) mesh->n_faces, sizeof(double));
-    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
-    if (parent == NULL || comp_area == NULL || keep == NULL) {
-        free(pairs); free(parent); free(comp_area); free(keep);
-        return 0;
-    }
-    for (int64_t i = 0; i < mesh->n_faces; ++i) parent[i] = (int) i;
-    for (int64_t i = 0; i < pair_count; ++i) uf_union(parent, pairs[i].f0, pairs[i].f1);
-    for (int64_t i = 0; i < mesh->n_faces; ++i) comp_area[uf_find(parent, (int) i)] += face_area(mesh, i);
-    for (int64_t i = 0; i < mesh->n_faces; ++i) keep[i] = comp_area[uf_find(parent, (int) i)] >= (double) min_area ? 1u : 0u;
-    int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
-    free(pairs);
-    free(parent);
-    free(comp_area);
-    free(keep);
-    return ok;
+    return vkmesh_remove_small_connected_components_cpu(mesh, min_area, removed_faces);
 }
 
 static int shared_edge_needs_flip(const vkmesh_mesh * mesh, const vkmesh_face_pair * pair) {
@@ -8460,6 +8645,86 @@ cleanup:
     return ok;
 }
 
+typedef struct vkmesh_trellis_remesh_finalize_stats {
+    uint32_t small_removed;
+    uint32_t small_faces;
+    uint32_t degenerate_removed;
+    uint32_t degenerate_faces;
+} vkmesh_trellis_remesh_finalize_stats;
+
+/* Keep this finalizer narrow.  The guarded simplifier preserves duplicate,
+   boundary, and orientation invariants, while repairing the DC path's
+   incidence-4 sheets and fan-filling the resulting cuts can damage geometry. */
+static int vkmesh_device_trellis_remesh_finalize(
+    vkmesh_device_mesh * dm,
+    float min_component_area,
+    int run_degenerate_cleanup,
+    float degenerate_abs,
+    float degenerate_rel,
+    vkmesh_trellis_remesh_finalize_stats * stats) {
+    if (dm == NULL || stats == NULL) return 0;
+    memset(stats, 0, sizeof(*stats));
+
+    if (run_degenerate_cleanup) {
+        if (!vkmesh_device_remove_degenerate_faces(
+                dm,
+                degenerate_abs,
+                degenerate_rel,
+                &stats->degenerate_removed)) {
+            return 0;
+        }
+        stats->degenerate_faces = dm->n_faces;
+    }
+
+    if (!vkmesh_device_remove_small_connected_components(
+            dm, min_component_area, &stats->small_removed)) {
+        return 0;
+    }
+    stats->small_faces = dm->n_faces;
+    return 1;
+}
+
+static void vkmesh_log_trellis_remesh_finalize_stats(
+    int run_degenerate_cleanup,
+    const vkmesh_trellis_remesh_finalize_stats * stats) {
+    if (run_degenerate_cleanup) {
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final remove_degenerate_faces removed=%u faces=%u\n",
+            stats->degenerate_removed,
+            stats->degenerate_faces);
+    }
+    fprintf(stderr,
+        "vkmesh: trellis.remesh.final remove_small_connected_components removed=%u faces=%u\n",
+        stats->small_removed,
+        stats->small_faces);
+}
+
+static int vkmesh_host_trellis_remesh_finalize(
+    vkmesh_mesh * mesh,
+    float min_component_area,
+    int run_degenerate_cleanup,
+    float degenerate_abs,
+    float degenerate_rel) {
+    if (mesh == NULL || mesh->n_vertices <= 0 || mesh->n_faces <= 0) return 0;
+    if (run_degenerate_cleanup) {
+        int removed = 0;
+        if (!vkmesh_remove_degenerate_faces_cpu(
+                mesh, degenerate_abs, degenerate_rel, &removed)) return 0;
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final remove_degenerate_faces path=cpu removed=%d faces=%" PRId64 "\n",
+            removed,
+            mesh->n_faces);
+    }
+    int removed = 0;
+    if (!vkmesh_remove_small_connected_components_cpu(
+            mesh, min_component_area, &removed)) return 0;
+    fprintf(stderr,
+        "vkmesh: trellis.remesh.final remove_small_connected_components path=cpu removed=%d faces=%" PRId64 "\n",
+        removed,
+        mesh->n_faces);
+    return mesh->n_vertices > 0 && mesh->n_faces > 0;
+}
+
 static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_mesh * mesh,
     const char * projection_output,
@@ -8546,19 +8811,82 @@ static int vkmesh_trellis_postprocess_device_inner(
             if (!vkmesh_remesh_narrow_band_dc(
                     &remesh_work, remesh_resolution, remesh_band, remesh_project)) goto cleanup;
         }
-        if (remesh_work.n_faces > (int64_t) decimation_target) {
-            if (!vkmesh_log_simplify(
-                    &remesh_work,
+        if (!vkmesh_device_mesh_upload(vk, &remesh_work, &dm)) goto cleanup;
+        mesh_free(&remesh_work);
+
+        if (dm.n_faces > (uint32_t) decimation_target) {
+            int collapsed = 0;
+            int removed = 0;
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify begin target=%d faces=%u\n",
+                decimation_target,
+                dm.n_faces);
+            fflush(stderr);
+            if (!vkmesh_device_simplify(
+                    &dm,
                     decimation_target,
                     lambda_edge_length,
                     lambda_skinny,
                     simplify_threshold,
                     simplify_steps,
-                    "trellis.remesh")) {
+                    &collapsed,
+                    &removed)) {
                 goto cleanup;
             }
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify target=%d collapsed=%d removed_faces=%d faces=%u\n",
+                decimation_target,
+                collapsed,
+                removed,
+                dm.n_faces);
         } else {
-            fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", remesh_work.n_faces, decimation_target);
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify skipped faces=%u target=%d\n",
+                dm.n_faces,
+                decimation_target);
+        }
+
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final begin vertices=%u faces=%u min_component_area=%.9g run_degenerate_cleanup=%d\n",
+            dm.n_vertices,
+            dm.n_faces,
+            min_component_area,
+            run_degenerate_cleanup);
+        vkmesh_trellis_remesh_finalize_stats final_stats;
+        int finalized_on_device = vkmesh_device_trellis_remesh_finalize(
+                &dm,
+                min_component_area,
+                run_degenerate_cleanup,
+                degenerate_abs,
+                degenerate_rel,
+                &final_stats);
+        if (finalized_on_device) {
+            vkmesh_log_trellis_remesh_finalize_stats(run_degenerate_cleanup, &final_stats);
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final done path=device vertices=%u faces=%u\n",
+                dm.n_vertices,
+                dm.n_faces);
+            if (!vkmesh_device_mesh_download(&dm, &remesh_work)) goto cleanup;
+        } else {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS remesh device finalizer")) goto cleanup;
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final device path failed; using local host fallback without rerunning remesh\n");
+            if (!vkmesh_device_mesh_download(&dm, &remesh_work)) goto cleanup;
+            if (!vkmesh_host_trellis_remesh_finalize(
+                    &remesh_work,
+                    min_component_area,
+                    run_degenerate_cleanup,
+                    degenerate_abs,
+                    degenerate_rel)) {
+                if (g_vkmesh_last_error == VKMESH_ERROR_NONE) {
+                    vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+                }
+                goto cleanup;
+            }
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final done path=host vertices=%" PRId64 " faces=%" PRId64 "\n",
+                remesh_work.n_vertices,
+                remesh_work.n_faces);
         }
         mesh_free(mesh);
         *mesh = remesh_work;
@@ -8791,6 +9119,22 @@ static int vkmesh_trellis_postprocess_inner(
         } else {
             fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", mesh->n_faces, decimation_target);
         }
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final begin vertices=%" PRId64 " faces=%" PRId64 " min_component_area=%.9g run_degenerate_cleanup=%d\n",
+            mesh->n_vertices,
+            mesh->n_faces,
+            min_component_area,
+            run_degenerate_cleanup);
+        if (!vkmesh_host_trellis_remesh_finalize(
+                mesh,
+                min_component_area,
+                run_degenerate_cleanup,
+                degenerate_abs,
+                degenerate_rel)) return 0;
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final done path=host vertices=%" PRId64 " faces=%" PRId64 "\n",
+            mesh->n_vertices,
+            mesh->n_faces);
         fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
         return 1;
     }

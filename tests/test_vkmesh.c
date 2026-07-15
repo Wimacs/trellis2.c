@@ -10,6 +10,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <float.h>
 #include <stdint.h>
 #include <limits.h>
 #include <math.h>
@@ -1081,6 +1082,85 @@ static int test_api_validation(void) {
     return 1;
 }
 
+static int test_api_remesh_no_simplify_finalizes_components(void) {
+    static float vertices[24] = {
+        -0.55f, -0.20f, -0.20f,
+        -0.15f, -0.20f, -0.20f,
+        -0.55f,  0.20f, -0.20f,
+        -0.55f, -0.20f,  0.20f,
+         0.26f, -0.04f, -0.04f,
+         0.34f, -0.04f, -0.04f,
+         0.26f,  0.04f, -0.04f,
+         0.26f, -0.04f,  0.04f,
+    };
+    static int32_t faces[24] = {
+        0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
+        4, 6, 5, 4, 5, 7, 5, 6, 7, 6, 4, 7,
+    };
+    trellis_mesh_host input;
+    trellis_mesh_host output;
+    trellis_mesh_host projection;
+    trellis_vkmesh_postprocess_options options;
+    memset(&input, 0, sizeof(input));
+    memset(&output, 0, sizeof(output));
+    memset(&projection, 0, sizeof(projection));
+    memset(&options, 0, sizeof(options));
+    input.vertices = vertices;
+    input.faces = faces;
+    input.n_vertices = 8;
+    input.n_faces = 8;
+    options.no_simplify = 1;
+    options.remesh = 1;
+    options.remesh_resolution = 128;
+    options.remesh_band = 1.0f;
+    options.min_component_area = 1e-1f;
+    options.device = 0;
+
+    trellis_status status = trellis_vkmesh_postprocess(
+        &input, &output, &projection, &options);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(output.vertices != NULL && output.faces != NULL &&
+        output.n_vertices > 0 && output.n_faces > 0);
+
+    /* The small tetrahedron is large enough to survive the DC grid, but its
+       remeshed shells are below min_component_area.  Their removal proves the
+       finalizer also runs when no_simplify bypasses device simplification. */
+    float output_max_x = -FLT_MAX;
+    for (int64_t i = 0; i < output.n_vertices; ++i) {
+        output_max_x = fmaxf(output_max_x, output.vertices[(size_t) i * 3u]);
+    }
+    CHECK_TRUE(output_max_x < 0.0f);
+
+    /* Projection remains the post-prefill, pre-remesh source and must not be
+       rewritten by the finalizer.  Both source components remain present. */
+    CHECK_TRUE(projection.vertices != NULL && projection.faces != NULL &&
+        projection.n_vertices == input.n_vertices &&
+        projection.n_faces == input.n_faces);
+    CHECK_TRUE(memcmp(
+        projection.vertices,
+        input.vertices,
+        sizeof(vertices)) == 0);
+    CHECK_TRUE(memcmp(
+        projection.faces,
+        input.faces,
+        sizeof(faces)) == 0);
+
+    trellis_mesh_free(&output);
+    trellis_mesh_free(&projection);
+
+    /* Filtering every component is an explicit algorithm error. It must not
+       masquerade as a device soft failure and rerun the whole remesh path. */
+    options.min_component_area = 1.0f;
+    status = trellis_vkmesh_postprocess(
+        &input, &output, &projection, &options);
+    CHECK_TRUE(status == TRELLIS_STATUS_ERROR);
+    CHECK_TRUE(output.vertices == NULL && output.faces == NULL &&
+        output.n_vertices == 0 && output.n_faces == 0);
+    CHECK_TRUE(projection.vertices == NULL && projection.faces == NULL &&
+        projection.n_vertices == 0 && projection.n_faces == 0);
+    return 1;
+}
+
 static int test_api_workspace_oom_is_fatal(void) {
     enum { VERTEX_COUNT = 65536, FACE_COUNT = 100000 };
     const size_t vertex_words = (size_t) VERTEX_COUNT * 3u;
@@ -1176,6 +1256,7 @@ int main(int argc, char ** argv) {
     (void) test_remesh_workspace_chunking(argv[1]);
     (void) test_api_concurrent();
     (void) test_api_validation();
+    (void) test_api_remesh_no_simplify_finalizes_components();
     (void) test_api_workspace_oom_is_fatal();
     (void) test_gltf_bake();
     if (g_failures != 0) {
