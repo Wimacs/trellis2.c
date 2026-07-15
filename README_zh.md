@@ -6,218 +6,179 @@
 &nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;|&nbsp;&nbsp;|&nbsp;&nbsp;_&nbsp;&lt;|&nbsp;|___|&nbsp;|___|&nbsp;|___&nbsp;|&nbsp;|&nbsp;___)&nbsp;|/&nbsp;__/&nbsp;|&nbsp;|___<br>
 &nbsp;&nbsp;&nbsp;&nbsp;|_|&nbsp;&nbsp;|_|&nbsp;\_\_____|_____|_____|___|____/|_____(_)____|<br>
 <br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;trellis2.c&nbsp;image-to-3D&nbsp;pipeline
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;trellis2.c&nbsp;3D&nbsp;Local&nbsp;Gen&nbsp;All-in-One
   </samp>
 </p>
 
 <p align="center">
-  <img src="img.png" alt="trellis2.c 本地工作区">
+  <img src="teaser.png" alt="trellis2.c pipeline 工作区">
 </p>
 
-`trellis2.c` 支持 TRELLIS.2、Pixal3D 图像转 3D 和 TokenSkin 网格权重绑定的
-原生 CUDA/Vulkan 推理。每个模型使用一个独立可执行文件：
-`trellis2-image-to-gltf`、`pixal3d-image-to-gltf` 和 `tokenskin-rig`。
+`trellis2.c` 是一套全本地运行的一体化 3D 生成工具，集成 TRELLIS.2、
+Pixal3D、SegViGen 和 TokenSkin，包含图生 3D、网格贴图、全自动拆件和自动绑骨，
+推理完全运行在原生 CUDA 或 Vulkan 上，不依赖 Python 或 PyTorch runtime。
 
 ## 编译
 
-带子模块克隆：
+依赖：
+
+- Git 和 CMake 3.22 或更高版本。
+- C/C++ 工具链：Linux 使用 GCC/Clang，Windows 使用 Visual Studio 2022。
+- Vulkan SDK，包括 loader、headers 和 `glslc`。
+- 编译 CUDA 后端时需要 CUDA Toolkit。
+- Linux 编译随附的 raylib GUI 时需要 OpenGL 和 X11 开发包。
+
+两种推理后端都需要 Vulkan SDK，因为 pipeline 工具还会编译 Vulkan 网格后处理器和纹理烘焙器。
+
+连同所有子模块一起克隆：
 
 ```sh
-git clone --recursive git@github.com:Wimacs/trellis2.c.git
+git clone --recursive https://github.com/Wimacs/trellis2.c.git
 cd trellis2.c
 ```
 
-如果克隆时没有加 `--recursive`，再执行：
+如果克隆时没有下载子模块：
 
 ```sh
 git submodule update --init --recursive
 ```
 
+### Linux
+
 CUDA：
 
 ```sh
-cmake -S . -B build -DTRELLIS2_C_BACKEND=cuda
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake -S . -B build-cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTRELLIS2_C_BACKEND=cuda
+cmake --build build-cuda -j
 ```
 
 Vulkan：
 
 ```sh
-cmake -S . -B build-vulkan -DTRELLIS2_C_BACKEND=vulkan
+cmake -S . -B build-vulkan \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTRELLIS2_C_BACKEND=vulkan
 cmake --build build-vulkan -j
 ```
 
-Windows CUDA：
+### Windows
+
+在 Visual Studio Developer Shell 中运行。
+
+CUDA：
 
 ```powershell
-cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 -DTRELLIS2_C_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build-win --config Release
-ctest --test-dir build-win -C Release --output-on-failure
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 `
+  -DTRELLIS2_C_BACKEND=cuda
+cmake --build build-win --config Release --parallel
 ```
 
-Windows Vulkan：
-
-先安装 Vulkan SDK。
+Vulkan：
 
 ```powershell
-cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 -DTRELLIS2_C_BACKEND=vulkan
-cmake --build build-win-vulkan --config Release
-ctest --test-dir build-win-vulkan -C Release --output-on-failure
+cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 `
+  -DTRELLIS2_C_BACKEND=vulkan
+cmake --build build-win-vulkan --config Release --parallel
 ```
 
-## 下载权重
+CUDA 默认编译 compute capability 8.9。其他代际 GPU 请设置
+`-DCMAKE_CUDA_ARCHITECTURES=<SM>`。只编译 CLI 时可加入
+`-DTRELLIS2_C_BUILD_RAYLIB_VIEWER=OFF`；不需要测试程序时可加入
+`-DTRELLIS2_C_BUILD_TESTS=OFF`。
 
-Hugging Face：
+下面的示例使用 `./build-cuda/`。Vulkan 构建改用 `./build-vulkan/`；
+Windows CUDA 和 Vulkan 分别改用 `./build-win/Release/` 和
+`./build-win-vulkan/Release/`。后端已经编译进可执行文件，不需要额外的后端参数。
+
+## Pipelines
+
+示例假设对应的模型包已经下载或转换完成。TRELLIS.2、DINOv3 和 BiRefNet
+可以使用 `tools/download_weights.py` 创建的目录；NAF、SegViGen 和 TokenSkin
+的转换脚本位于 `tools/`。
+
+### `trellis2-image-to-gltf`
+
+使用 TRELLIS.2 从单张图片生成带纹理 3D 资产。完整流程包括前景处理、DINOv3
+图像编码、形状生成与解码、拓扑清理、PBR 纹理生成以及 GLB/glTF 导出。
+默认 profile 为 `512`，`--pipeline 1024` 使用 1024 profile；
+`--shape-only` 可以跳过纹理生成。
 
 ```sh
-python3 tools/download_weights.py --source huggingface
-```
-
-ModelScope：
-
-```sh
-python3 tools/download_weights.py --source modelscope
-```
-
-会下载 TRELLIS.2、DINOv3 和 BiRefNet 背景去除模型：
-
-Hugging Face 下载默认使用公开镜像
-`camenduru/dinov3-vitl16-pretrain-lvd1689m`，因为 Meta 官方仓库需要先接受访问协议。
-所需模型文件与官方仓库一致；可通过 `--dino-repo` 覆盖下载源。
-
-```text
-../TRELLIS.2/
-|-- TRELLIS.2-4B/
-|-- dinov3-vitl16-pretrain-lvd1689m/
-`-- BiRefNet/
-    `-- BiRefNet-F16.gguf
-```
-
-## 使用
-
-Linux：
-
-```sh
-./build/trellis2-image-to-gltf \
-  --model ../TRELLIS.2/TRELLIS.2-4B \
-  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --birefnet ../TRELLIS.2/BiRefNet/BiRefNet-F16.gguf \
-  --image example_image/T.png \
-  --pipeline 1024 \
-  --gltf output.glb
-```
-
-TRELLIS.2 命令默认使用 512 profile，并支持通过 `--pipeline 1024` 直接进行
-1024 分辨率生成；它会在读取图片和初始化 GPU 前拒绝 Pixal3D 模型包。
-
-形状生成可以和材质生成分开执行。下面的命令只生成网格，同时保存实际用于
-条件输入的去背 RGBA 图片，以及重拓扑前的 shape latent：
-
-```sh
-./build/trellis2-image-to-gltf \
+./build-cuda/trellis2-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image example_image/T.png \
-  --shape-only \
-  --prepared-image-output prepared.png \
-  --shape-latent-output shape.tslat \
-  --output shape.glb
+  --pipeline 1024 \
+  --output output.glb
 ```
 
-`--shape-only` 会跳过 texture flow 和 texture decoder。`.tslat` 是与资产绑定的
-缓存，只应和同一个形状或仅修改拓扑的重拓扑版本一起保存和复用。
+不透明输入会在可用时使用自动发现的 BiRefNet；透明 RGBA 输入直接使用。
 
-### 为现有 TRELLIS.2 网格生成材质
+### `pixal3d-image-to-gltf`
 
-`trellis2-texture-mesh` 可以为现有三角网格生成 PBR 材质。没有兼容缓存时，
-它会将网格转换成 Flexible Dual Grid，再运行 `FlexiDualGridVaeEncoder`；有缓存
-时则直接复用 shape latent。之后根据参考图片生成并烘焙 base color 和
-metallic-roughness 纹理，输出自包含 GLB。
+使用 Pixal3D 的 NAF 和投影图像条件生成带纹理 3D 资产。默认使用
+`1024_cascade`，可通过 `--pipeline 1536_cascade` 使用更大的 cascade。
+NAF 会从 `MODEL/ckpts/naf_release.safetensors` 自动发现，也可通过 `--naf` 指定。
 
 ```sh
-./build/trellis2-texture-mesh \
-  --model ../TRELLIS.2/TRELLIS.2-4B \
-  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
-  --input remeshed-shape.glb \
-  --image prepared.png --image-prepared \
-  --shape-latent shape.tslat \
-  --output textured.glb
-```
-
-缓存不存在、损坏、分辨率不符或与当前网格几何不兼容时，程序会回退到重新编码
-当前网格。可使用 `--shape-latent-output FILE` 保存回退后得到的新缓存。该任务会
-重建静态纹理网格，不保留输入的节点、材质、UV、蒙皮、动画或 VRM 扩展。
-
-Pixal3D 默认使用 `1024_cascade`，命令为：
-
-```sh
-./build/pixal3d-image-to-gltf \
+./build-cuda/pixal3d-image-to-gltf \
   --model ../Pixal3D/Pixal3D \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image example_image/T.png \
-  --gltf pixal3d.glb
+  --output pixal3d.glb
 ```
 
-Pixal3D 专用命令提供 `--naf`、`--fov`、`--camera-distance`、
-`--mesh-scale` 和 cascade pipeline；TRELLIS.2 的 `--pipeline` 仅接受
-`512` 或 `1024`。两个命令共享底层 task、算子、vkmesh 补洞和 remesh 实现。
+不透明输入还需要可自动发现的 BiRefNet，或显式传入 `--birefnet FILE`；
+透明 RGBA 输入不需要。
 
-### TokenSkin 网格权重绑定
+### `trellis2-texture-mesh`
 
-TokenSkin 使用独立的 `tokenskin-rig`，不会作为模式混入两个图像转 3D
-命令。先将官方 TokenRig Lightning checkpoint 转换为三个推理权重文件；
-转换脚本需要 Python `torch` 和 `safetensors`：
+根据参考图为已有三角网格生成新的 PBR 材质。pipeline 会把网格编码为
+TRELLIS.2 shape latent，运行纹理 flow 和 decoder，再写出新的静态 GLB。
+由于资产会被重建，原节点层级、材质、UV、skin、animation 和 VRM 扩展不会保留。
 
 ```sh
-python3 tools/convert_tokenskin_weights.py \
-  /path/to/grpo_1400.ckpt \
-  models/tokenskin/ckpts
+./build-cuda/trellis2-texture-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input input.glb \
+  --image reference.png \
+  --output textured.glb
 ```
 
-CUDA 构建直接运行：
+不透明参考图需要 BiRefNet；已完成前景处理的图片可配合 `--image-prepared` 使用。
+
+### `trellis2-segment-mesh`
+
+使用 SegViGen Full 全自动拆分静态 GLB/glTF。没有指定条件图时，pipeline
+会从固定视角自动渲染条件图，预测零件标签、拆分连通组件，并输出一个 assembly
+GLB，其中每个物理零件都是可单独选择的 node 和 mesh。默认输出保证每个源面恰好
+出现一次，并保留可映射的标准顶点属性、材质和纹理。
 
 ```sh
-./build/tokenskin-rig \
+./build-cuda/trellis2-segment-mesh \
+  --model ../TRELLIS.2/TRELLIS.2-4B \
+  --segmentation-model ../SegviGen \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --input input.glb \
+  --output parts.glb
+```
+
+`--small-part-mode keep|merge|discard` 控制断开的小壳；`discard` 会主动删除其面。
+pipeline 不生成切面或封口，因此拆出的零件不保证水密。无法正确保留 skin、
+animation、morph、instancing 或扩展的输入会被拒绝。
+
+### `tokenskin-rig`
+
+使用 TokenSkin 为已有 GLB/glTF 自动绑骨。输出 GLB 包含生成的骨架、joint、
+inverse bind matrix 和 skin weight。展平后的世界空间几何和标准 PBR 外观会保留；
+原节点层级、morph target 和已有 animation 不会保留。
+
+```sh
+./build-cuda/tokenskin-rig \
   --model models/tokenskin \
   --input input.glb \
-  --output rigged-cuda.glb
-```
-
-Vulkan 构建使用相同参数，不需要额外环境变量或推理选项：
-
-```sh
-./build-vulkan/tokenskin-rig \
-  --model models/tokenskin \
-  --input input.glb \
-  --output rigged-vulkan.glb
-```
-
-输入可以是 GLB 或 glTF，输出是包含骨骼、逆绑定矩阵、关节索引和蒙皮权重的
-自包含 GLB。当前实现会保留展平到世界坐标的网格几何、拓扑、标准 glTF PBR
-材质、UV、采样器以及图片和纹理数据；不会保留源节点结构、morph target、
-动画或 VRM 扩展。若源外观无法安全复制，仍会输出有效的绑定模型，并回退为
-不透明白色 PBR 材质。
-
-Windows：
-
-```powershell
-.\build-win\Release\trellis2-image-to-gltf.exe `
-  --model ..\TRELLIS.2\TRELLIS.2-4B `
-  --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
-  --image example_image\T.png `
-  --gltf output.glb
-```
-
-Windows Vulkan 构建使用：
-
-```powershell
-.\build-win-vulkan\Release\trellis2-image-to-gltf.exe `
-  --backend vulkan `
-  --model ..\TRELLIS.2\TRELLIS.2-4B `
-  --dino ..\TRELLIS.2\dinov3-vitl16-pretrain-lvd1689m `
-  --birefnet ..\TRELLIS.2\BiRefNet\BiRefNet-F16.gguf `
-  --image example_image\T.png `
-  --gltf output.glb
+  --output rigged.glb
 ```
