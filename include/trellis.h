@@ -1018,6 +1018,15 @@ typedef struct trellis_mesh_texturing_options {
 trellis_status trellis_pipeline_trellis2_texture_mesh(
     const trellis_mesh_texturing_options * options);
 
+typedef enum trellis_mesh_segmentation_small_part_mode {
+    /* Leave disconnected micro-shells unchanged. */
+    TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP = 0,
+    /* Attach automatically detected micro-shells to the nearest retained part. */
+    TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE = 1,
+    /* Remove automatically detected micro-shell faces from the output GLB. */
+    TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD = 2,
+} trellis_mesh_segmentation_small_part_mode;
+
 typedef struct trellis_mesh_segmentation_options {
     size_t struct_size;              /* set to sizeof(trellis_mesh_segmentation_options) */
     const char * model_dir;          /* base TRELLIS.2 model package root */
@@ -1044,7 +1053,7 @@ typedef struct trellis_mesh_segmentation_options {
     int resolution;                  /* SegviGen Full is pinned to 512 */
     int steps;                       /* paired flow Euler steps, default 12 */
     uint32_t seed;                   /* generated segmentation latent seed, default 42 */
-    int min_component_faces;         /* absorb smaller connected islands, default 16 */
+    int min_component_faces;         /* absorb islands; micro-shell face threshold, default 16 */
     int min_palette_voxels;          /* ignore smaller decoded color bins, default 16 */
     float palette_merge_distance;    /* RGB Euclidean radius, default 32/255 */
     int condition_image_prepared;    /* skip BiRefNet for condition_image_path */
@@ -1053,14 +1062,19 @@ typedef struct trellis_mesh_segmentation_options {
     int flow_no_rope;                /* debug sparse-RoPE bypass */
     int emulate_bf16_blocks;         /* debug explicit BF16 activation round trips */
     int no_flash_attn;               /* debug explicit-attention fallback */
+    trellis_mesh_segmentation_small_part_mode small_part_mode; /* default KEEP; V2 */
 } trellis_mesh_segmentation_options;
 
 #define TRELLIS_MESH_SEGMENTATION_OPTIONS_V1_SIZE \
     (offsetof(trellis_mesh_segmentation_options, no_flash_attn) + sizeof(int))
+#define TRELLIS_MESH_SEGMENTATION_OPTIONS_V2_SIZE \
+    (offsetof(trellis_mesh_segmentation_options, small_part_mode) + \
+     sizeof(trellis_mesh_segmentation_small_part_mode))
 #define TRELLIS_MESH_SEGMENTATION_OPTIONS_INIT \
     { sizeof(trellis_mesh_segmentation_options), NULL, NULL, NULL, NULL, NULL, \
       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
-      NULL, NULL, NULL, 0, 512, 12, 42u, 16, 16, (32.0f / 255.0f), 0, -1, -1, 0, 0, 0 }
+      NULL, NULL, NULL, 0, 512, 12, 42u, 16, 16, (32.0f / 255.0f), 0, -1, -1, 0, 0, 0, \
+      TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP }
 
 /* SegviGen Full automatic mesh decomposition. The model predicts categorical
  * voxel colors from a paired generated/source texture SLat. Colors are

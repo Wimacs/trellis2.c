@@ -926,13 +926,8 @@ trellis_status trellis_mesh_segmentation_write_parts_glb(
     for (size_t face = 0; face < face_count; ++face) face_next[face] = UINT32_MAX;
 
     size_t range_cursor = 0;
+    size_t retained_face_count = 0;
     for (size_t face = 0; face < face_count; ++face) {
-        if ((size_t) face_part_ids[face] >= part_count) {
-            parts_set_error(error_out, error_size, "face part id exceeds part_count");
-            status = TRELLIS_STATUS_INVALID_ARGUMENT;
-            goto cleanup;
-        }
-        ++part_faces[face_part_ids[face]];
         if (asset->primitive_count != 0) {
             while (range_cursor < asset->primitive_count &&
                 face >= asset->primitives[range_cursor].first_triangle +
@@ -946,6 +941,14 @@ trellis_status trellis_mesh_segmentation_write_parts_glb(
                 goto cleanup;
             }
         }
+        if (face_part_ids[face] == UINT32_MAX) continue;
+        if ((size_t) face_part_ids[face] >= part_count) {
+            parts_set_error(error_out, error_size, "face part id exceeds part_count");
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            goto cleanup;
+        }
+        ++part_faces[face_part_ids[face]];
+        ++retained_face_count;
         if (!group_table_find_or_insert(
                 &table,
                 face_part_ids[face],
@@ -956,8 +959,11 @@ trellis_status trellis_mesh_segmentation_write_parts_glb(
             goto cleanup;
         }
     }
-    if (table.count == 0 || table.count >= UINT32_MAX) {
-        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+    if (retained_face_count == 0 || table.count == 0 ||
+        table.count >= UINT32_MAX) {
+        parts_set_error(error_out, error_size, "parts GLB cannot discard every source face");
+        status = retained_face_count == 0 ?
+            TRELLIS_STATUS_INVALID_ARGUMENT : TRELLIS_STATUS_OUT_OF_MEMORY;
         goto cleanup;
     }
     for (size_t part = 0; part < part_count; ++part) {
@@ -1349,7 +1355,7 @@ trellis_status trellis_mesh_segmentation_write_parts_glb(
                     "cgltf failed to write parts GLB");
         } else {
             status = verify_parts_glb(
-                temporary, part_count, face_count, error_out, error_size);
+                temporary, part_count, retained_face_count, error_out, error_size);
             if (status == TRELLIS_STATUS_OK && !parts_atomic_replace(temporary, path)) {
                 parts_set_error(error_out, error_size, "failed to atomically replace parts GLB");
                 status = TRELLIS_STATUS_IO_ERROR;

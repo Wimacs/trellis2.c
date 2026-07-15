@@ -12,10 +12,13 @@ extern "C" {
 
 /* Writes one self-contained GLB with an assembly root and one independently
  * selectable node+mesh per dense part id. Geometry remains in the flattened
- * source glTF world coordinate system. Each input face is emitted exactly
- * once, and vertices shared across part boundaries are duplicated. A part is
+ * source glTF world coordinate system. Each retained input face is emitted
+ * exactly once, and vertices shared across part boundaries are duplicated. A
+ * part is
  * split into one primitive per source primitive instance so original material
- * assignments and vertex-attribute layouts remain intact. Source materials,
+ * assignments and vertex-attribute layouts remain intact. A face part id of
+ * UINT32_MAX is an explicit discard sentinel and is omitted; all remaining
+ * part ids must still be dense and non-empty. Source materials,
  * textures, samplers, and images are retained; images are embedded in the GLB.
  * Unsupported lossless-preservation cases fail explicitly rather than falling
  * back to per-part debug colors. */

@@ -45,6 +45,8 @@ static void usage(FILE * output, const char * executable) {
         "  --steps N                   Paired flow steps (default 12)\n"
         "  --seed N                    Segmentation latent seed (default 42)\n"
         "  --min-component-faces N     Absorb smaller islands (default 16)\n"
+        "  --small-part-mode MODE      keep, merge, or discard disconnected "
+            "micro-shells (default keep)\n"
         "  --min-palette-voxels N      Ignore smaller color bins (default 16)\n"
         "  --palette-merge-distance F  RGB merge radius (default 0.12549)\n"
         "  --backend NAME              Compiled backend (default "
@@ -92,6 +94,22 @@ static int parse_float(const char * text, float * output) {
     return 1;
 }
 
+static int parse_small_part_mode(
+    const char * text,
+    trellis_mesh_segmentation_small_part_mode * output) {
+    if (text == NULL || output == NULL) return 0;
+    if (strcmp(text, "keep") == 0) {
+        *output = TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP;
+    } else if (strcmp(text, "merge") == 0) {
+        *output = TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE;
+    } else if (strcmp(text, "discard") == 0) {
+        *output = TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static int argument_ranges_are_valid(
     const trellis_mesh_segmentation_options * options) {
     return options != NULL &&
@@ -99,6 +117,10 @@ static int argument_ranges_are_valid(
         options->steps > 0 && options->steps <= 1000 &&
         options->min_component_faces >= 0 &&
         options->min_palette_voxels > 0 &&
+        options->small_part_mode >=
+            TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP &&
+        options->small_part_mode <=
+            TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD &&
         isfinite(options->palette_merge_distance) &&
         options->palette_merge_distance >= 0.0f &&
         options->palette_merge_distance <= 1.732051f;
@@ -162,6 +184,10 @@ int main(int argc, char ** argv) {
             if (!parse_int(
                     argument_value(argc, argv, &index),
                     &options.min_component_faces)) goto bad_args;
+        } else if (strcmp(argv[index], "--small-part-mode") == 0) {
+            if (!parse_small_part_mode(
+                    argument_value(argc, argv, &index),
+                    &options.small_part_mode)) goto bad_args;
         } else if (strcmp(argv[index], "--min-palette-voxels") == 0) {
             if (!parse_int(
                     argument_value(argc, argv, &index),
@@ -196,7 +222,8 @@ int main(int argc, char ** argv) {
             stderr,
             "invalid argument range: --device must be >= 0, --steps must be "
             "1..1000, component thresholds must be non-negative (palette > 0), "
-            "and --palette-merge-distance must be 0..sqrt(3)\n");
+            "--small-part-mode must be keep, merge, or discard, and "
+            "--palette-merge-distance must be 0..sqrt(3)\n");
         goto bad_args;
     }
 

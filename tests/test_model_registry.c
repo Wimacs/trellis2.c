@@ -255,7 +255,8 @@ static void test_mesh_segmentation_public_options_contract(void) {
         TRELLIS_MESH_SEGMENTATION_OPTIONS_INIT;
     CHECK_TRUE(options.struct_size == sizeof(options));
     CHECK_TRUE(options.struct_size >=
-        TRELLIS_MESH_SEGMENTATION_OPTIONS_V1_SIZE);
+        TRELLIS_MESH_SEGMENTATION_OPTIONS_V2_SIZE);
+    CHECK_TRUE(TRELLIS_MESH_SEGMENTATION_OPTIONS_V2_SIZE == sizeof(options));
     CHECK_TRUE(options.resolution == 512);
     CHECK_TRUE(options.steps == 12);
     CHECK_TRUE(options.seed == 42u);
@@ -263,6 +264,8 @@ static void test_mesh_segmentation_public_options_contract(void) {
     CHECK_TRUE(options.min_palette_voxels == 16);
     CHECK_TRUE(options.palette_merge_distance == (32.0f / 255.0f));
     CHECK_TRUE(options.condition_image_prepared == 0);
+    CHECK_TRUE(options.small_part_mode ==
+        TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP);
 
     options.model_dir = "must-not-be-opened";
     options.segmentation_model_dir = "must-not-be-opened";
@@ -284,6 +287,19 @@ static void test_mesh_segmentation_public_options_contract(void) {
     options.steps = 12;
     options.min_palette_voxels = 0;
     CHECK_TRUE(trellis_pipeline_trellis2_segment_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    options.min_palette_voxels = 16;
+    options.small_part_mode =
+        (trellis_mesh_segmentation_small_part_mode) 99;
+    options.struct_size = TRELLIS_MESH_SEGMENTATION_OPTIONS_V2_SIZE;
+    CHECK_TRUE(trellis_pipeline_trellis2_segment_mesh(&options) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+
+    /* A V1 caller has no small_part_mode field. Even if trailing storage in
+     * this test contains an invalid value, struct_size gates the read and the
+     * pipeline must apply the legacy KEEP behavior instead of rejecting it. */
+    options.struct_size = TRELLIS_MESH_SEGMENTATION_OPTIONS_V1_SIZE;
+    CHECK_TRUE(trellis_pipeline_trellis2_segment_mesh(&options) !=
         TRELLIS_STATUS_INVALID_ARGUMENT);
 }
 

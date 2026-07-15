@@ -478,6 +478,57 @@ cleanup:
     return ok;
 }
 
+static int run_discarded_face_round_trip(void) {
+    static const uint32_t parts[] = {UINT32_MAX, 0u, UINT32_MAX, 0u};
+    char source_path[4096] = {0};
+    char output_path[4096] = {0};
+    char error[512] = {0};
+    trellis_mesh_rigging_asset asset = TRELLIS_MESH_RIGGING_ASSET_INIT;
+    cgltf_data * data = NULL;
+    int ok = 0;
+
+    CHECK_TRUE(trellis_make_temp_path(
+        source_path, sizeof(source_path), "trellis_parts_discard_source", ".glb"));
+    CHECK_TRUE(trellis_make_temp_path(
+        output_path, sizeof(output_path), "trellis_parts_discard_output", ".glb"));
+    CHECK_TRUE(write_appearance_source_glb(source_path, "[1,1,1]", ""));
+    CHECK_TRUE(trellis_mesh_rigging_gltf_load(
+        source_path, &asset, error, sizeof(error)) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(asset.primitive_count == 2u && asset.triangle_count == 4u);
+    CHECK_TRUE(trellis_mesh_segmentation_write_parts_glb(
+        output_path, &asset, parts, 4u, 1u, NULL, error, sizeof(error)) ==
+        TRELLIS_STATUS_OK);
+
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    CHECK_TRUE(cgltf_parse_file(&options, output_path, &data) ==
+        cgltf_result_success);
+    CHECK_TRUE(cgltf_load_buffers(&options, data, output_path) ==
+        cgltf_result_success);
+    CHECK_TRUE(cgltf_validate(data) == cgltf_result_success);
+    CHECK_TRUE(data->scene != NULL && data->scene->nodes_count == 1u);
+    CHECK_TRUE(data->scene->nodes[0]->children_count == 1u);
+    const cgltf_mesh * mesh = data->scene->nodes[0]->children[0]->mesh;
+    CHECK_TRUE(mesh != NULL && mesh->primitives_count == 2u);
+    size_t total_faces = 0;
+    for (size_t primitive = 0; primitive < 2u; ++primitive) {
+        CHECK_TRUE(mesh->primitives[primitive].indices != NULL);
+        CHECK_TRUE(mesh->primitives[primitive].indices->count == 3u);
+        CHECK_TRUE(mesh->primitives[primitive].material ==
+            &data->materials[primitive]);
+        total_faces += (size_t) mesh->primitives[primitive].indices->count / 3u;
+    }
+    CHECK_TRUE(total_faces == 2u);
+    ok = 1;
+
+cleanup:
+    if (data != NULL) cgltf_free(data);
+    trellis_mesh_rigging_asset_free(&asset);
+    if (source_path[0] != '\0') trellis_unlink(source_path);
+    if (output_path[0] != '\0') trellis_unlink(output_path);
+    return ok;
+}
+
 static int run_tiny_uniform_scale_preservation(void) {
     char source_path[4096] = {0};
     char error[512] = {0};
@@ -551,6 +602,7 @@ static int run_validation_checks(void) {
     static uint32_t triangles[] = {0u, 1u, 2u};
     static const uint32_t invalid_part[] = {2u};
     static const uint32_t part_zero[] = {0u};
+    static const uint32_t discarded[] = {UINT32_MAX};
     trellis_mesh_rigging_asset asset = TRELLIS_MESH_RIGGING_ASSET_INIT;
     asset.positions = positions;
     asset.vertex_count = 3;
@@ -571,6 +623,10 @@ static int run_validation_checks(void) {
     CHECK_TRUE(
         trellis_mesh_segmentation_write_parts_glb(
             "not-a-glb.gltf", &asset, part_zero, 1, 1, NULL, error, sizeof(error)) ==
+        TRELLIS_STATUS_INVALID_ARGUMENT);
+    CHECK_TRUE(
+        trellis_mesh_segmentation_write_parts_glb(
+            path, &asset, discarded, 1, 1, NULL, error, sizeof(error)) ==
         TRELLIS_STATUS_INVALID_ARGUMENT);
     ok = 1;
 cleanup:
@@ -651,6 +707,7 @@ cleanup:
 int main(void) {
     run_parts_round_trip();
     run_source_appearance_round_trip();
+    run_discarded_face_round_trip();
     run_tiny_uniform_scale_preservation();
     run_required_extension_rejection();
     run_validation_checks();

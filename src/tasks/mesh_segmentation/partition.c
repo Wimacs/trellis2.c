@@ -1,5 +1,6 @@
 #include "partition.h"
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -58,18 +59,26 @@ static int edge_same_key(
     return left->low == right->low && left->high == right->high;
 }
 
-trellis_status trellis_mesh_segmentation_partition_faces(
+static trellis_status partition_faces_internal(
     const uint32_t * triangles,
     size_t face_count,
     size_t vertex_count,
     const uint32_t * semantic_labels,
     size_t min_component_faces,
     uint32_t ** part_ids_out,
-    size_t * part_count_out) {
+    size_t * part_count_out,
+    uint32_t ** geometric_shell_ids_out,
+    size_t * geometric_shell_count_out) {
     if (part_ids_out != NULL) *part_ids_out = NULL;
     if (part_count_out != NULL) *part_count_out = 0;
+    if (geometric_shell_ids_out != NULL) *geometric_shell_ids_out = NULL;
+    if (geometric_shell_count_out != NULL) *geometric_shell_count_out = 0;
+    const int collect_shells = geometric_shell_ids_out != NULL &&
+        geometric_shell_count_out != NULL;
     if (triangles == NULL || semantic_labels == NULL || face_count == 0 ||
         vertex_count == 0 || part_ids_out == NULL || part_count_out == NULL ||
+        ((geometric_shell_ids_out == NULL) !=
+         (geometric_shell_count_out == NULL)) ||
         face_count > UINT32_MAX ||
         face_count > SIZE_MAX / (3u * sizeof(segmentation_edge)) ||
         face_count > SIZE_MAX / sizeof(uint32_t) ||
@@ -85,11 +94,22 @@ trellis_status trellis_mesh_segmentation_partition_faces(
     size_t * best_size = (size_t *) calloc(face_count, sizeof(size_t));
     uint32_t * dense_root = (uint32_t *) malloc(face_count * sizeof(uint32_t));
     uint32_t * output = (uint32_t *) malloc(face_count * sizeof(uint32_t));
+    uint32_t * shell_parent = collect_shells ?
+        (uint32_t *) malloc(face_count * sizeof(uint32_t)) : NULL;
+    size_t * shell_sizes = collect_shells ?
+        (size_t *) malloc(face_count * sizeof(size_t)) : NULL;
+    uint32_t * shell_dense = collect_shells ?
+        (uint32_t *) malloc(face_count * sizeof(uint32_t)) : NULL;
+    uint32_t * shell_output = collect_shells ?
+        (uint32_t *) malloc(face_count * sizeof(uint32_t)) : NULL;
     if (edges == NULL || parent == NULL || sizes == NULL ||
         best_neighbor == NULL || best_size == NULL || dense_root == NULL ||
-        output == NULL) {
+        output == NULL ||
+        (collect_shells && (shell_parent == NULL || shell_sizes == NULL ||
+                            shell_dense == NULL || shell_output == NULL))) {
         free(edges); free(parent); free(sizes); free(best_neighbor);
-        free(best_size); free(dense_root); free(output);
+        free(best_size); free(dense_root); free(output); free(shell_parent);
+        free(shell_sizes); free(shell_dense); free(shell_output);
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
     for (size_t face = 0; face < face_count; ++face) {
@@ -97,13 +117,19 @@ trellis_status trellis_mesh_segmentation_partition_faces(
         sizes[face] = 1;
         best_neighbor[face] = UINT32_MAX;
         dense_root[face] = UINT32_MAX;
+        if (collect_shells) {
+            shell_parent[face] = (uint32_t) face;
+            shell_sizes[face] = 1u;
+            shell_dense[face] = UINT32_MAX;
+        }
         const uint32_t a = triangles[face * 3u];
         const uint32_t b = triangles[face * 3u + 1u];
         const uint32_t c = triangles[face * 3u + 2u];
         if ((size_t) a >= vertex_count || (size_t) b >= vertex_count ||
             (size_t) c >= vertex_count || a == b || b == c || c == a) {
             free(edges); free(parent); free(sizes); free(best_neighbor);
-            free(best_size); free(dense_root); free(output);
+            free(best_size); free(dense_root); free(output); free(shell_parent);
+            free(shell_sizes); free(shell_dense); free(shell_output);
             return TRELLIS_STATUS_PARSE_ERROR;
         }
         const uint32_t vertices[3] = {a, b, c};
@@ -126,6 +152,10 @@ trellis_status trellis_mesh_segmentation_partition_faces(
             for (size_t right = left + 1u; right < end; ++right) {
                 const uint32_t left_face = edges[left].face;
                 const uint32_t right_face = edges[right].face;
+                if (collect_shells) {
+                    partition_union(
+                        shell_parent, shell_sizes, left_face, right_face);
+                }
                 if (semantic_labels[left_face] == semantic_labels[right_face]) {
                     partition_union(parent, sizes, left_face, right_face);
                 }
@@ -178,9 +208,11 @@ trellis_status trellis_mesh_segmentation_partition_faces(
     for (size_t face = 0; face < face_count; ++face) {
         const uint32_t root = partition_find(parent, (uint32_t) face);
         if (dense_root[root] == UINT32_MAX) {
-            if (part_count > UINT32_MAX) {
+            if (part_count >= UINT32_MAX) {
                 free(edges); free(parent); free(sizes); free(best_neighbor);
                 free(best_size); free(dense_root); free(output);
+                free(shell_parent); free(shell_sizes); free(shell_dense);
+                free(shell_output);
                 return TRELLIS_STATUS_OUT_OF_MEMORY;
             }
             dense_root[root] = (uint32_t) part_count++;
@@ -188,11 +220,54 @@ trellis_status trellis_mesh_segmentation_partition_faces(
         output[face] = dense_root[root];
     }
 
+    size_t shell_count = 0;
+    if (collect_shells) {
+        for (size_t face = 0; face < face_count; ++face) {
+            const uint32_t root = partition_find(shell_parent, (uint32_t) face);
+            if (shell_dense[root] == UINT32_MAX) {
+                if (shell_count >= UINT32_MAX) {
+                    free(edges); free(parent); free(sizes); free(best_neighbor);
+                    free(best_size); free(dense_root); free(output);
+                    free(shell_parent); free(shell_sizes); free(shell_dense);
+                    free(shell_output);
+                    return TRELLIS_STATUS_OUT_OF_MEMORY;
+                }
+                shell_dense[root] = (uint32_t) shell_count++;
+            }
+            shell_output[face] = shell_dense[root];
+        }
+    }
+
     free(edges); free(parent); free(sizes); free(best_neighbor);
-    free(best_size); free(dense_root);
+    free(best_size); free(dense_root); free(shell_parent); free(shell_sizes);
+    free(shell_dense);
     *part_ids_out = output;
     *part_count_out = part_count;
+    if (collect_shells) {
+        *geometric_shell_ids_out = shell_output;
+        *geometric_shell_count_out = shell_count;
+    }
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_mesh_segmentation_partition_faces(
+    const uint32_t * triangles,
+    size_t face_count,
+    size_t vertex_count,
+    const uint32_t * semantic_labels,
+    size_t min_component_faces,
+    uint32_t ** part_ids_out,
+    size_t * part_count_out) {
+    return partition_faces_internal(
+        triangles,
+        face_count,
+        vertex_count,
+        semantic_labels,
+        min_component_faces,
+        part_ids_out,
+        part_count_out,
+        NULL,
+        NULL);
 }
 
 static uint64_t segmentation_mix_u64(uint64_t value) {
@@ -214,7 +289,377 @@ static size_t segmentation_cell_bucket(
     return (size_t) hash & mask;
 }
 
-trellis_status trellis_mesh_segmentation_partition_faces_geometric(
+/* A shell must pass both scale gates. The values intentionally sit above the
+ * observed tail of disconnected tessellation specks while remaining far below
+ * a low-poly but model-scale component. They are ratios, so source units do
+ * not affect the decision. */
+#define SEGMENTATION_SMALL_SHELL_MAX_DIAGONAL_RATIO 0.01
+#define SEGMENTATION_SMALL_SHELL_MAX_AREA_RATIO 1e-5
+
+typedef struct segmentation_shell_stats {
+    size_t face_count;
+    double area;
+    double centroid[3];
+    double bounds_min[3];
+    double bounds_max[3];
+    uint32_t dominant_part;
+    size_t dominant_part_faces;
+    int candidate;
+} segmentation_shell_stats;
+
+typedef struct segmentation_part_stats {
+    size_t face_count;
+    uint32_t shell_id;
+    uint32_t semantic_label;
+    double bounds_min[3];
+    double bounds_max[3];
+} segmentation_part_stats;
+
+static void segmentation_bounds_init(double bounds_min[3], double bounds_max[3]) {
+    for (size_t axis = 0; axis < 3u; ++axis) {
+        bounds_min[axis] = DBL_MAX;
+        bounds_max[axis] = -DBL_MAX;
+    }
+}
+
+static void segmentation_bounds_include(
+    double bounds_min[3],
+    double bounds_max[3],
+    const float * point) {
+    for (size_t axis = 0; axis < 3u; ++axis) {
+        const double value = point[axis];
+        if (value < bounds_min[axis]) bounds_min[axis] = value;
+        if (value > bounds_max[axis]) bounds_max[axis] = value;
+    }
+}
+
+static double segmentation_bounds_diagonal_squared(
+    const double bounds_min[3],
+    const double bounds_max[3]) {
+    double result = 0.0;
+    for (size_t axis = 0; axis < 3u; ++axis) {
+        const double extent = bounds_max[axis] - bounds_min[axis];
+        result += extent * extent;
+    }
+    return result;
+}
+
+static double segmentation_point_aabb_distance_squared(
+    const double point[3],
+    const double bounds_min[3],
+    const double bounds_max[3]) {
+    double result = 0.0;
+    for (size_t axis = 0; axis < 3u; ++axis) {
+        double distance = 0.0;
+        if (point[axis] < bounds_min[axis]) {
+            distance = bounds_min[axis] - point[axis];
+        } else if (point[axis] > bounds_max[axis]) {
+            distance = point[axis] - bounds_max[axis];
+        }
+        result += distance * distance;
+    }
+    return result;
+}
+
+static trellis_status segmentation_postprocess_small_shells(
+    const float * positions,
+    const uint32_t * triangles,
+    size_t face_count,
+    size_t vertex_count,
+    const uint32_t * semantic_labels,
+    size_t min_component_faces,
+    trellis_mesh_segmentation_small_part_mode mode,
+    const uint32_t * shell_ids,
+    size_t shell_count,
+    uint32_t * part_ids,
+    size_t * part_count_io,
+    trellis_mesh_segmentation_small_part_stats * stats_out) {
+    const size_t input_part_count = part_count_io != NULL ? *part_count_io : 0u;
+    trellis_mesh_segmentation_small_part_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.input_part_count = input_part_count;
+    stats.output_part_count = input_part_count;
+    stats.geometric_shell_count = shell_count;
+    if (positions == NULL || triangles == NULL || semantic_labels == NULL ||
+        shell_ids == NULL || part_ids == NULL || part_count_io == NULL ||
+        face_count == 0 || vertex_count == 0 || shell_count == 0 ||
+        input_part_count == 0 ||
+        (mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE &&
+         mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (shell_count > SIZE_MAX / sizeof(segmentation_shell_stats) ||
+        input_part_count > SIZE_MAX / sizeof(segmentation_part_stats) ||
+        input_part_count > SIZE_MAX / sizeof(uint32_t)) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    segmentation_shell_stats * shells = (segmentation_shell_stats *)
+        calloc(shell_count, sizeof(*shells));
+    segmentation_part_stats * parts = (segmentation_part_stats *)
+        calloc(input_part_count, sizeof(*parts));
+    uint32_t * dense_part = (uint32_t *)
+        malloc(input_part_count * sizeof(*dense_part));
+    if (shells == NULL || parts == NULL || dense_part == NULL) {
+        free(shells); free(parts); free(dense_part);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (size_t shell = 0; shell < shell_count; ++shell) {
+        segmentation_bounds_init(
+            shells[shell].bounds_min, shells[shell].bounds_max);
+        shells[shell].dominant_part = UINT32_MAX;
+    }
+    for (size_t part = 0; part < input_part_count; ++part) {
+        segmentation_bounds_init(parts[part].bounds_min, parts[part].bounds_max);
+        parts[part].shell_id = UINT32_MAX;
+        dense_part[part] = UINT32_MAX;
+    }
+    double global_bounds_min[3];
+    double global_bounds_max[3];
+    segmentation_bounds_init(global_bounds_min, global_bounds_max);
+    double global_area = 0.0;
+    trellis_status status = TRELLIS_STATUS_OK;
+
+    for (size_t face = 0; face < face_count; ++face) {
+        const uint32_t shell_id = shell_ids[face];
+        const uint32_t part_id = part_ids[face];
+        if ((size_t) shell_id >= shell_count ||
+            (size_t) part_id >= input_part_count) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        segmentation_shell_stats * shell = &shells[shell_id];
+        segmentation_part_stats * part = &parts[part_id];
+        if (part->face_count == 0) {
+            part->shell_id = shell_id;
+            part->semantic_label = semantic_labels[face];
+        } else if (part->shell_id != shell_id) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        ++shell->face_count;
+        ++part->face_count;
+
+        const uint32_t ia = triangles[face * 3u];
+        const uint32_t ib = triangles[face * 3u + 1u];
+        const uint32_t ic = triangles[face * 3u + 2u];
+        if ((size_t) ia >= vertex_count || (size_t) ib >= vertex_count ||
+            (size_t) ic >= vertex_count) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        const float * a = positions + (size_t) ia * 3u;
+        const float * b = positions + (size_t) ib * 3u;
+        const float * c = positions + (size_t) ic * 3u;
+        for (size_t corner = 0; corner < 3u; ++corner) {
+            const float * point = corner == 0 ? a : corner == 1 ? b : c;
+            if (!isfinite(point[0]) || !isfinite(point[1]) ||
+                !isfinite(point[2])) {
+                status = TRELLIS_STATUS_PARSE_ERROR;
+                goto cleanup;
+            }
+            segmentation_bounds_include(
+                shell->bounds_min, shell->bounds_max, point);
+            segmentation_bounds_include(
+                part->bounds_min, part->bounds_max, point);
+            segmentation_bounds_include(
+                global_bounds_min, global_bounds_max, point);
+        }
+        const double ab[3] = {
+            (double) b[0] - a[0],
+            (double) b[1] - a[1],
+            (double) b[2] - a[2],
+        };
+        const double ac[3] = {
+            (double) c[0] - a[0],
+            (double) c[1] - a[1],
+            (double) c[2] - a[2],
+        };
+        const double cross[3] = {
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        };
+        const double area = 0.5 * sqrt(
+            cross[0] * cross[0] + cross[1] * cross[1] +
+            cross[2] * cross[2]);
+        const double updated_shell_area = shell->area + area;
+        if (!isfinite(area) || !isfinite(global_area + area) ||
+            !isfinite(updated_shell_area)) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        if (area > 0.0) {
+            const double weight = area / updated_shell_area;
+            for (size_t axis = 0; axis < 3u; ++axis) {
+                const double face_centroid =
+                    ((double) a[axis] + b[axis] + c[axis]) / 3.0;
+                const double updated_centroid = shell->centroid[axis] +
+                    (face_centroid - shell->centroid[axis]) * weight;
+                if (!isfinite(updated_centroid)) {
+                    status = TRELLIS_STATUS_PARSE_ERROR;
+                    goto cleanup;
+                }
+                shell->centroid[axis] = updated_centroid;
+            }
+        }
+        shell->area = updated_shell_area;
+        global_area += area;
+    }
+
+    for (size_t part_id = 0; part_id < input_part_count; ++part_id) {
+        const segmentation_part_stats * part = &parts[part_id];
+        if (part->face_count == 0 || (size_t) part->shell_id >= shell_count) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        segmentation_shell_stats * shell = &shells[part->shell_id];
+        if (shell->dominant_part == UINT32_MAX ||
+            part->face_count > shell->dominant_part_faces ||
+            (part->face_count == shell->dominant_part_faces &&
+             part_id < shell->dominant_part)) {
+            shell->dominant_part = (uint32_t) part_id;
+            shell->dominant_part_faces = part->face_count;
+        }
+    }
+
+    size_t protected_shell = 0;
+    for (size_t shell_id = 0; shell_id < shell_count; ++shell_id) {
+        const segmentation_shell_stats * shell = &shells[shell_id];
+        if (shell->face_count == 0 || shell->dominant_part == UINT32_MAX) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        const segmentation_shell_stats * protected_stats =
+            &shells[protected_shell];
+        if (shell_id == 0 || shell->area > protected_stats->area ||
+            (shell->area == protected_stats->area &&
+             shell->face_count > protected_stats->face_count) ||
+            (shell->area == protected_stats->area &&
+             shell->face_count == protected_stats->face_count &&
+             shell_id < protected_shell)) {
+            protected_shell = shell_id;
+        }
+    }
+
+    const double global_diagonal_squared = segmentation_bounds_diagonal_squared(
+        global_bounds_min, global_bounds_max);
+    /* Degenerate or non-finite source scale cannot support a meaningful
+     * relative-size classification. Fall back to KEEP, never "everything is
+     * tiny", which also guarantees DISCARD cannot erase the complete mesh. */
+    if (min_component_faces <= 1u || !isfinite(global_area) ||
+        !(global_area > 0.0) || !isfinite(global_diagonal_squared) ||
+        !(global_diagonal_squared > 0.0)) {
+        goto cleanup;
+    }
+    const double diagonal_limit_squared = global_diagonal_squared *
+        SEGMENTATION_SMALL_SHELL_MAX_DIAGONAL_RATIO *
+        SEGMENTATION_SMALL_SHELL_MAX_DIAGONAL_RATIO;
+    const double area_limit =
+        global_area * SEGMENTATION_SMALL_SHELL_MAX_AREA_RATIO;
+    for (size_t shell_id = 0; shell_id < shell_count; ++shell_id) {
+        segmentation_shell_stats * shell = &shells[shell_id];
+        const double diagonal_squared = segmentation_bounds_diagonal_squared(
+            shell->bounds_min, shell->bounds_max);
+        shell->candidate = shell_id != protected_shell &&
+            shell->face_count < min_component_faces &&
+            isfinite(diagonal_squared) &&
+            diagonal_squared <= diagonal_limit_squared &&
+            shell->area <= area_limit;
+        if (!shell->candidate) continue;
+        ++stats.candidate_shell_count;
+        stats.affected_face_count += shell->face_count;
+    }
+    if (stats.candidate_shell_count == 0) goto cleanup;
+    for (size_t part_id = 0; part_id < input_part_count; ++part_id) {
+        if (shells[parts[part_id].shell_id].candidate) {
+            ++stats.candidate_part_count;
+        }
+    }
+
+    if (mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE) {
+        for (size_t shell_id = 0; shell_id < shell_count; ++shell_id) {
+            segmentation_shell_stats * shell = &shells[shell_id];
+            if (!shell->candidate) continue;
+            double centroid[3];
+            for (size_t axis = 0; axis < 3u; ++axis) {
+                centroid[axis] = shell->area > 0.0 ?
+                    shell->centroid[axis] :
+                    (shell->bounds_min[axis] + shell->bounds_max[axis]) * 0.5;
+            }
+            const uint32_t preferred_label =
+                parts[shell->dominant_part].semantic_label;
+            uint32_t best_part = UINT32_MAX;
+            double best_distance = DBL_MAX;
+            int best_matches_label = 0;
+            for (size_t part_id = 0; part_id < input_part_count; ++part_id) {
+                const segmentation_part_stats * target = &parts[part_id];
+                if (shells[target->shell_id].candidate) continue;
+                const int matches_label =
+                    target->semantic_label == preferred_label;
+                const double distance =
+                    segmentation_point_aabb_distance_squared(
+                        centroid, target->bounds_min, target->bounds_max);
+                if (best_part == UINT32_MAX || distance < best_distance ||
+                    (distance == best_distance &&
+                     (matches_label > best_matches_label ||
+                      (matches_label == best_matches_label &&
+                       part_id < best_part)))) {
+                    best_part = (uint32_t) part_id;
+                    best_distance = distance;
+                    best_matches_label = matches_label;
+                }
+            }
+            if (best_part == UINT32_MAX) {
+                status = TRELLIS_STATUS_ERROR;
+                goto cleanup;
+            }
+            /* Reuse dominant_part after classification as the immutable merge
+             * anchor. Targets are always retained, so chains and cycles are
+             * impossible and every face in this shell receives one target. */
+            shell->dominant_part = best_part;
+        }
+    }
+
+    for (size_t face = 0; face < face_count; ++face) {
+        segmentation_shell_stats * shell = &shells[shell_ids[face]];
+        if (!shell->candidate) continue;
+        part_ids[face] = mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE ?
+            shell->dominant_part : UINT32_MAX;
+    }
+    size_t output_part_count = 0;
+    for (size_t face = 0; face < face_count; ++face) {
+        const uint32_t old_part = part_ids[face];
+        if (old_part == UINT32_MAX) continue;
+        if ((size_t) old_part >= input_part_count) {
+            status = TRELLIS_STATUS_ERROR;
+            goto cleanup;
+        }
+        if (dense_part[old_part] == UINT32_MAX) {
+            if (output_part_count >= UINT32_MAX) {
+                status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                goto cleanup;
+            }
+            dense_part[old_part] = (uint32_t) output_part_count++;
+        }
+        part_ids[face] = dense_part[old_part];
+    }
+    if (output_part_count == 0) {
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
+    }
+    *part_count_io = output_part_count;
+    stats.output_part_count = output_part_count;
+
+cleanup:
+    if (stats_out != NULL && status == TRELLIS_STATUS_OK) *stats_out = stats;
+    free(dense_part);
+    free(parts);
+    free(shells);
+    return status;
+}
+
+trellis_status trellis_mesh_segmentation_partition_faces_geometric_ex(
     const float * positions,
     const uint32_t * triangles,
     size_t face_count,
@@ -222,10 +667,13 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
     const uint32_t * semantic_labels,
     size_t min_component_faces,
     float weld_tolerance,
+    trellis_mesh_segmentation_small_part_mode small_part_mode,
     uint32_t ** part_ids_out,
-    size_t * part_count_out) {
+    size_t * part_count_out,
+    trellis_mesh_segmentation_small_part_stats * stats_out) {
     if (part_ids_out != NULL) *part_ids_out = NULL;
     if (part_count_out != NULL) *part_count_out = 0;
+    if (stats_out != NULL) memset(stats_out, 0, sizeof(*stats_out));
     if (positions == NULL || triangles == NULL || semantic_labels == NULL ||
         face_count == 0 || vertex_count == 0 || vertex_count > UINT32_MAX ||
         face_count > UINT32_MAX ||
@@ -233,6 +681,9 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
         vertex_count > SIZE_MAX / sizeof(uint32_t) ||
         vertex_count > SIZE_MAX / (3u * sizeof(int64_t)) ||
         part_ids_out == NULL || part_count_out == NULL ||
+        (small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP &&
+         small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE &&
+         small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD) ||
         !isfinite(weld_tolerance) || !(weld_tolerance > 0.0f)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -274,6 +725,8 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
         (double) weld_tolerance * (double) weld_tolerance;
     const size_t mask = table_capacity - 1u;
     uint32_t welded_count = 0;
+    uint32_t * shell_ids = NULL;
+    size_t shell_count = 0;
     trellis_status status = TRELLIS_STATUS_OK;
     for (size_t vertex = 0; vertex < vertex_count; ++vertex) {
         const float * position = positions + vertex * 3u;
@@ -390,16 +843,48 @@ trellis_status trellis_mesh_segmentation_partition_faces_geometric(
             }
         }
     }
-    status = trellis_mesh_segmentation_partition_faces(
+    status = partition_faces_internal(
         welded_triangles,
         face_count,
         adjacency_vertex_count,
         semantic_labels,
         min_component_faces,
         part_ids_out,
-        part_count_out);
+        part_count_out,
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP ?
+            NULL : &shell_ids,
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP ?
+            NULL : &shell_count);
+    if (status == TRELLIS_STATUS_OK &&
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP) {
+        if (stats_out != NULL) {
+            stats_out->input_part_count = *part_count_out;
+            stats_out->output_part_count = *part_count_out;
+        }
+    } else if (status == TRELLIS_STATUS_OK) {
+        status = segmentation_postprocess_small_shells(
+            positions,
+            triangles,
+            face_count,
+            vertex_count,
+            semantic_labels,
+            min_component_faces,
+            small_part_mode,
+            shell_ids,
+            shell_count,
+            *part_ids_out,
+            part_count_out,
+            stats_out);
+    }
 
 cleanup:
+    if (status != TRELLIS_STATUS_OK) {
+        free(*part_ids_out);
+        *part_ids_out = NULL;
+        *part_count_out = 0;
+        if (stats_out != NULL) memset(stats_out, 0, sizeof(*stats_out));
+    }
+    free(shell_ids);
     free(welded_triangles);
     free(cells);
     free(vertex_to_welded);
@@ -407,4 +892,28 @@ cleanup:
     free(next);
     free(buckets);
     return status;
+}
+
+trellis_status trellis_mesh_segmentation_partition_faces_geometric(
+    const float * positions,
+    const uint32_t * triangles,
+    size_t face_count,
+    size_t vertex_count,
+    const uint32_t * semantic_labels,
+    size_t min_component_faces,
+    float weld_tolerance,
+    uint32_t ** part_ids_out,
+    size_t * part_count_out) {
+    return trellis_mesh_segmentation_partition_faces_geometric_ex(
+        positions,
+        triangles,
+        face_count,
+        vertex_count,
+        semantic_labels,
+        min_component_faces,
+        weld_tolerance,
+        TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP,
+        part_ids_out,
+        part_count_out,
+        NULL);
 }

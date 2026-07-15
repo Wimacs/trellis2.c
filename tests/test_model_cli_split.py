@@ -168,7 +168,7 @@ def main() -> int:
         "--rendered-condition", "--shape-latent", "--texture-latent",
         "--segmentation-latent",
         "--segmentation-flow", "--segmentation-latent-output",
-        "--min-component-faces",
+        "--min-component-faces", "--small-part-mode",
     ):
         require(required_flag in segmentation_help.stdout,
                 f"TRELLIS.2 mesh segmentation is missing {required_flag}",
@@ -193,6 +193,7 @@ def main() -> int:
         ("--min-palette-voxels", "0"),
         ("--palette-merge-distance", "-0.01"),
         ("--palette-merge-distance", "1.8"),
+        ("--small-part-mode", "invalid"),
     ):
         rejected_range = run(
             args.segmentation,
@@ -203,9 +204,25 @@ def main() -> int:
         require(rejected_range.returncode == 2,
                 f"mesh segmentation accepted invalid {option}={value}",
                 rejected_range.stdout)
-        require("invalid argument range" in rejected_range.stdout,
-                f"mesh segmentation did not explain invalid {option}",
-                rejected_range.stdout)
+        if option == "--small-part-mode":
+            require("Usage:" in rejected_range.stdout,
+                    "mesh segmentation did not reject invalid small-part mode",
+                    rejected_range.stdout)
+        else:
+            require("invalid argument range" in rejected_range.stdout,
+                    f"mesh segmentation did not explain invalid {option}",
+                    rejected_range.stdout)
+
+    for mode in ("keep", "merge", "discard"):
+        accepted_mode = run(
+            args.segmentation,
+            *segmentation_required,
+            "--small-part-mode",
+            mode,
+        )
+        require(accepted_mode.returncode == 1,
+                f"mesh segmentation did not parse small-part mode {mode}",
+                accepted_mode.stdout)
 
     wrong_segmentation_task = run(
         args.segmentation,

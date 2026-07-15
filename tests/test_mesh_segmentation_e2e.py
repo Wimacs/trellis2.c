@@ -315,6 +315,7 @@ def verify_parts(
     binary: bytes,
     expected_faces: int,
     source_material_count: int,
+    require_multiple_parts: bool,
 ) -> int:
     scenes = document.get("scenes", [])
     nodes = document.get("nodes", [])
@@ -328,7 +329,9 @@ def verify_parts(
     if root.get("name") != "trellis_parts":
         raise AssertionError("parts GLB root must be named trellis_parts")
     children = root.get("children", [])
-    if len(children) <= 1:
+    if not children:
+        raise AssertionError("segmentation must produce at least one retained part")
+    if require_multiple_parts and len(children) <= 1:
         raise AssertionError("segmentation must produce more than one part")
     if len(nodes) != len(children) + 1 or len(document.get("meshes", [])) != len(children):
         raise AssertionError("parts GLB must have one node and one mesh per part")
@@ -384,6 +387,11 @@ def verify_parts(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", type=Path, required=True)
+    parser.add_argument(
+        "--small-part-mode",
+        choices=("keep", "merge", "discard"),
+        default=os.getenv("TRELLIS_SEGVIGEN_E2E_SMALL_PART_MODE", "keep"),
+    )
     args = parser.parse_args()
 
     missing = [name for name, variable in ENVIRONMENT_PATHS.items() if not os.getenv(variable)]
@@ -420,6 +428,7 @@ def main() -> int:
             "--output", str(output),
             "--steps", os.getenv("TRELLIS_SEGVIGEN_E2E_STEPS", "12"),
             "--seed", "42",
+            "--small-part-mode", args.small_part_mode,
         ]
         completed = subprocess.run(
             command,
@@ -434,22 +443,33 @@ def main() -> int:
                 f"automatic SegviGen pipeline exited {completed.returncode}"
             )
         output_document, output_binary = read_glb(output)
+        output_triangles = scene_triangle_multiset(output_document, output_binary)
+        output_faces = sum(output_triangles.values())
         part_count = verify_parts(
             output_document,
             output_binary,
-            expected_faces,
+            output_faces if args.small_part_mode == "discard" else expected_faces,
             len(input_document.get("materials", [])),
+            args.small_part_mode == "keep",
         )
-        output_triangles = scene_triangle_multiset(output_document, output_binary)
-        if output_triangles != input_triangles:
+        if args.small_part_mode != "discard" and output_triangles != input_triangles:
             missing = sum((input_triangles - output_triangles).values())
             duplicated = sum((output_triangles - input_triangles).values())
             raise AssertionError(
                 "parts do not preserve the input triangle multiset: "
                 f"missing={missing} duplicated_or_new={duplicated}"
             )
+        if args.small_part_mode == "discard":
+            unexpected = sum((output_triangles - input_triangles).values())
+            if unexpected != 0 or output_faces > expected_faces:
+                raise AssertionError(
+                    "discard mode emitted triangles absent from the source: "
+                    f"unexpected={unexpected} output={output_faces} "
+                    f"input={expected_faces}"
+                )
         print(
             f"SegviGen E2E passed: input_faces={expected_faces} "
+            f"output_faces={output_faces} mode={args.small_part_mode} "
             f"parts={part_count} output={output}"
         )
     return 0

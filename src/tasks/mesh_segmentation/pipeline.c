@@ -716,6 +716,12 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
     const trellis_mesh_segmentation_options * options) {
     trellis_runtime_init();
 
+    const trellis_mesh_segmentation_small_part_mode small_part_mode =
+        options != NULL &&
+        options->struct_size >= TRELLIS_MESH_SEGMENTATION_OPTIONS_V2_SIZE ?
+            options->small_part_mode :
+            TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP;
+
     if (options == NULL ||
         options->struct_size < TRELLIS_MESH_SEGMENTATION_OPTIONS_V1_SIZE ||
         options->model_dir == NULL || options->model_dir[0] == '\0' ||
@@ -731,6 +737,9 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         !isfinite(options->palette_merge_distance) ||
         options->palette_merge_distance < 0.0f ||
         options->palette_merge_distance > 1.732051f ||
+        (small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP &&
+         small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE &&
+         small_part_mode != TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD) ||
         options->flow_blocks_override < -1 ||
         options->flow_block_parts_override < -1 ||
         options->flow_block_parts_override > 3 ||
@@ -770,6 +779,7 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
     uint32_t * face_part_ids = NULL;
     size_t semantic_count = 0;
     size_t part_count = 0;
+    trellis_mesh_segmentation_small_part_stats small_part_stats;
     int graph_backend_initialized = 0;
     int cpu_weight_backend_initialized = 0;
     int cuda_initialized = 0;
@@ -789,6 +799,7 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
     memset(&shape_cache_info, 0, sizeof(shape_cache_info));
     memset(&texture_cache_info, 0, sizeof(texture_cache_info));
     memset(&segmentation_cache_info, 0, sizeof(segmentation_cache_info));
+    memset(&small_part_stats, 0, sizeof(small_part_stats));
     memset(&guides, 0, sizeof(guides));
     memset(&condition, 0, sizeof(condition));
     memset(&decoded_labels, 0, sizeof(decoded_labels));
@@ -1475,7 +1486,7 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
             trellis_status_string(status));
         goto cleanup;
     }
-    status = trellis_mesh_segmentation_partition_faces_geometric(
+    status = trellis_mesh_segmentation_partition_faces_geometric_ex(
         normalized_mesh.vertices,
         asset.triangles,
         asset.triangle_count,
@@ -1483,14 +1494,33 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         semantic_labels,
         (size_t) options->min_component_faces,
         1e-5f,
+        small_part_mode,
         &face_part_ids,
-        &part_count);
+        &part_count,
+        &small_part_stats);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR(
             "mesh segmentation: geometric face partitioning failed: %s",
             trellis_status_string(status));
         goto cleanup;
     }
+    const char * small_part_mode_name =
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_MERGE ?
+            "merge" :
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD ?
+            "discard" : "keep";
+    TRELLIS_INFO(
+        "mesh segmentation: small_part_mode=%s scan=%s geometric_shells=%zu candidates=%zu "
+        "candidate_parts=%zu affected_faces=%zu input_parts=%zu output_parts=%zu",
+        small_part_mode_name,
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_KEEP ?
+            "disabled" : "enabled",
+        small_part_stats.geometric_shell_count,
+        small_part_stats.candidate_shell_count,
+        small_part_stats.candidate_part_count,
+        small_part_stats.affected_face_count,
+        small_part_stats.input_part_count,
+        small_part_stats.output_part_count);
     gltf_error[0] = '\0';
     status = trellis_mesh_segmentation_write_parts_glb(
         options->output_path,
@@ -1510,11 +1540,17 @@ trellis_status trellis_pipeline_trellis2_segment_mesh(
         goto cleanup;
     }
     TRELLIS_INFO(
-        "mesh segmentation: wrote %s semantic_labels=%zu physical_parts=%zu faces=%zu",
+        "mesh segmentation: wrote %s semantic_labels=%zu physical_parts=%zu "
+        "source_faces=%zu output_faces=%zu discarded_faces=%zu",
         options->output_path,
         semantic_count,
         part_count,
-        asset.triangle_count);
+        asset.triangle_count,
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD ?
+            asset.triangle_count - small_part_stats.affected_face_count :
+            asset.triangle_count,
+        small_part_mode == TRELLIS_MESH_SEGMENTATION_SMALL_PART_DISCARD ?
+            small_part_stats.affected_face_count : 0u);
 
 cleanup:
     free(face_part_ids);
