@@ -4419,6 +4419,12 @@ static int vkmesh_simplify_step_vulkan(
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
 
+    /* The sorted 3F edge records are only needed to construct the compact
+       unique-edge array. Releasing them before the packed simplify scratch is
+       allocated keeps the two largest transient phases from overlapping. */
+    vk_buffer_destroy(vk, &edges_buffer);
+    vk_buffer_destroy(vk, &edge_dummy);
+
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
     const uint64_t adjacency_base = offset_base + (uint64_t) offset_count;
@@ -4771,6 +4777,15 @@ static int vkmesh_device_simplify_step(
     push.aux1 = (uint32_t) boundary_base;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, vertex_groups)) goto cleanup;
 
+    /* Offsets, adjacency, and boundary flags now live in scratch. The QEM,
+       cost, winner selection, and collapse kernels no longer reference the
+       construction buffers directly. */
+    vk_buffer_destroy(vk, &degree_buffer);
+    vk_buffer_destroy(vk, &offset_a_buffer);
+    vk_buffer_destroy(vk, &offset_b_buffer);
+    vk_buffer_destroy(vk, &adjacency_buffer);
+    vk_buffer_destroy(vk, &boundary_flags);
+
     vkmesh_vk_buffer fill_buffers[4];
     fill_buffers[0] = scratch;
     fill_buffers[1] = counter;
@@ -4852,7 +4867,8 @@ static int vkmesh_device_simplify_step(
 
     uint32_t collapsed_u32 = ((const uint32_t *) scratch.mapped)[counter_base];
     uint32_t removed_u32 = 0u;
-    if (!compact_device_mesh_from_flags(dm, &scratch, (uint32_t) face_keep_base, &removed_u32)) goto cleanup;
+    if (collapsed_u32 > 0u &&
+        !compact_device_mesh_from_flags(dm, &scratch, (uint32_t) face_keep_base, &removed_u32)) goto cleanup;
     if (collapsed_edges != NULL) *collapsed_edges = collapsed_u32;
     if (removed_faces != NULL) *removed_faces = removed_u32;
     ok = 1;
@@ -4889,6 +4905,7 @@ static int vkmesh_device_simplify(
     uint32_t total_removed_u32 = 0u;
 
     int step = 0;
+    int consecutive_no_progress = 0;
     while (dm->n_faces > (uint32_t) target_faces && (max_steps <= 0 || step < max_steps)) {
         uint32_t before = dm->n_faces;
         uint32_t collapsed = 0u;
@@ -4913,7 +4930,25 @@ static int vkmesh_device_simplify(
             dm->n_faces);
         fflush(stderr);
         if (dm->n_faces <= (uint32_t) target_faces) break;
-        if (collapsed == 0u || removed == 0u || removed * 100u < before) threshold *= 10.0f;
+        if (collapsed == 0u || removed == 0u) {
+            ++consecutive_no_progress;
+        } else {
+            consecutive_no_progress = 0;
+        }
+        if (consecutive_no_progress >= 16) {
+            fprintf(stderr,
+                "vkmesh: simplify stopped after %d consecutive no-progress rounds at %u faces\n",
+                consecutive_no_progress,
+                dm->n_faces);
+            break;
+        }
+        if (collapsed == 0u || removed == 0u || (uint64_t) removed * 100ull < (uint64_t) before) {
+            if (!isfinite(threshold) || threshold > FLT_MAX / 10.0f) {
+                fprintf(stderr, "vkmesh: simplify stopped because threshold can no longer increase\n");
+                break;
+            }
+            threshold *= 10.0f;
+        }
     }
 
     if (total_collapsed_u32 > (uint32_t) INT_MAX || total_removed_u32 > (uint32_t) INT_MAX) return 0;
@@ -5097,6 +5132,7 @@ static int vkmesh_simplify(
     }
 
     int step = 0;
+    int consecutive_no_progress = 0;
     while (mesh->n_faces > target_faces && (max_steps <= 0 || step < max_steps)) {
         int before = (int) mesh->n_faces;
         int collapsed = 0;
@@ -5120,7 +5156,25 @@ static int vkmesh_simplify(
             mesh->n_faces);
         fflush(stderr);
         if (mesh->n_faces <= target_faces) break;
-        if (collapsed == 0 || removed == 0 || removed * 100 < before) threshold *= 10.0f;
+        if (collapsed == 0 || removed == 0) {
+            ++consecutive_no_progress;
+        } else {
+            consecutive_no_progress = 0;
+        }
+        if (consecutive_no_progress >= 16) {
+            fprintf(stderr,
+                "vkmesh: simplify stopped after %d consecutive no-progress rounds at %" PRId64 " faces\n",
+                consecutive_no_progress,
+                mesh->n_faces);
+            break;
+        }
+        if (collapsed == 0 || removed == 0 || (int64_t) removed * 100ll < (int64_t) before) {
+            if (!isfinite(threshold) || threshold > FLT_MAX / 10.0f) {
+                fprintf(stderr, "vkmesh: simplify stopped because threshold can no longer increase\n");
+                break;
+            }
+            threshold *= 10.0f;
+        }
     }
     return 1;
 }

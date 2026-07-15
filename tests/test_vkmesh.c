@@ -254,6 +254,34 @@ static int mesh_is_closed_and_clean(const float * vertices, const int32_t * face
     return 1;
 }
 
+static int mesh_has_valid_triangles(const test_mesh * mesh) {
+    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0) return 0;
+    uint8_t * referenced = (uint8_t *) calloc((size_t) mesh->n_vertices, 1u);
+    if (referenced == NULL) return 0;
+    int ok = 1;
+    for (int64_t i = 0; i < mesh->n_vertices * 3 && ok; ++i) {
+        if (!isfinite(mesh->vertices[i])) ok = 0;
+    }
+    for (int64_t i = 0; i < mesh->n_faces && ok; ++i) {
+        const int32_t * f = mesh->faces + (size_t) i * 3u;
+        if (f[0] < 0 || f[1] < 0 || f[2] < 0 ||
+            f[0] >= mesh->n_vertices || f[1] >= mesh->n_vertices || f[2] >= mesh->n_vertices ||
+            f[0] == f[1] || f[1] == f[2] || f[2] == f[0]) {
+            ok = 0;
+            break;
+        }
+        referenced[f[0]] = 1u;
+        referenced[f[1]] = 1u;
+        referenced[f[2]] = 1u;
+    }
+    for (int64_t i = 0; i < mesh->n_vertices && ok; ++i) {
+        if (!referenced[i]) ok = 0;
+    }
+    free(referenced);
+    return ok;
+}
+
 static int has_compute_device(int device_index) {
     VkInstance instance = VK_NULL_HANDLE;
     VkInstanceCreateInfo info;
@@ -310,6 +338,58 @@ static int test_cli_cleanup(const char * vkmesh_path) {
     trellis_unlink(output);
     CHECK_TRUE(read_ok);
     CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_simplify(const char * vkmesh_path) {
+    enum { grid_size = 9, vertex_count = grid_size * grid_size,
+           face_count = (grid_size - 1) * (grid_size - 1) * 2 };
+    float vertices[vertex_count * 3];
+    int32_t faces[face_count * 3];
+    for (int y = 0; y < grid_size; ++y) {
+        for (int x = 0; x < grid_size; ++x) {
+            const int v = y * grid_size + x;
+            vertices[v * 3 + 0] = (float) x / (float) (grid_size - 1);
+            vertices[v * 3 + 1] = (float) y / (float) (grid_size - 1);
+            vertices[v * 3 + 2] = 0.03f * sinf((float) x * 0.7f) * sinf((float) y * 0.5f);
+        }
+    }
+    int face = 0;
+    for (int y = 0; y + 1 < grid_size; ++y) {
+        for (int x = 0; x + 1 < grid_size; ++x) {
+            const int32_t a = y * grid_size + x;
+            const int32_t b = a + 1;
+            const int32_t c = a + grid_size;
+            const int32_t d = c + 1;
+            int32_t * f0 = faces + (size_t) face++ * 3u;
+            int32_t * f1 = faces + (size_t) face++ * 3u;
+            f0[0] = a; f0[1] = b; f0[2] = d;
+            f1[0] = a; f1[1] = d; f1[2] = c;
+        }
+    }
+
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_simplify_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_simplify_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, vertex_count, faces, face_count));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--simplify", (char *) "--target-faces", (char *) "48",
+        (char *) "--simplify-steps", (char *) "32", (char *) "--no-fill-holes",
+        (char *) "--no-uv-unwrap", (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_faces > 0 && mesh.n_faces <= 48 && mesh.n_faces < face_count);
+    CHECK_TRUE(mesh.n_vertices > 0 && mesh.n_vertices < vertex_count);
+    CHECK_TRUE(mesh_has_valid_triangles(&mesh));
     test_mesh_free(&mesh);
     return 1;
 }
@@ -723,6 +803,7 @@ int main(int argc, char ** argv) {
         return 77;
     }
     (void) test_cli_cleanup(argv[1]);
+    (void) test_cli_simplify(argv[1]);
     (void) test_cli_rejects_nan(argv[1]);
     (void) test_udf_workspace_chunking(argv[1]);
     (void) test_remesh_workspace_chunking(argv[1]);
