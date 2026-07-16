@@ -9,10 +9,9 @@ The short conclusion is:
 - `vkmesh` now provides a practical low-memory post-processing path for the
   TRELLIS.2 generator.
 - On the real 5.423M-face remesh fixture, simplify fell from 70.38 seconds to
-  9.84--15.12 seconds while its workspace fell from 918.1 MiB to 577.6 MiB.
-- The final HEAD completed the real image-to-GLB pipeline and produced a valid
-  451,720-vertex / 951,990-face GLB with no invalid, duplicate, degenerate, or
-  boundary faces/edges.
+  3.39--3.46 seconds while its workspace fell from 918.1 MiB to 577.6 MiB.
+- The final HEAD completed the real image-to-GLB pipeline in 129.97 seconds and
+  produced a 452,629-vertex / 953,782-face GLB.
 - CuMesh remains much faster inside its CUDA kernels, especially for remesh,
   but its measured transient VRAM is substantially higher and its simplifier
   permits topology defects that `vkmesh` now rejects.
@@ -151,8 +150,38 @@ The dominant causes were algorithmic and synchronization overhead, not simply
 - Remesh, simplify, and cleanup downloaded and re-uploaded meshes between stages.
 - Soft fallback could rerun an expensive completed device stage after a fatal
   Vulkan/OOM failure.
-- Every ordinary `vkmesh_dispatch` still records, submits, and waits on a fence;
-  this remains a performance gap versus CUDA stream scheduling and CUB.
+- Ordinary standalone dispatch still records, submits, and waits on a fence.
+  Simplify now batches its dependent sequences, but sort passes and count-driven
+  allocation boundaries remain a gap versus CUDA stream scheduling and CUB.
+
+## Dispatch batching and explicit buffer reuse
+
+Commit `8511745` keeps the implementation local to `vkmesh.c` and leaves the
+public API unchanged. It deliberately uses a fixed-size command array rather
+than a general command-graph or allocator abstraction:
+
+- One batch records at most 32 compute dispatches, inserts conservative
+  compute-to-compute barriers, and waits on one fence.
+- Descriptor sets are allocated once with the Vulkan context and reused after
+  each synchronous batch completes.
+- Prefix-scan levels, degree/seed setup, adjacency construction, the 12-kernel
+  QEM/candidate/collapse sequence, and remap/vertex compaction are submitted in
+  small explicit batches.
+- A single phase buffer first stores sorted edge keys and is destructively
+  repurposed as packed simplify scratch only after unique-edge compaction has
+  completed. It persists across productive rounds.
+- The sort's dead temporary becomes unique-edge storage. After collapse,
+  adjacency, boundary, and counter buffers become compaction outputs instead of
+  triggering equivalent new allocations.
+- Vertex-map assignment remains a separate submission: its actual vertex count
+  is read before allocating the output vertex buffer. This preserves the low
+  memory peak when cleanup removes most vertices.
+- A no-progress round releases the persistent phase buffer, preventing a stale
+  large allocation from overlapping the next round on pathological `V >> F`
+  input.
+
+The resulting code has explicit ownership-transfer points and one fixed batch
+type; it does not add a public workspace-pool or scheduler interface.
 
 ## Optimization order and staged commits
 
@@ -173,6 +202,7 @@ The work was ordered by expected benefit and risk:
 | 11 | Enforce relative degeneracy | `dff9a77` | Scale-aware geometry validity |
 | 12 | Keep remesh result on device through finalization | `fd677df` | One final download; narrower cleanup |
 | 13 | Report an unmet simplify target | `11e7262`, `db87de3` | Explicit best-effort termination reason |
+| 14 | Batch dependent dispatches and reuse phase/compaction buffers | `8511745` | Fewer submit/waits and allocation/map stalls |
 
 ## Benchmark methodology
 
@@ -200,17 +230,17 @@ Large artifacts and sampled resource traces remain under the ignored local
 | Implementation | Wall/process | Core simplify | Peak signal | Output faces | Duplicate extras |
 |---|---:|---:|---:|---:|---:|
 | Old vkmesh | 70.38 s | included | 918.1 MiB workspace; 979.5 MiB NVML | 946,502 | 1,064 |
-| New vkmesh, topology guard | 9.84--15.12 s | included | 577.6 MiB workspace; 636--728 MiB NVML | about 945k--958k | 0 |
+| Topology-guard baseline | 9.84--15.12 s | included | 577.6 MiB workspace; 636--728 MiB NVML | about 945k--958k | 0 |
+| Final vkmesh, batched/reused | 3.39--3.46 s | included | 577.6 MiB workspace | 957,252--958,320 | 0 |
 | CuMesh | 3.09 s | 0.903 s | 1,267 MiB NVML | 962,082 | 1,021 |
 
-GPU clock/power state caused the new vkmesh spread; a same-state frozen guard
-run was 15.12 seconds versus 14.34 seconds for the final code, so the later
-diagnostic/finalizer work did not regress simplify.
-
-Relative to the old implementation, the guarded path is 4.65--7.15x faster and
-uses 37.1% less tracked workspace. CuMesh's kernel is still much faster, while
-its observed transient NVML peak is about twice the new vkmesh peak on this
-fixture.
+Relative to the original 70.38-second implementation, the final path is
+20.3--20.8x faster and uses 37.1% less tracked workspace. Relative to the best
+9.84-second topology-guard baseline immediately before this change, it is about
+2.9x faster. CuMesh's 0.903-second CUDA core is still about 3.8x faster, while
+the complete CuMesh Python process (3.09 seconds) is now within about 10% of the
+complete vkmesh executable. CuMesh's observed transient NVML peak remains about
+twice vkmesh's measured approximately-616 MiB incremental peak on this fixture.
 
 ### Same clean approximately-2M-face input
 
@@ -219,7 +249,7 @@ from the real remesh fixture with the current topology-safe simplifier.
 
 | Operation | Implementation | Core/wall | Workspace / allocations | NVML delta | Output |
 |---|---|---:|---:|---:|---:|
-| simplify to 1M | vkmesh | 2.33 s | 211.2 MiB workspace | 266.7 MiB | 454,606 V / 956,534 F |
+| simplify to 1M | vkmesh | 1.15--1.18 s | 211.2 MiB workspace | about 269 MiB | about 454k V / 956k F |
 | simplify to 1M | CuMesh | 0.227 s core; 2.37 s process | 50.7 MiB Torch-tracked (extension temporaries are not fully tracked) | 687.2 MiB | 458,520 V / 931,354 F |
 | remesh512 | vkmesh | 33.50 s | 103.1 MiB workspace | 190.9 MiB | 3,193,463 V / 6,438,676 F |
 | remesh512 | CuMesh | 1.864 s core; 4.49 s process | 2,519.9 MiB Torch allocated / 2,726 MiB reserved | 3,102.1 MiB | 3,193,463 V / 6,438,676 F |
@@ -230,27 +260,35 @@ faster in the remesh core, while vkmesh uses about one-sixteenth of the measured
 incremental VRAM. This is the clearest current speed/memory tradeoff.
 
 On the same 2M->1M simplify comparison, sampled surface fidelity was nearly
-identical. vkmesh emitted no duplicate, degenerate, or unused geometry; CuMesh
-emitted 1,021 duplicate instances, four geometric degenerates, and 1,645 unused
-vertices. CuMesh's lower non-manifold-edge count must not be read as a strict
-topology improvement because invalid duplicate-producing collapses also change
-that count.
+identical. Final vkmesh emitted no duplicate or unused geometry; one selected
+run retained two geometric degenerates from an input containing five. Atomic
+candidate selection is intentionally nondeterministic, and other runs retained
+zero. CuMesh emitted 1,021 duplicate instances, four geometric degenerates, and
+1,645 unused vertices. CuMesh's lower non-manifold-edge count must not be read
+as a strict topology improvement because invalid duplicate-producing collapses
+also change that count.
+
+The final binary passed the 100,000-sample regression thresholds on both
+fixtures. Symmetric RMS / worst directional p99 / sampled Hausdorff were
+0.004325 / 0.008426 / 0.012707 for 2M, and 0.004323 / 0.008345 / 0.013937 for
+5.423M. Both outputs had zero invalid indices, duplicate faces, boundary edges,
+winding conflicts, and unused vertices.
 
 ### Complete isolated post-process
 
 | Version | Input -> remesh -> final | Wall | Workspace | NVML delta | CPU peak private |
 |---|---|---:|---:|---:|---:|
 | Old | 3.979M -> 5.423M -> 936,578 F | 162.90 s | 918.1 MiB | 928.2 MiB | 1,233.3 MiB |
-| New | 3.979M -> 5.423M -> 949,986 F | 102.37 s | 577.6 MiB | 644.6 MiB | 986.1 MiB |
+| Pre-batching optimized | 3.979M -> 5.423M -> 949,986 F | 102.37 s | 577.6 MiB | 644.6 MiB | 986.1 MiB |
 
-The complete mesh processor is 37.2% faster, tracked workspace is 37.1% lower,
-and measured incremental VRAM is 30.6% lower. Remesh is now the dominant stage;
-most of the achieved runtime gain came from simplify and eliminating stage
-round-trips.
+That historical complete mesh-processor run was 37.2% faster, used 37.1% less
+tracked workspace, and used 30.6% less measured incremental VRAM than the old
+path. The current change further reduces its simplify portion; remesh remains
+the dominant stage and the complete isolated sequence was not resampled.
 
-### Final-HEAD TRELLIS.2 end-to-end run
+### TRELLIS.2 end-to-end verification
 
-The final branch HEAD, after merging current `main`, ran:
+The final branch HEAD ran:
 
 ```powershell
 build-vkmesh-opt\Release\trellis2-image-to-gltf.exe `
@@ -267,25 +305,28 @@ build-vkmesh-opt\Release\trellis2-image-to-gltf.exe `
   --mesh-remesh-project 0 --vkmesh-gpu-workspace-budget-mib 2048
 ```
 
-Measured result:
+Current batched/reused result:
 
 - Return code: 0.
-- Wall: 126.77 seconds.
+- Wall: 129.97 seconds.
 - Raw: 1,833,567 V / 3,979,440 F.
 - Remesh: 2,687,875 V / 5,423,072 F.
-- Final GLB: 451,720 V / 951,990 F.
+- Final GLB: 452,629 V / 953,782 F.
 - vkmesh workspace peak: 577.6 MiB.
-- Whole model-process NVML delta: 5,893.5 MiB.
-- Whole process CPU peak working set/private: 2,824.4 / 6,995.5 MiB.
 
-The whole-process figure includes DINO/BiRefNet/TRELLIS weights and inference
-workspaces and is not a vkmesh requirement. It also varies more with background
-GPU state; the isolated 644.6 MiB result is the useful mesh-processor peak.
+A preceding instrumented run before dispatch batching took 126.77 seconds and
+measured 5,893.5 MiB whole-process NVML delta plus 2,824.4/6,995.5 MiB peak CPU
+working-set/private memory. Those whole-process figures include DINO, BiRefNet,
+TRELLIS weights, inference workspaces, model loading, and remesh. Their normal
+run-to-run variation is larger than the approximately-6-second simplify saving,
+so the isolated 5.423M-face measurements are the useful performance comparison.
+The successful end-to-end rerun is the integration/compatibility check.
 
-The GLB container length/chunks, accessors, finite positions, and index bounds
-were independently parsed. Exact scalable topology validation reported:
+The preceding instrumented GLB's container length/chunks, accessors, finite
+positions, and index bounds were independently parsed. Exact scalable topology
+validation reported:
 
-| Metric | Final HEAD |
+| Metric | Instrumented GLB |
 |---|---:|
 | Non-finite vertices | 0 |
 | Invalid/index-degenerate faces | 0 |
@@ -311,6 +352,10 @@ After inverting the documented GLB axis rotation `(x,y,z)->(x,z,-y)`, a
 
 This is a sampled approximation, not an exact triangle-to-triangle Hausdorff or
 self-intersection test.
+
+Release builds and both focused tests passed after the final edit. Khronos core
+and synchronization validation reported zero VUIDs or synchronization hazards,
+including a 174k-face multi-level-scan simplify to 50k faces.
 
 ## Memory guidance for a 2M-face asset
 
@@ -350,10 +395,11 @@ remesh memory than the original face count, so a blanket estimate based only on
 
 1. Move sparse-grid filtering/hash, DC vertex solving, and topology construction
    from the CPU to Vulkan. Remesh is now the largest end-to-end bottleneck.
-2. Record more of a simplify iteration into fewer command buffers; ordinary
-   dispatch currently incurs a fence wait.
-3. Add a persistent buffer pool and device-local-only workspaces with small
-   staging/readback buffers for GPUs without a large host-visible BAR heap.
+2. Replace the remaining merge-sort passes with a Vulkan radix sort and compact
+   run-length encoding, provided profiling shows a net win on the target GPU.
+3. Move large scratch to device-local-only memory with small staging/readback
+   buffers for GPUs without a large host-visible BAR heap. Keep actual-count
+   readbacks where they prevent oversized output allocation.
 4. Reduce full CSR/edge/QEM reconstruction frequency or maintain incremental
    topology.
 5. Optimize link-condition neighborhood queries without weakening the output
