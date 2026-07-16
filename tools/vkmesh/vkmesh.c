@@ -88,10 +88,27 @@ typedef struct vkmesh_mesh {
 typedef struct vkmesh_edge {
     uint32_t min_v;
     uint32_t max_v;
-    uint32_t a;
-    uint32_t b;
-    uint32_t face;
+    /* Low bit is direction: 0=min->max, 1=max->min. */
+    uint32_t payload;
 } vkmesh_edge;
+
+_Static_assert(sizeof(vkmesh_edge) == 3u * sizeof(uint32_t), "vkmesh_edge must match GLSL");
+
+static uint32_t vkmesh_edge_make_payload(uint32_t face, uint32_t a, uint32_t b) {
+    return (face << 1u) | (a != b && a > b ? 1u : 0u);
+}
+
+static uint32_t vkmesh_edge_face(const vkmesh_edge * edge) {
+    return edge->payload >> 1u;
+}
+
+static uint32_t vkmesh_edge_start(const vkmesh_edge * edge) {
+    return (edge->payload & 1u) != 0u ? edge->max_v : edge->min_v;
+}
+
+static uint32_t vkmesh_edge_end(const vkmesh_edge * edge) {
+    return (edge->payload & 1u) != 0u ? edge->min_v : edge->max_v;
+}
 
 typedef struct vkmesh_boundary_edge {
     int32_t a;
@@ -3504,9 +3521,7 @@ static int compare_vkmesh_edges(const void * lhs_ptr, const void * rhs_ptr) {
     const vkmesh_edge * rhs = (const vkmesh_edge *) rhs_ptr;
     if (lhs->min_v != rhs->min_v) return lhs->min_v < rhs->min_v ? -1 : 1;
     if (lhs->max_v != rhs->max_v) return lhs->max_v < rhs->max_v ? -1 : 1;
-    if (lhs->face != rhs->face) return lhs->face < rhs->face ? -1 : 1;
-    if (lhs->a != rhs->a) return lhs->a < rhs->a ? -1 : 1;
-    if (lhs->b != rhs->b) return lhs->b < rhs->b ? -1 : 1;
+    if (lhs->payload != rhs->payload) return lhs->payload < rhs->payload ? -1 : 1;
     return 0;
 }
 
@@ -3533,11 +3548,11 @@ static int get_sorted_edges_cpu(
         const uint32_t vertices[3] = { (uint32_t) f[0], (uint32_t) f[1], (uint32_t) f[2] };
         for (uint32_t edge = 0u; edge < 3u; ++edge) {
             vkmesh_edge * dst = edges + (size_t) face * 3u + edge;
-            dst->a = vertices[edge];
-            dst->b = vertices[(edge + 1u) % 3u];
-            dst->min_v = dst->a < dst->b ? dst->a : dst->b;
-            dst->max_v = dst->a > dst->b ? dst->a : dst->b;
-            dst->face = (uint32_t) face;
+            const uint32_t a = vertices[edge];
+            const uint32_t b = vertices[(edge + 1u) % 3u];
+            dst->min_v = a < b ? a : b;
+            dst->max_v = a > b ? a : b;
+            dst->payload = vkmesh_edge_make_payload((uint32_t) face, a, b);
         }
     }
     qsort(edges, edge_count, sizeof(*edges), compare_vkmesh_edges);
@@ -3718,8 +3733,8 @@ static int get_boundary_edges_fallback(
             boundary = next;
             boundary_capacity = next_cap;
         }
-        boundary[boundary_count].a = (int32_t) edges[i].a;
-        boundary[boundary_count].b = (int32_t) edges[i].b;
+        boundary[boundary_count].a = (int32_t) vkmesh_edge_start(&edges[i]);
+        boundary[boundary_count].b = (int32_t) vkmesh_edge_end(&edges[i]);
         boundary[boundary_count].min_v = edges[i].min_v;
         boundary[boundary_count].max_v = edges[i].max_v;
         ++boundary_count;
@@ -3862,8 +3877,8 @@ static int get_manifold_face_pairs_cpu(
                 pairs = next;
                 capacity = next_cap;
             }
-            pairs[count].f0 = (int32_t) edges[i].face;
-            pairs[count].f1 = (int32_t) edges[i + 1].face;
+            pairs[count].f0 = (int32_t) vkmesh_edge_face(&edges[i]);
+            pairs[count].f1 = (int32_t) vkmesh_edge_face(&edges[i + 1]);
             pairs[count].v0 = edges[i].min_v;
             pairs[count].v1 = edges[i].max_v;
             ++count;

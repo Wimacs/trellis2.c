@@ -380,6 +380,147 @@ static int test_cli_cleanup(const char * vkmesh_path) {
     return 1;
 }
 
+static int mesh_is_closed_and_consistently_wound(
+    const int32_t * faces,
+    int64_t n_vertices,
+    int64_t n_faces) {
+    if (faces == NULL || n_vertices <= 0 || n_faces <= 0) return 0;
+    for (int64_t i = 0; i < n_faces; ++i) {
+        const int32_t * f = faces + (size_t) i * 3u;
+        for (int edge = 0; edge < 3; ++edge) {
+            const int32_t a = f[edge];
+            const int32_t b = f[(edge + 1) % 3];
+            if (a < 0 || b < 0 || a >= n_vertices || b >= n_vertices || a == b) return 0;
+            int same = 0;
+            int opposite = 0;
+            for (int64_t j = 0; j < n_faces; ++j) {
+                const int32_t * g = faces + (size_t) j * 3u;
+                for (int other = 0; other < 3; ++other) {
+                    const int32_t ga = g[other];
+                    const int32_t gb = g[(other + 1) % 3];
+                    same += ga == a && gb == b;
+                    opposite += ga == b && gb == a;
+                }
+            }
+            if (same != 1 || opposite != 1) return 0;
+        }
+    }
+    return 1;
+}
+
+static int mesh_max_edge_incidence(const test_mesh * mesh) {
+    if (mesh == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
+        return -1;
+    }
+    int max_incidence = 0;
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        const int32_t * f = mesh->faces + (size_t) i * 3u;
+        for (int edge = 0; edge < 3; ++edge) {
+            int32_t a = f[edge];
+            int32_t b = f[(edge + 1) % 3];
+            if (a < 0 || b < 0 ||
+                a >= mesh->n_vertices || b >= mesh->n_vertices || a == b) {
+                return -1;
+            }
+            if (a > b) { int32_t t = a; a = b; b = t; }
+            int incidence = 0;
+            for (int64_t j = 0; j < mesh->n_faces; ++j) {
+                const int32_t * g = mesh->faces + (size_t) j * 3u;
+                for (int other = 0; other < 3; ++other) {
+                    int32_t ga = g[other];
+                    int32_t gb = g[(other + 1) % 3];
+                    if (ga > gb) { int32_t t = ga; ga = gb; gb = t; }
+                    incidence += ga == a && gb == b;
+                }
+            }
+            if (incidence > max_incidence) max_incidence = incidence;
+        }
+    }
+    return max_incidence;
+}
+
+static int mesh_has_same_face_sets(
+    const int32_t * lhs,
+    const int32_t * rhs,
+    int64_t n_faces) {
+    if (lhs == NULL || rhs == NULL || n_faces <= 0) return 0;
+    for (int64_t i = 0; i < n_faces; ++i) {
+        int32_t key[3] = {
+            lhs[(size_t) i * 3u + 0u],
+            lhs[(size_t) i * 3u + 1u],
+            lhs[(size_t) i * 3u + 2u],
+        };
+        sort3(key);
+        int matches = 0;
+        for (int64_t j = 0; j < n_faces; ++j) {
+            int32_t candidate[3] = {
+                rhs[(size_t) j * 3u + 0u],
+                rhs[(size_t) j * 3u + 1u],
+                rhs[(size_t) j * 3u + 2u],
+            };
+            sort3(candidate);
+            matches += memcmp(key, candidate, sizeof(key)) == 0;
+        }
+        if (matches != 1) return 0;
+    }
+    return 1;
+}
+
+static int mesh_has_face_geometry(
+    const test_mesh * mesh,
+    const float * reference_vertices,
+    int64_t reference_vertex_count,
+    const int32_t * reference_faces,
+    int64_t reference_face_count) {
+    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        reference_vertices == NULL || reference_faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces != reference_face_count ||
+        reference_vertex_count <= 0 || reference_face_count <= 0) {
+        return 0;
+    }
+    int32_t * vertex_map = (int32_t *) malloc((size_t) mesh->n_vertices * sizeof(*vertex_map));
+    int32_t * remapped_faces =
+        (int32_t *) malloc((size_t) mesh->n_faces * 3u * sizeof(*remapped_faces));
+    if (vertex_map == NULL || remapped_faces == NULL) {
+        free(vertex_map);
+        free(remapped_faces);
+        return 0;
+    }
+    int ok = 1;
+    for (int64_t vertex = 0; vertex < mesh->n_vertices && ok; ++vertex) {
+        vertex_map[vertex] = -1;
+        for (int64_t original = 0; original < reference_vertex_count; ++original) {
+            if (memcmp(
+                    mesh->vertices + (size_t) vertex * 3u,
+                    reference_vertices + (size_t) original * 3u,
+                    3u * sizeof(float)) == 0) {
+                if (vertex_map[vertex] >= 0) {
+                    ok = 0;
+                    break;
+                }
+                vertex_map[vertex] = (int32_t) original;
+            }
+        }
+        if (vertex_map[vertex] < 0) ok = 0;
+    }
+    for (int64_t i = 0; i < mesh->n_faces * 3 && ok; ++i) {
+        const int32_t vertex = mesh->faces[i];
+        if (vertex < 0 || vertex >= mesh->n_vertices) {
+            ok = 0;
+            break;
+        }
+        remapped_faces[i] = vertex_map[vertex];
+    }
+    if (ok) {
+        ok = mesh_has_same_face_sets(
+            reference_faces, remapped_faces, reference_face_count);
+    }
+    free(vertex_map);
+    free(remapped_faces);
+    return ok;
+}
+
 static int test_cli_fill_holes_closed_noop(const char * vkmesh_path) {
     static const float vertices[12] = {
         0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
@@ -408,6 +549,215 @@ static int test_cli_fill_holes_closed_noop(const char * vkmesh_path) {
     CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
     CHECK_TRUE(memcmp(mesh.vertices, vertices, sizeof(vertices)) == 0);
     CHECK_TRUE(memcmp(mesh.faces, faces, sizeof(faces)) == 0);
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_fill_holes_preserves_winding(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    static const int32_t faces[9] = {
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_fill_winding_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_fill_winding_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 3));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--fill-holes", (char *) "--max-hole-perimeter", (char *) "10",
+        (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 5 && mesh.n_faces == 6);
+    CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_is_closed_and_consistently_wound(
+        mesh.faces, mesh.n_vertices, mesh.n_faces));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_unify_orientation_flips_face(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    static const int32_t faces[12] = {
+        0, 1, 2,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+    };
+    CHECK_TRUE(!mesh_is_closed_and_consistently_wound(faces, 4, 4));
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_orientation_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_orientation_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 4));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--unify-face-orientations", (char *) "--no-fill-holes",
+        (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
+    CHECK_TRUE(mesh_has_same_face_sets(faces, mesh.faces, 4));
+    CHECK_TRUE(memcmp(faces, mesh.faces, sizeof(faces)) != 0);
+    CHECK_TRUE(mesh_is_closed_and_consistently_wound(
+        mesh.faces, mesh.n_vertices, mesh.n_faces));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_repair_nonmanifold_incidence(const char * vkmesh_path) {
+    static const float vertices[27] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        0.0f, -1.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        4.0f, 0.0f, 0.0f,
+        3.0f, 1.0f, 0.0f,
+        3.0f, -1.0f, 0.0f,
+    };
+    static const int32_t faces[15] = {
+        0, 1, 2,
+        0, 1, 3,
+        0, 1, 4,
+        5, 6, 7,
+        6, 5, 8,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_repair_incidence_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_repair_incidence_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 9, faces, 5));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--repair-non-manifold-edges", (char *) "--no-fill-holes",
+        (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 13 && mesh.n_faces == 5);
+    CHECK_TRUE(mesh_has_valid_triangles(&mesh));
+    const int max_incidence = mesh_max_edge_incidence(&mesh);
+    CHECK_TRUE(max_incidence == 2);
+    CHECK_TRUE(mesh_has_face_geometry(&mesh, vertices, 9, faces, 5));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_remove_small_components_direct(const char * vkmesh_path) {
+    static const float vertices[15] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        0.5f, 0.0001f, 0.0f,
+    };
+    static const int32_t faces[15] = {
+        0, 1, 4,
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+    };
+    static const int32_t tetra_faces[12] = {
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_components_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_components_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 5, faces, 5));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--remove-small-components", (char *) "--min-component-area", (char *) "0.01",
+        (char *) "--no-fill-holes", (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
+    CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_is_closed_and_consistently_wound(
+        mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_has_face_geometry(&mesh, vertices, 5, tetra_faces, 4));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_components_handles_self_edge(const char * vkmesh_path) {
+    static const float vertices[18] = {
+        0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+        10.0f, 0.0f, 0.0f, 11.0f, 0.0f, 0.0f,
+    };
+    static const int32_t faces[15] = {
+        0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
+        4, 4, 5,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_components_self_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_components_self_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 6, faces, 5));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--remove-small-components", (char *) "--min-component-area", (char *) "1e-6",
+        (char *) "--no-fill-holes", (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
+    CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_is_closed_and_consistently_wound(
+        mesh.faces, mesh.n_vertices, mesh.n_faces));
     test_mesh_free(&mesh);
     return 1;
 }
@@ -1316,6 +1666,11 @@ int main(int argc, char ** argv) {
     }
     (void) test_cli_cleanup(argv[1]);
     (void) test_cli_fill_holes_closed_noop(argv[1]);
+    (void) test_cli_fill_holes_preserves_winding(argv[1]);
+    (void) test_cli_unify_orientation_flips_face(argv[1]);
+    (void) test_cli_repair_nonmanifold_incidence(argv[1]);
+    (void) test_cli_remove_small_components_direct(argv[1]);
+    (void) test_cli_components_handles_self_edge(argv[1]);
     (void) test_cli_remove_relative_degenerate_face(argv[1]);
     (void) test_cli_simplify(argv[1]);
     (void) test_cli_simplify_rejects_self_edge(argv[1]);

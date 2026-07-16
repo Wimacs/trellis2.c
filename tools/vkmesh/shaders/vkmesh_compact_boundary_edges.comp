@@ -28,8 +28,8 @@ layout(binding = 3) buffer AuxData {
 };
 
 bool same_edge(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
+    uint abase = a * 3u;
+    uint bbase = b * 3u;
     return edges[abase + 0u] == edges[bbase + 0u] &&
            edges[abase + 1u] == edges[bbase + 1u];
 }
@@ -46,10 +46,11 @@ void main() {
     // aux0 selects the count-only pass used to size the compact output.
     if (p.aux0 != 0u) return;
 
-    uint src = idx * 5u;
+    uint src = idx * 3u;
     uint dst = out_idx * 4u;
-    boundary_edges[dst + 0u] = edges[src + 2u];
-    boundary_edges[dst + 1u] = edges[src + 3u];
+    uint direction = edges[src + 2u] & 1u;
+    boundary_edges[dst + 0u] = direction == 0u ? edges[src + 0u] : edges[src + 1u];
+    boundary_edges[dst + 1u] = direction == 0u ? edges[src + 1u] : edges[src + 0u];
     boundary_edges[dst + 2u] = edges[src + 0u];
     boundary_edges[dst + 3u] = edges[src + 1u];
 }

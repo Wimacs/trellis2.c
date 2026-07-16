@@ -28,8 +28,8 @@ layout(binding = 3) buffer Changed {
 };
 
 bool same_edge(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
+    uint abase = a * 3u;
+    uint bbase = b * 3u;
     return edges[abase + 0u] == edges[bbase + 0u] &&
            edges[abase + 1u] == edges[bbase + 1u];
 }
@@ -94,10 +94,16 @@ void main() {
     if (idx > 0u && same_edge(idx - 1u, idx)) return;
     if (idx + 2u < p.n && same_edge(idx + 1u, idx + 2u)) return;
 
-    uint face0 = edges[idx * 5u + 4u];
-    uint face1 = edges[(idx + 1u) * 5u + 4u];
+    uint payload0 = edges[idx * 3u + 2u];
+    uint payload1 = edges[(idx + 1u) * 3u + 2u];
+    uint face0 = payload0 >> 1u;
+    uint face1 = payload1 >> 1u;
     if (face0 >= p.aux0 || face1 >= p.aux0) return;
 
-    uint need = edge_needs_flip(face0, face1, edges[idx * 5u + 0u], edges[idx * 5u + 1u]);
+    uint need = edge_needs_flip(
+        face0,
+        face1,
+        edges[idx * 3u + 0u],
+        edges[idx * 3u + 1u]);
     unite(face0, face1, need);
 }

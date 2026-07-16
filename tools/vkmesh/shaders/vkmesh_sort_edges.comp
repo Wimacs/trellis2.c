@@ -16,9 +16,7 @@ layout(push_constant) uniform Push {
 struct EdgeRecord {
     uint min_v;
     uint max_v;
-    uint a;
-    uint b;
-    uint face;
+    uint payload;
 };
 
 layout(std430, binding = 0) buffer Records {
@@ -42,15 +40,13 @@ shared EdgeRecord ping_records[TILE_SIZE];
 shared EdgeRecord pong_records[TILE_SIZE];
 
 EdgeRecord sentinel_record() {
-    return EdgeRecord(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+    return EdgeRecord(0xffffffffu, 0xffffffffu, 0xffffffffu);
 }
 
 bool record_less(EdgeRecord lhs, EdgeRecord rhs) {
     if (lhs.min_v != rhs.min_v) return lhs.min_v < rhs.min_v;
     if (lhs.max_v != rhs.max_v) return lhs.max_v < rhs.max_v;
-    if (lhs.face != rhs.face) return lhs.face < rhs.face;
-    if (lhs.a != rhs.a) return lhs.a < rhs.a;
-    return lhs.b < rhs.b;
+    return lhs.payload < rhs.payload;
 }
 
 EdgeRecord shared_load(bool ping_is_source, uint index) {
