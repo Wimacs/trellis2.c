@@ -2280,16 +2280,75 @@ static int vkmesh_device_mesh_download(vkmesh_device_mesh * dm, vkmesh_mesh * me
         dm->n_vertices == 0u || dm->n_faces == 0u) {
         return 0;
     }
-    float * vertices = (float *) malloc((size_t) dm->n_vertices * 3u * sizeof(float));
-    int32_t * faces = (int32_t *) malloc((size_t) dm->n_faces * 3u * sizeof(int32_t));
+    if ((size_t) dm->n_vertices > SIZE_MAX / (3u * sizeof(float)) ||
+        (size_t) dm->n_faces > SIZE_MAX / (3u * sizeof(int32_t))) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    const size_t vertices_bytes = (size_t) dm->n_vertices * 3u * sizeof(float);
+    const size_t faces_bytes = (size_t) dm->n_faces * 3u * sizeof(int32_t);
+    float * vertices = (float *) malloc(vertices_bytes);
+    int32_t * faces = (int32_t *) malloc(faces_bytes);
     if (vertices == NULL || faces == NULL) {
         free(vertices);
         free(faces);
         vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
         return 0;
     }
-    memcpy(vertices, dm->vertices.mapped, (size_t) dm->n_vertices * 3u * sizeof(float));
-    memcpy(faces, dm->faces.mapped, (size_t) dm->n_faces * 3u * sizeof(int32_t));
+
+    vkmesh_vk * vk = dm->vk;
+    vkmesh_vk_buffer readback;
+    memset(&readback, 0, sizeof(readback));
+    const size_t available = vk->workspace_budget_bytes > vk->workspace_current_bytes ?
+        vk->workspace_budget_bytes - vk->workspace_current_bytes : 0u;
+    const size_t readback_bytes = vertices_bytes <= SIZE_MAX - faces_bytes ?
+        vertices_bytes + faces_bytes : 0u;
+    const uint32_t vertex_words = dm->n_vertices <= UINT32_MAX / 3u ?
+        dm->n_vertices * 3u : 0u;
+    const uint32_t face_words = dm->n_faces <= UINT32_MAX / 3u ?
+        dm->n_faces * 3u : 0u;
+    const int use_cached_readback =
+        readback_bytes > 0u && vertex_words > 0u && face_words > 0u &&
+        vertex_words <= UINT32_MAX - face_words &&
+        (vk->workspace_budget_bytes == 0u || readback_bytes <= available);
+    if (use_cached_readback) {
+        const vkmesh_error_kind previous_error = g_vkmesh_last_error;
+        if (!vk_buffer_create_host_cached(vk, readback_bytes, &readback)) {
+            if (previous_error != VKMESH_ERROR_NONE ||
+                g_vkmesh_last_error != VKMESH_ERROR_OUT_OF_MEMORY) {
+                goto fail;
+            }
+            /* Cached staging is optional. Preserve the old direct-read path if
+               its allocation does not fit a tight workspace or memory heap. */
+            g_vkmesh_last_error = VKMESH_ERROR_NONE;
+        }
+    }
+    if (readback.buffer != VK_NULL_HANDLE) {
+        vkmesh_dispatch_command commands[2];
+        memset(commands, 0, sizeof(commands));
+        commands[0].pipeline_kind = VKMESH_PIPE_COPY_U32;
+        commands[0].buffers[0] = dm->vertices;
+        commands[0].buffers[1] = readback;
+        commands[0].buffers[2] = readback;
+        commands[0].buffers[3] = readback;
+        commands[0].push.n = vertex_words;
+        commands[0].groups_x = (vertex_words - 1u) / 128u + 1u;
+        commands[1].pipeline_kind = VKMESH_PIPE_COPY_U32;
+        commands[1].buffers[0] = dm->faces;
+        commands[1].buffers[1] = readback;
+        commands[1].buffers[2] = readback;
+        commands[1].buffers[3] = readback;
+        commands[1].push.n = face_words;
+        commands[1].push.aux1 = vertex_words;
+        commands[1].groups_x = (face_words - 1u) / 128u + 1u;
+        if (!vkmesh_dispatch_batch(vk, commands, 2u)) goto fail;
+        memcpy(vertices, readback.mapped, vertices_bytes);
+        memcpy(faces, (const uint8_t *) readback.mapped + vertices_bytes, faces_bytes);
+    } else {
+        memcpy(vertices, dm->vertices.mapped, vertices_bytes);
+        memcpy(faces, dm->faces.mapped, faces_bytes);
+    }
+    vk_buffer_destroy(vk, &readback);
     free(mesh->vertices);
     free(mesh->uvs);
     free(mesh->faces);
@@ -2302,6 +2361,12 @@ static int vkmesh_device_mesh_download(vkmesh_device_mesh * dm, vkmesh_mesh * me
     mesh->face_capacity = mesh->n_faces;
     mesh->has_uvs = 0;
     return 1;
+
+fail:
+    vk_buffer_destroy(vk, &readback);
+    free(vertices);
+    free(faces);
+    return 0;
 }
 
 static int compact_device_mesh_from_flags_reuse(
@@ -2838,13 +2903,13 @@ static int vkmesh_device_remove_small_connected_components(
     vkmesh_vk_buffer parents;
     vkmesh_vk_buffer changed;
     vkmesh_vk_buffer area_bits;
-    vkmesh_vk_buffer keep_flags;
+    vkmesh_vk_buffer parent_readback;
     memset(&edges_buffer, 0, sizeof(edges_buffer));
     memset(&edge_dummy, 0, sizeof(edge_dummy));
     memset(&parents, 0, sizeof(parents));
     memset(&changed, 0, sizeof(changed));
     memset(&area_bits, 0, sizeof(area_bits));
-    memset(&keep_flags, 0, sizeof(keep_flags));
+    memset(&parent_readback, 0, sizeof(parent_readback));
 
     const size_t parents_bytes = (size_t) dm->n_faces * sizeof(uint32_t);
     size_t edge_count = 0;
@@ -2855,8 +2920,8 @@ static int vkmesh_device_remove_small_connected_components(
     }
     if (!vk_buffer_create_uninitialized(vk, parents_bytes, &parents) ||
         !vk_buffer_create(vk, sizeof(uint32_t), &changed) ||
-        !vk_buffer_create(vk, parents_bytes, &area_bits) ||
-        !vk_buffer_create_uninitialized(vk, parents_bytes, &keep_flags)) {
+        !vk_buffer_create_host_cached(vk, parents_bytes, &area_bits) ||
+        !vk_buffer_create_host_cached(vk, parents_bytes, &parent_readback)) {
         goto cleanup;
     }
 
@@ -2898,7 +2963,15 @@ static int vkmesh_device_remove_small_connected_components(
     }
     if (!converged) goto cleanup;
 
-    memset(area_bits.mapped, 0, parents_bytes);
+    vkmesh_vk_buffer copy_buffers[4];
+    copy_buffers[0] = parents;
+    copy_buffers[1] = parent_readback;
+    copy_buffers[2] = changed;
+    copy_buffers[3] = changed;
+    memset(&push, 0, sizeof(push));
+    push.n = dm->n_faces;
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, face_groups)) goto cleanup;
+
     vkmesh_vk_buffer area_buffers[4];
     area_buffers[0] = dm->faces;
     area_buffers[1] = dm->vertices;
@@ -2909,14 +2982,14 @@ static int vkmesh_device_remove_small_connected_components(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPONENT_AREA, area_buffers, &push, face_groups)) goto cleanup;
 
     if (!vkmesh_mark_components_by_area_host(
-            &parents, &area_bits, &keep_flags, dm->n_faces, min_area)) goto cleanup;
+            &parent_readback, &area_bits, &area_bits, dm->n_faces, min_area)) goto cleanup;
 
     vk_buffer_destroy(vk, &edges_buffer);
     vk_buffer_destroy(vk, &edge_dummy);
     vk_buffer_destroy(vk, &parents);
     vk_buffer_destroy(vk, &changed);
-    vk_buffer_destroy(vk, &area_bits);
-    if (!compact_device_mesh_from_flags(dm, &keep_flags, 0u, removed_faces)) goto cleanup;
+    vk_buffer_destroy(vk, &parent_readback);
+    if (!compact_device_mesh_from_flags(dm, &area_bits, 0u, removed_faces)) goto cleanup;
     ok = 1;
 
 cleanup:
@@ -2925,7 +2998,7 @@ cleanup:
     vk_buffer_destroy(vk, &parents);
     vk_buffer_destroy(vk, &changed);
     vk_buffer_destroy(vk, &area_bits);
-    vk_buffer_destroy(vk, &keep_flags);
+    vk_buffer_destroy(vk, &parent_readback);
     return ok;
 }
 
