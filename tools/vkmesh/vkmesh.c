@@ -8838,44 +8838,43 @@ static int vkmesh_device_fill_holes(
         goto cleanup;
     }
 
-    size_t boundary_count_size = 0;
-    const vkmesh_edge * sorted_edges = (const vkmesh_edge *) edges_buffer.mapped;
-    for (size_t begin = 0; begin < edge_count;) {
-        size_t end = begin + 1u;
-        while (end < edge_count &&
-               sorted_edges[end].min_v == sorted_edges[begin].min_v &&
-               sorted_edges[end].max_v == sorted_edges[begin].max_v) {
-            ++end;
-        }
-        if (end == begin + 1u) ++boundary_count_size;
-        begin = end;
-    }
-    if (boundary_count_size == 0u) {
-        ok = 1;
-        goto cleanup;
-    }
-    if (boundary_count_size > UINT32_MAX ||
-        !vk_buffer_create(vk, boundary_count_size * sizeof(vkmesh_boundary_edge), &boundary_buffer)) {
-        goto cleanup;
-    }
-
     vkmesh_vk_buffer compact_buffers[4];
     compact_buffers[0] = edges_buffer;
-    compact_buffers[1] = boundary_buffer;
+    compact_buffers[1] = dummy_buffer;
     compact_buffers[2] = counter_buffer;
     compact_buffers[3] = dummy_buffer;
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) edge_count;
+    push.aux0 = 1u;
     uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
+    ((uint32_t *) counter_buffer.mapped)[0] = 0u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_BOUNDARY_EDGES, compact_buffers, &push, edge_groups)) goto cleanup;
 
     uint32_t boundary_count = ((const uint32_t *) counter_buffer.mapped)[0];
-    if ((size_t) boundary_count != boundary_count_size) goto cleanup;
+    if (boundary_count == 0u) {
+        ok = 1;
+        goto cleanup;
+    }
+    if ((size_t) boundary_count > edge_count ||
+        (size_t) boundary_count > SIZE_MAX / sizeof(vkmesh_boundary_edge) ||
+        !vk_buffer_create(vk, (size_t) boundary_count * sizeof(vkmesh_boundary_edge), &boundary_buffer)) {
+        goto cleanup;
+    }
+
+    ((uint32_t *) counter_buffer.mapped)[0] = 0u;
+    compact_buffers[1] = boundary_buffer;
+    push.aux0 = 0u;
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_BOUNDARY_EDGES, compact_buffers, &push, edge_groups)) goto cleanup;
+
+    if (((const uint32_t *) counter_buffer.mapped)[0] != boundary_count) goto cleanup;
     vk_buffer_destroy(vk, &edges_buffer);
 
-    size_t hole_words_size = (size_t) boundary_count * 7u + (size_t) vertex_count * 2u;
-    if (hole_words_size > UINT32_MAX) goto cleanup;
+    uint64_t hole_words_u64 =
+        (uint64_t) boundary_count * 7u + (uint64_t) vertex_count * 2u;
+    if (hole_words_u64 > UINT32_MAX ||
+        hole_words_u64 > SIZE_MAX / sizeof(uint32_t)) goto cleanup;
+    size_t hole_words_size = (size_t) hole_words_u64;
     const uint32_t degree_off = boundary_count;
     const uint32_t owner_off = degree_off + vertex_count;
     if (!vk_buffer_create(vk, hole_words_size * sizeof(uint32_t), &hole_data) ||

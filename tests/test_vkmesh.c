@@ -373,7 +373,41 @@ static int test_cli_cleanup(const char * vkmesh_path) {
     trellis_unlink(input);
     trellis_unlink(output);
     CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 5 && mesh.n_faces == 6);
     CHECK_TRUE(mesh_is_closed_and_clean(mesh.vertices, mesh.faces, mesh.n_vertices, mesh.n_faces));
+    CHECK_TRUE(mesh_has_well_conditioned_triangles(&mesh));
+    test_mesh_free(&mesh);
+    return 1;
+}
+
+static int test_cli_fill_holes_closed_noop(const char * vkmesh_path) {
+    static const float vertices[12] = {
+        0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    static const int32_t faces[12] = {
+        0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3,
+    };
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(input, sizeof(input), "vkmesh_fill_closed_in", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(output, sizeof(output), "vkmesh_fill_closed_out", ".meshbin"));
+    CHECK_TRUE(write_meshbin(input, vertices, 4, faces, 4));
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", input, (char *) "--output", output,
+        (char *) "--fill-holes", (char *) "--no-remesh", (char *) "--no-uv-unwrap",
+        (char *) "--device", (char *) "0", NULL,
+    };
+    int ran = trellis_run_process_exact(args);
+    test_mesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    int read_ok = ran && read_meshbin(output, &mesh);
+    trellis_unlink(input);
+    trellis_unlink(output);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(mesh.n_vertices == 4 && mesh.n_faces == 4);
+    CHECK_TRUE(memcmp(mesh.vertices, vertices, sizeof(vertices)) == 0);
+    CHECK_TRUE(memcmp(mesh.faces, faces, sizeof(faces)) == 0);
     test_mesh_free(&mesh);
     return 1;
 }
@@ -1244,6 +1278,7 @@ int main(int argc, char ** argv) {
         return 77;
     }
     (void) test_cli_cleanup(argv[1]);
+    (void) test_cli_fill_holes_closed_noop(argv[1]);
     (void) test_cli_remove_relative_degenerate_face(argv[1]);
     (void) test_cli_simplify(argv[1]);
     (void) test_cli_simplify_rejects_self_edge(argv[1]);
