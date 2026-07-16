@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(std430, binding = 0) readonly buffer EdgeKeys {
+    uvec2 edge_keys[];
+};
+
+layout(binding = 1) buffer Histogram {
+    uint histogram[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+const uint ITEMS_PER_GROUP = 1024u;
+shared uint counts[256];
+
+uint key_digit(uvec2 key) {
+    uint word = p.aux0 < 4u ? key.y : key.x;
+    return (word >> ((p.aux0 & 3u) * 8u)) & 255u;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    counts[lane] = 0u;
+    barrier();
+
+    uint block_start = gl_WorkGroupID.x * ITEMS_PER_GROUP;
+    for (uint item = 0u; item < 4u; ++item) {
+        uint index = block_start + lane + item * 256u;
+        if (index < p.n) atomicAdd(counts[key_digit(edge_keys[index])], 1u);
+    }
+    barrier();
+
+    histogram[lane * p.aux1 + gl_WorkGroupID.x] = counts[lane];
+}

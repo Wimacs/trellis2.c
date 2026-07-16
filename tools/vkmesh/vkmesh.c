@@ -33,6 +33,10 @@
 #include "vkmesh_merge_edges_spv.h"
 #include "vkmesh_merge_simplify_edge_keys_spv.h"
 #include "vkmesh_merge_face_keys_spv.h"
+#include "vkmesh_radix_histogram_simplify_edge_keys_spv.h"
+#include "vkmesh_radix_offset_simplify_edge_histogram_spv.h"
+#include "vkmesh_radix_scan_simplify_edge_histogram_spv.h"
+#include "vkmesh_radix_scatter_simplify_edge_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
 #include "vkmesh_block_scan_u32_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
@@ -169,6 +173,10 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_MERGE_EDGES,
     VKMESH_PIPE_MERGE_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_MERGE_FACE_KEYS,
+    VKMESH_PIPE_RADIX_HISTOGRAM_SIMPLIFY_EDGE_KEYS,
+    VKMESH_PIPE_RADIX_SCAN_SIMPLIFY_EDGE_HISTOGRAM,
+    VKMESH_PIPE_RADIX_OFFSET_SIMPLIFY_EDGE_HISTOGRAM,
+    VKMESH_PIPE_RADIX_SCATTER_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_MARK_DUPLICATE_FACES,
     VKMESH_PIPE_MARK_BOUNDARY_EDGES,
     VKMESH_PIPE_BOUNDARY_DEGREE_OWNER,
@@ -296,6 +304,10 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_merge_edges_spv, sizeof(vkmesh_merge_edges_spv), "merge_edges" },
     { vkmesh_merge_simplify_edge_keys_spv, sizeof(vkmesh_merge_simplify_edge_keys_spv), "merge_simplify_edge_keys" },
     { vkmesh_merge_face_keys_spv, sizeof(vkmesh_merge_face_keys_spv), "merge_face_keys" },
+    { vkmesh_radix_histogram_simplify_edge_keys_spv, sizeof(vkmesh_radix_histogram_simplify_edge_keys_spv), "radix_histogram_simplify_edge_keys" },
+    { vkmesh_radix_scan_simplify_edge_histogram_spv, sizeof(vkmesh_radix_scan_simplify_edge_histogram_spv), "radix_scan_simplify_edge_histogram" },
+    { vkmesh_radix_offset_simplify_edge_histogram_spv, sizeof(vkmesh_radix_offset_simplify_edge_histogram_spv), "radix_offset_simplify_edge_histogram" },
+    { vkmesh_radix_scatter_simplify_edge_keys_spv, sizeof(vkmesh_radix_scatter_simplify_edge_keys_spv), "radix_scatter_simplify_edge_keys" },
     { vkmesh_mark_duplicate_faces_spv, sizeof(vkmesh_mark_duplicate_faces_spv), "mark_duplicate_faces" },
     { vkmesh_mark_boundary_edges_spv, sizeof(vkmesh_mark_boundary_edges_spv), "mark_boundary_edges" },
     { vkmesh_boundary_degree_owner_spv, sizeof(vkmesh_boundary_degree_owner_spv), "boundary_degree_owner" },
@@ -1311,6 +1323,30 @@ static void vkmesh_update_descriptor_set(vkmesh_vk * vk, vkmesh_vk_buffer buffer
     vkmesh_update_descriptor_set_handle(vk, vk->descriptor_sets[0], buffers);
 }
 
+static void vkmesh_update_batch_descriptor_sets(
+    vkmesh_vk * vk,
+    const vkmesh_dispatch_command * commands,
+    uint32_t command_count) {
+    VkDescriptorBufferInfo infos[4u * VKMESH_DISPATCH_BATCH_MAX];
+    VkWriteDescriptorSet writes[4u * VKMESH_DISPATCH_BATCH_MAX];
+    memset(infos, 0, sizeof(infos));
+    memset(writes, 0, sizeof(writes));
+    for (uint32_t command = 0u; command < command_count; ++command) {
+        for (uint32_t binding = 0u; binding < 4u; ++binding) {
+            const uint32_t index = command * 4u + binding;
+            infos[index].buffer = commands[command].buffers[binding].buffer;
+            infos[index].range = (VkDeviceSize) commands[command].buffers[binding].bytes;
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = vk->descriptor_sets[command];
+            writes[index].dstBinding = binding;
+            writes[index].descriptorCount = 1u;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[index].pBufferInfo = &infos[index];
+        }
+    }
+    vkUpdateDescriptorSets(vk->device, 4u * command_count, writes, 0u, NULL);
+}
+
 static int vkmesh_dispatch(
     vkmesh_vk * vk,
     vkmesh_pipeline_kind pipeline_kind,
@@ -1367,8 +1403,8 @@ static int vkmesh_dispatch_batch(
 
     for (uint32_t i = 0u; i < command_count; ++i) {
         if (commands[i].pipeline_kind >= VKMESH_PIPE_COUNT || commands[i].groups_x == 0u) return 0;
-        vkmesh_update_descriptor_set_handle(vk, vk->descriptor_sets[i], commands[i].buffers);
     }
+    vkmesh_update_batch_descriptor_sets(vk, commands, command_count);
 
     int ok = 0;
     VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
@@ -1746,6 +1782,135 @@ cleanup:
     return ok;
 }
 
+#define VKMESH_RADIX_ITEMS_PER_GROUP 1024u
+#define VKMESH_RADIX_MIN_KEYS (1u << 18u)
+#define VKMESH_RADIX_MAX_KEYS (65535u * VKMESH_RADIX_ITEMS_PER_GROUP)
+
+static int vkmesh_radix_histogram_fits(
+    const vkmesh_vk * vk,
+    const vkmesh_vk_buffer * histogram,
+    size_t bytes,
+    size_t reserve_bytes) {
+    if (vk->workspace_budget_bytes == 0u || histogram->bytes >= bytes) return 1;
+    size_t live_without_histogram = vk->workspace_current_bytes;
+    if (histogram->allocation_bytes <= live_without_histogram) {
+        live_without_histogram -= histogram->allocation_bytes;
+    }
+    const size_t allocation_slack = 64u * 1024u;
+    if (bytes > SIZE_MAX - allocation_slack ||
+        bytes + allocation_slack > SIZE_MAX - reserve_bytes ||
+        live_without_histogram > vk->workspace_budget_bytes) return 0;
+    return bytes + allocation_slack + reserve_bytes <=
+        vk->workspace_budget_bytes - live_without_histogram;
+}
+
+static int vkmesh_sort_simplify_edge_keys_radix(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * records,
+    vkmesh_vk_buffer * temporary,
+    vkmesh_vk_buffer * histogram,
+    vkmesh_vk_buffer * dummy,
+    uint32_t record_count) {
+    const uint32_t block_count = record_count / VKMESH_RADIX_ITEMS_PER_GROUP +
+        (record_count % VKMESH_RADIX_ITEMS_PER_GROUP != 0u);
+    const uint32_t histogram_count = block_count * 256u;
+    const size_t key_bytes = (size_t) record_count * 2u * sizeof(uint32_t);
+    const size_t histogram_bytes =
+        ((size_t) histogram_count + 256u) * sizeof(uint32_t);
+    if (records->bytes < key_bytes || dummy->bytes < sizeof(uint32_t) ||
+        !vk_buffer_ensure_capacity(vk, key_bytes, temporary) ||
+        !vk_buffer_ensure_capacity(vk, histogram_bytes, histogram)) {
+        return 0;
+    }
+
+    vkmesh_dispatch_command commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    for (uint32_t pass = 0u; pass < 8u; ++pass) {
+        vkmesh_vk_buffer source = (pass & 1u) == 0u ? *records : *temporary;
+        vkmesh_vk_buffer destination = (pass & 1u) == 0u ? *temporary : *records;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        vkmesh_dispatch_command * command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_HISTOGRAM_SIMPLIFY_EDGE_KEYS;
+        command->buffers[0] = source;
+        command->buffers[1] = *histogram;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = record_count;
+        command->push.aux0 = pass;
+        command->push.aux1 = block_count;
+        command->groups_x = block_count;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_SCAN_SIMPLIFY_EDGE_HISTOGRAM;
+        command->buffers[0] = *histogram;
+        command->buffers[1] = *dummy;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = block_count;
+        command->groups_x = 256u;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_OFFSET_SIMPLIFY_EDGE_HISTOGRAM;
+        command->buffers[0] = *histogram;
+        command->buffers[1] = *dummy;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = block_count;
+        command->groups_x = 1u;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_SCATTER_SIMPLIFY_EDGE_KEYS;
+        command->buffers[0] = source;
+        command->buffers[1] = *histogram;
+        command->buffers[2] = destination;
+        command->buffers[3] = *dummy;
+        command->push.n = record_count;
+        command->push.aux0 = pass;
+        command->push.aux1 = block_count;
+        command->groups_x = block_count;
+    }
+    return vkmesh_dispatch_batch(vk, commands, command_count);
+}
+
+static int vkmesh_sort_simplify_edge_keys(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * records,
+    vkmesh_vk_buffer * temporary,
+    vkmesh_vk_buffer * histogram,
+    vkmesh_vk_buffer * dummy,
+    uint32_t record_count,
+    size_t radix_reserve_bytes) {
+    const uint32_t block_count = record_count / VKMESH_RADIX_ITEMS_PER_GROUP +
+        (record_count % VKMESH_RADIX_ITEMS_PER_GROUP != 0u);
+    const size_t histogram_bytes =
+        ((size_t) block_count * 256u + 256u) * sizeof(uint32_t);
+    const size_t key_bytes = (size_t) record_count * 2u * sizeof(uint32_t);
+    const size_t temporary_growth = temporary != NULL &&
+        key_bytes > temporary->allocation_bytes ?
+        key_bytes - temporary->allocation_bytes : 0u;
+    if (radix_reserve_bytes > SIZE_MAX - temporary_growth) radix_reserve_bytes = SIZE_MAX;
+    else radix_reserve_bytes += temporary_growth;
+    if (histogram != NULL &&
+        record_count >= VKMESH_RADIX_MIN_KEYS && record_count <= VKMESH_RADIX_MAX_KEYS &&
+        vkmesh_radix_histogram_fits(
+            vk, histogram, histogram_bytes, radix_reserve_bytes)) {
+        return vkmesh_sort_simplify_edge_keys_radix(
+            vk, records, temporary, histogram, dummy, record_count);
+    }
+    return vkmesh_sort_records_vulkan(
+        vk,
+        records,
+        dummy,
+        record_count,
+        VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS,
+        temporary);
+}
+
 static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_out, int64_t * edge_count_out) {
     *edges_out = NULL;
     *edge_count_out = 0;
@@ -1851,6 +2016,7 @@ static int expand_simplify_edge_keys_device(
     vkmesh_vk_buffer * vertices_buffer,
     vkmesh_vk_buffer * edge_keys_buffer_out,
     vkmesh_vk_buffer * reusable_temporary_out,
+    vkmesh_vk_buffer * radix_histogram,
     size_t * edge_count_out) {
     if (edge_count_out != NULL) *edge_count_out = 0;
     if (vk == NULL || mesh == NULL || faces_buffer == NULL || vertices_buffer == NULL ||
@@ -1875,14 +2041,50 @@ static int expand_simplify_edge_keys_device(
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = ((uint32_t) mesh->n_faces + 127u) / 128u;
+    /* The radix histogram is optional. Reserve a conservative upper bound for
+       the packed scratch, output vertices, and compaction scan buffers. */
+    const uint64_t packed_scratch_words =
+        (uint64_t) mesh->n_vertices * 12ull + (uint64_t) mesh->n_faces * 9ull + 2ull;
+    if (packed_scratch_words > SIZE_MAX / sizeof(uint32_t)) return 0;
+    const size_t packed_scratch_bytes =
+        (size_t) packed_scratch_words * sizeof(uint32_t);
+    const size_t packed_scratch_growth =
+        packed_scratch_bytes > edge_keys_buffer_out->allocation_bytes ?
+        packed_scratch_bytes - edge_keys_buffer_out->allocation_bytes : 0u;
+    const size_t output_vertices_bytes =
+        (size_t) mesh->n_vertices * 3u * sizeof(float);
+    size_t compact_scan_reserve = 0u;
+    uint64_t scan_count = (uint64_t) mesh->n_faces > (uint64_t) mesh->n_vertices ?
+        (uint64_t) mesh->n_faces : (uint64_t) mesh->n_vertices;
+    while (scan_count > VKMESH_SCAN_BLOCK_SIZE) {
+        scan_count = (scan_count + VKMESH_SCAN_BLOCK_SIZE - 1u) / VKMESH_SCAN_BLOCK_SIZE;
+        const size_t level_bytes = (size_t) scan_count * sizeof(uint32_t) + 64u * 1024u;
+        if (compact_scan_reserve > SIZE_MAX - level_bytes) {
+            compact_scan_reserve = SIZE_MAX;
+            break;
+        }
+        compact_scan_reserve += level_bytes;
+    }
+    size_t radix_reserve_bytes = packed_scratch_growth;
+    if (radix_reserve_bytes > SIZE_MAX - output_vertices_bytes) {
+        radix_reserve_bytes = SIZE_MAX;
+    } else {
+        radix_reserve_bytes += output_vertices_bytes;
+    }
+    if (radix_reserve_bytes > SIZE_MAX - compact_scan_reserve) {
+        radix_reserve_bytes = SIZE_MAX;
+    } else {
+        radix_reserve_bytes += compact_scan_reserve;
+    }
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_SIMPLIFY_EDGE_KEYS, buffers, &push, groups) ||
-        !vkmesh_sort_records_vulkan(
+        !vkmesh_sort_simplify_edge_keys(
             vk,
             edge_keys_buffer_out,
+            reusable_temporary_out,
+            radix_histogram,
             vertices_buffer,
-            edge_count,
-            VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS,
-            reusable_temporary_out)) {
+            (uint32_t) edge_count,
+            radix_reserve_bytes)) {
         vk_buffer_destroy(vk, edge_keys_buffer_out);
         return 0;
     }
@@ -4554,6 +4756,7 @@ static int get_unique_simplify_edges_vulkan(
             &vertices_buffer,
             &edges_buffer,
             NULL,
+            NULL,
             &raw_count)) {
         goto cleanup;
     }
@@ -5254,6 +5457,7 @@ static int vkmesh_simplify_step_vulkan(
             &vertices_buffer,
             &edges_buffer,
             &unique_edges,
+            NULL,
             &raw_edge_count)) {
         goto cleanup;
     }
@@ -5624,14 +5828,16 @@ static int vkmesh_device_simplify_step(
             &dm->vertices,
             edge_scratch_buffer,
             &unique_edges,
+            &boundary_flags,
             &raw_edge_count)) {
         goto cleanup;
     }
     if (raw_edge_count > UINT32_MAX) goto cleanup;
+    const size_t boundary_bytes = (size_t) vertex_count * sizeof(uint32_t);
+    const size_t vertices_bytes = (size_t) vertex_count * 3u * sizeof(float);
     if (!vk_buffer_ensure_capacity(
             vk, raw_edge_count * 2u * sizeof(uint32_t), &unique_edges) ||
-        !vk_buffer_ensure_capacity(
-            vk, (size_t) vertex_count * sizeof(uint32_t), &boundary_flags)) {
+        !vk_buffer_ensure_capacity(vk, boundary_bytes, &boundary_flags)) {
         goto cleanup;
     }
     memset(boundary_flags.mapped, 0, (size_t) vertex_count * sizeof(uint32_t));
@@ -5673,7 +5879,7 @@ static int vkmesh_device_simplify_step(
             vk, (size_t) scratch_count * sizeof(uint32_t), edge_scratch_buffer) ||
         !vk_buffer_ensure_capacity(
             vk,
-            (size_t) vertex_count * 3u * sizeof(float),
+            vertices_bytes,
             &next_vertices)) goto cleanup;
 
     vkmesh_dispatch_command simplify_commands[VKMESH_DISPATCH_BATCH_MAX];

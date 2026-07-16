@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Histogram {
+    uint histogram[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+shared uint ping_values[256];
+shared uint pong_values[256];
+
+uint shared_load(bool ping_is_source, uint index) {
+    return ping_is_source ? ping_values[index] : pong_values[index];
+}
+
+void shared_store(bool ping_is_destination, uint index, uint value) {
+    if (ping_is_destination) ping_values[index] = value;
+    else pong_values[index] = value;
+}
+
+void main() {
+    uint digit = gl_LocalInvocationID.x;
+    ping_values[digit] = histogram[(digit + 1u) * p.n - 1u];
+    barrier();
+
+    bool ping_is_source = true;
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint value = shared_load(ping_is_source, digit);
+        if (digit >= offset) value += shared_load(ping_is_source, digit - offset);
+        shared_store(!ping_is_source, digit, value);
+        barrier();
+        ping_is_source = !ping_is_source;
+    }
+
+    uint exclusive_offset = digit > 0u ? shared_load(ping_is_source, digit - 1u) : 0u;
+    histogram[256u * p.n + digit] = exclusive_offset;
+}

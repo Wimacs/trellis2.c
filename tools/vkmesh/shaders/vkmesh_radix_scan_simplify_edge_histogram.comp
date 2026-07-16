@@ -1,0 +1,71 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Histogram {
+    uint histogram[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+shared uint ping_values[256];
+shared uint pong_values[256];
+shared uint running_total;
+shared uint chunk_base;
+
+uint shared_load(bool ping_is_source, uint index) {
+    return ping_is_source ? ping_values[index] : pong_values[index];
+}
+
+void shared_store(bool ping_is_destination, uint index, uint value) {
+    if (ping_is_destination) ping_values[index] = value;
+    else pong_values[index] = value;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint digit_base = gl_WorkGroupID.x * p.n;
+    if (lane == 0u) running_total = 0u;
+    barrier();
+
+    for (uint chunk = 0u; chunk < p.n; chunk += 256u) {
+        uint index = chunk + lane;
+        uint chunk_count = min(256u, p.n - chunk);
+        if (lane == 0u) chunk_base = running_total;
+        ping_values[lane] = index < p.n ? histogram[digit_base + index] : 0u;
+        barrier();
+
+        bool ping_is_source = true;
+        for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+            uint value = shared_load(ping_is_source, lane);
+            if (lane >= offset) value += shared_load(ping_is_source, lane - offset);
+            shared_store(!ping_is_source, lane, value);
+            barrier();
+            ping_is_source = !ping_is_source;
+        }
+
+        uint value = shared_load(ping_is_source, lane) + chunk_base;
+        if (index < p.n) histogram[digit_base + index] = value;
+        if (lane + 1u == chunk_count) running_total = value;
+        barrier();
+    }
+}
