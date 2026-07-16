@@ -1618,33 +1618,29 @@ cleanup:
 #define VKMESH_SCAN_MAX_LEVELS 8u
 #define VKMESH_SCAN_COMMAND_MAX (2u * VKMESH_SCAN_MAX_LEVELS + 1u)
 
-/* Inclusive scan with a fixed output buffer. Each upward pass scans blocks
-   locally and emits block sums; downward passes add the scanned parent sum. */
-static int vkmesh_scan_u32_inclusive(
+/* Append an inclusive scan to an existing dispatch batch. Each upward pass
+   scans blocks locally; downward passes add the scanned parent sum. */
+static int vkmesh_append_scan_u32_inclusive(
     vkmesh_vk * vk,
     vkmesh_vk_buffer * input,
     vkmesh_vk_buffer * output,
     uint32_t count,
     vkmesh_vk_buffer * dummy,
-    vkmesh_vk_buffer * reusable_block_sums) {
+    vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS],
+    vkmesh_dispatch_command * commands,
+    uint32_t command_capacity,
+    uint32_t * command_count) {
     if (vk == NULL || input == NULL || output == NULL || dummy == NULL || count == 0u ||
+        block_sums == NULL || commands == NULL || command_count == NULL ||
         input->bytes < (size_t) count * sizeof(uint32_t) ||
         output->bytes < (size_t) count * sizeof(uint32_t) ||
         dummy->bytes < sizeof(uint32_t)) {
         return 0;
     }
 
-    vkmesh_vk_buffer local_block_sums[VKMESH_SCAN_MAX_LEVELS];
-    vkmesh_vk_buffer * block_sums = reusable_block_sums != NULL ?
-        reusable_block_sums : local_block_sums;
     uint32_t block_sum_counts[VKMESH_SCAN_MAX_LEVELS];
-    vkmesh_dispatch_command commands[VKMESH_SCAN_COMMAND_MAX];
-    memset(local_block_sums, 0, sizeof(local_block_sums));
     memset(block_sum_counts, 0, sizeof(block_sum_counts));
-    memset(commands, 0, sizeof(commands));
     uint32_t level_count = 0u;
-    uint32_t command_count = 0u;
-    int ok = 0;
 
     vkmesh_vk_buffer * level_input = input;
     vkmesh_vk_buffer * level_output = output;
@@ -1656,14 +1652,15 @@ static int vkmesh_scan_u32_inclusive(
             if (level_count >= VKMESH_SCAN_MAX_LEVELS ||
                 !vk_buffer_ensure_capacity(
                     vk, (size_t) groups * sizeof(uint32_t), &block_sums[level_count])) {
-                goto cleanup;
+                return 0;
             }
             block_sum_counts[level_count] = groups;
             level_block_sums = &block_sums[level_count];
         }
 
-        if (command_count >= VKMESH_SCAN_COMMAND_MAX) goto cleanup;
-        vkmesh_dispatch_command * command = &commands[command_count++];
+        if (*command_count >= command_capacity) return 0;
+        vkmesh_dispatch_command * command = &commands[(*command_count)++];
+        memset(command, 0, sizeof(*command));
         command->pipeline_kind = VKMESH_PIPE_BLOCK_SCAN_U32;
         command->buffers[0] = *level_input;
         command->buffers[1] = *level_output;
@@ -1682,8 +1679,9 @@ static int vkmesh_scan_u32_inclusive(
     for (uint32_t depth = level_count; depth > 0u; --depth) {
         vkmesh_vk_buffer * data = depth == 1u ? output : &block_sums[depth - 2u];
         uint32_t data_count = depth == 1u ? count : block_sum_counts[depth - 2u];
-        if (command_count >= VKMESH_SCAN_COMMAND_MAX) goto cleanup;
-        vkmesh_dispatch_command * command = &commands[command_count++];
+        if (*command_count >= command_capacity) return 0;
+        vkmesh_dispatch_command * command = &commands[(*command_count)++];
+        memset(command, 0, sizeof(*command));
         command->pipeline_kind = VKMESH_PIPE_ADD_BLOCK_OFFSETS_U32;
         command->buffers[0] = *data;
         command->buffers[1] = block_sums[depth - 1u];
@@ -1693,13 +1691,37 @@ static int vkmesh_scan_u32_inclusive(
         uint32_t groups = (data_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
         command->groups_x = groups;
     }
+    return 1;
+}
+
+/* Inclusive scan with a fixed output buffer and one submit. */
+static int vkmesh_scan_u32_inclusive(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * input,
+    vkmesh_vk_buffer * output,
+    uint32_t count,
+    vkmesh_vk_buffer * dummy) {
+    vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS];
+    vkmesh_dispatch_command commands[VKMESH_SCAN_COMMAND_MAX];
+    memset(block_sums, 0, sizeof(block_sums));
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    int ok = 0;
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            input,
+            output,
+            count,
+            dummy,
+            block_sums,
+            commands,
+            VKMESH_SCAN_COMMAND_MAX,
+            &command_count)) goto cleanup;
     ok = vkmesh_dispatch_batch(vk, commands, command_count);
 
 cleanup:
-    if (reusable_block_sums == NULL) {
-        for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
-            vk_buffer_destroy(vk, &local_block_sums[i]);
-        }
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &block_sums[i]);
     }
     return ok;
 }
@@ -4349,7 +4371,7 @@ static int build_vertex_face_adjacency_vulkan(const vkmesh_mesh * mesh, int ** o
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
 
     if (!vkmesh_scan_u32_inclusive(
-            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &dummy_buffer, NULL)) goto cleanup;
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &dummy_buffer)) goto cleanup;
     vkmesh_vk_buffer * scan_in = &offset_b_buffer;
 
     int * offset = (int *) calloc((size_t) mesh->n_vertices + 1u, sizeof(*offset));
@@ -5175,7 +5197,7 @@ static int vkmesh_simplify_step_vulkan(
             offset_groups)) goto cleanup;
 
     if (!vkmesh_scan_u32_inclusive(
-            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter, NULL)) goto cleanup;
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter)) goto cleanup;
     vkmesh_vk_buffer * scan_in = &offset_b_buffer;
     vkmesh_vk_buffer * scan_out = &offset_a_buffer;
 
@@ -5417,8 +5439,7 @@ cleanup:
 typedef struct vkmesh_simplify_workspace {
     vkmesh_vk_buffer edge_data;
     vkmesh_vk_buffer edge_aux;
-    vkmesh_vk_buffer degree;
-    vkmesh_vk_buffer offsets[2];
+    vkmesh_vk_buffer offsets;
     vkmesh_vk_buffer adjacency_faces;
     vkmesh_vk_buffer vertex_aux;
     vkmesh_vk_buffer control;
@@ -5432,9 +5453,7 @@ static void vkmesh_simplify_workspace_destroy(
     if (vk == NULL || workspace == NULL) return;
     vk_buffer_destroy(vk, &workspace->edge_data);
     vk_buffer_destroy(vk, &workspace->edge_aux);
-    vk_buffer_destroy(vk, &workspace->degree);
-    vk_buffer_destroy(vk, &workspace->offsets[0]);
-    vk_buffer_destroy(vk, &workspace->offsets[1]);
+    vk_buffer_destroy(vk, &workspace->offsets);
     vk_buffer_destroy(vk, &workspace->adjacency_faces);
     vk_buffer_destroy(vk, &workspace->vertex_aux);
     vk_buffer_destroy(vk, &workspace->control);
@@ -5464,9 +5483,7 @@ static int vkmesh_device_simplify_step(
     view.n_vertices = dm->n_vertices;
     view.n_faces = dm->n_faces;
 
-    vkmesh_vk_buffer degree_buffer;
     vkmesh_vk_buffer offset_a_buffer;
-    vkmesh_vk_buffer offset_b_buffer;
     vkmesh_vk_buffer adjacency_buffer;
     vkmesh_vk_buffer unique_edges;
     vkmesh_vk_buffer boundary_flags;
@@ -5474,9 +5491,7 @@ static int vkmesh_device_simplify_step(
     vkmesh_vk_buffer next_vertices;
     vkmesh_vk_buffer edge_data = workspace->edge_data;
     vkmesh_vk_buffer * edge_scratch_buffer = &edge_data;
-    degree_buffer = workspace->degree;
-    offset_a_buffer = workspace->offsets[0];
-    offset_b_buffer = workspace->offsets[1];
+    offset_a_buffer = workspace->offsets;
     adjacency_buffer = workspace->adjacency_faces;
     unique_edges = workspace->edge_aux;
     boundary_flags = workspace->vertex_aux;
@@ -5484,8 +5499,7 @@ static int vkmesh_device_simplify_step(
     next_vertices = workspace->next_vertices;
     memset(&workspace->edge_data, 0, sizeof(workspace->edge_data));
     memset(&workspace->edge_aux, 0, sizeof(workspace->edge_aux));
-    memset(&workspace->degree, 0, sizeof(workspace->degree));
-    memset(workspace->offsets, 0, sizeof(workspace->offsets));
+    memset(&workspace->offsets, 0, sizeof(workspace->offsets));
     memset(&workspace->adjacency_faces, 0, sizeof(workspace->adjacency_faces));
     memset(&workspace->vertex_aux, 0, sizeof(workspace->vertex_aux));
     memset(&workspace->control, 0, sizeof(workspace->control));
@@ -5494,17 +5508,16 @@ static int vkmesh_device_simplify_step(
     const uint32_t vertex_count = dm->n_vertices;
     const uint32_t face_count = dm->n_faces;
     const uint32_t offset_count = vertex_count + 1u;
-    const size_t degree_bytes = (size_t) vertex_count * sizeof(uint32_t);
     const size_t offset_bytes = (size_t) offset_count * sizeof(uint32_t);
     int ok = 0;
 
-    if (!vk_buffer_ensure_capacity(vk, degree_bytes, &degree_buffer) ||
-        !vk_buffer_ensure_capacity(vk, offset_bytes, &offset_a_buffer) ||
-        !vk_buffer_ensure_capacity(vk, offset_bytes, &offset_b_buffer) ||
+    if (!vk_buffer_ensure_capacity(vk, offset_bytes, &offset_a_buffer) ||
+        !vk_buffer_ensure_capacity(vk, offset_bytes, &boundary_flags) ||
         !vk_buffer_ensure_capacity(vk, 4u * sizeof(uint32_t), &counter)) {
         goto cleanup;
     }
-    memset(degree_buffer.mapped, 0, degree_bytes);
+    memset(boundary_flags.mapped, 0, offset_bytes);
+    ((uint32_t *) counter.mapped)[1] = 0u;
 
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
@@ -5513,45 +5526,19 @@ static int vkmesh_device_simplify_step(
 
     vkmesh_vk_buffer degree_buffers[4];
     degree_buffers[0] = dm->faces;
-    degree_buffers[1] = degree_buffer;
+    degree_buffers[1] = boundary_flags;
     degree_buffers[2] = counter;
     degree_buffers[3] = counter;
     push.n = face_count;
     push.aux0 = vertex_count;
+    push.aux1 = 1u;
     vkmesh_push degree_push = push;
 
-    vkmesh_vk_buffer seed_buffers[4];
-    seed_buffers[0] = degree_buffer;
-    seed_buffers[1] = offset_a_buffer;
-    seed_buffers[2] = counter;
-    seed_buffers[3] = counter;
-    memset(&push, 0, sizeof(push));
-    push.n = offset_count;
     uint32_t offset_groups = (offset_count + 127u) / 128u;
-    if (!vkmesh_dispatch_pair(
-            vk,
-            VKMESH_PIPE_VERTEX_FACE_DEGREE,
-            degree_buffers,
-            &degree_push,
-            face_groups,
-            VKMESH_PIPE_SEED_VERTEX_OFFSETS,
-            seed_buffers,
-            offset_count,
-            offset_groups)) goto cleanup;
-    /* Both adjacency setup kernels complete in one submission. */
+    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
+    vkmesh_vk_buffer * scan_out = &boundary_flags;
 
-    if (!vkmesh_scan_u32_inclusive(
-            vk,
-            &offset_a_buffer,
-            &offset_b_buffer,
-            offset_count,
-            &counter,
-            workspace->scan_sums)) goto cleanup;
-    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_a_buffer;
-
-    const uint32_t total_adj = ((const uint32_t *) scan_in->mapped)[vertex_count];
-    if (total_adj != face_count * 3u) goto cleanup;
+    const uint32_t total_adj = face_count * 3u;
     if (!vk_buffer_ensure_capacity(
             vk, (size_t) total_adj * sizeof(uint32_t), &adjacency_buffer)) goto cleanup;
 
@@ -5573,17 +5560,39 @@ static int vkmesh_device_simplify_step(
     push.n = face_count;
     push.aux0 = vertex_count;
     push.aux1 = total_adj;
-    vkmesh_dispatch_command adjacency_commands[2];
+    vkmesh_dispatch_command adjacency_commands[VKMESH_DISPATCH_BATCH_MAX];
     memset(adjacency_commands, 0, sizeof(adjacency_commands));
-    adjacency_commands[0].pipeline_kind = VKMESH_PIPE_COPY_U32;
-    memcpy(adjacency_commands[0].buffers, cursor_copy_buffers, sizeof(cursor_copy_buffers));
-    adjacency_commands[0].push = cursor_copy_push;
-    adjacency_commands[0].groups_x = offset_groups;
-    adjacency_commands[1].pipeline_kind = VKMESH_PIPE_VERTEX_FACE_ADJACENCY;
-    memcpy(adjacency_commands[1].buffers, adj_buffers, sizeof(adj_buffers));
-    adjacency_commands[1].push = push;
-    adjacency_commands[1].groups_x = face_groups;
-    if (!vkmesh_dispatch_batch(vk, adjacency_commands, 2u)) goto cleanup;
+    uint32_t adjacency_command_count = 0u;
+
+    vkmesh_dispatch_command * command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_VERTEX_FACE_DEGREE;
+    memcpy(command->buffers, degree_buffers, sizeof(degree_buffers));
+    command->push = degree_push;
+    command->groups_x = face_groups;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &boundary_flags,
+            &offset_a_buffer,
+            offset_count,
+            &counter,
+            workspace->scan_sums,
+            adjacency_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &adjacency_command_count)) goto cleanup;
+
+    command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_COPY_U32;
+    memcpy(command->buffers, cursor_copy_buffers, sizeof(cursor_copy_buffers));
+    command->push = cursor_copy_push;
+    command->groups_x = offset_groups;
+
+    command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_VERTEX_FACE_ADJACENCY;
+    memcpy(command->buffers, adj_buffers, sizeof(adj_buffers));
+    command->push = push;
+    command->groups_x = face_groups;
+    if (!vkmesh_dispatch_batch(vk, adjacency_commands, adjacency_command_count)) goto cleanup;
 
     size_t raw_edge_count = 0;
     if (!expand_simplify_edge_keys_device(
@@ -5621,7 +5630,8 @@ static int vkmesh_device_simplify_step(
             &push,
             edge_groups)) goto cleanup;
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
-    if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
+    if ((size_t) unique_edge_count > raw_edge_count ||
+        ((const uint32_t *) counter.mapped)[1] != 0u) goto cleanup;
     /* Edge keys are dead here. Repurpose their allocation as packed scratch;
        no edge-key access is valid below this point. */
 
@@ -5801,9 +5811,7 @@ static int vkmesh_device_simplify_step(
 cleanup:
     workspace->edge_data = edge_data;
     workspace->edge_aux = unique_edges;
-    workspace->degree = degree_buffer;
-    workspace->offsets[0] = offset_a_buffer;
-    workspace->offsets[1] = offset_b_buffer;
+    workspace->offsets = offset_a_buffer;
     workspace->adjacency_faces = adjacency_buffer;
     workspace->vertex_aux = boundary_flags;
     workspace->control = counter;
@@ -8140,7 +8148,7 @@ static int vkmesh_scan_flags_to_offsets(
     uint32_t groups = (push.n + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, groups)) return 0;
 
-    if (!vkmesh_scan_u32_inclusive(vk, offsets_a, offsets_b, count + 1u, dummy, NULL)) return 0;
+    if (!vkmesh_scan_u32_inclusive(vk, offsets_a, offsets_b, count + 1u, dummy)) return 0;
     *offsets_out = offsets_b;
     return 1;
 }

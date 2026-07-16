@@ -19,8 +19,8 @@ layout(binding = 1) buffer Degree {
     uint degree[];
 };
 
-layout(binding = 2) buffer Unused2 {
-    uint unused2[];
+layout(binding = 2) buffer Control {
+    uint control[];
 };
 
 layout(binding = 3) buffer Unused3 {
@@ -28,7 +28,11 @@ layout(binding = 3) buffer Unused3 {
 };
 
 void add_vertex(uint v) {
-    if (v < p.aux0) atomicAdd(degree[v], 1u);
+    if (v < p.aux0) {
+        atomicAdd(degree[v + p.aux1], 1u);
+    } else {
+        atomicOr(control[1], 1u);
+    }
 }
 
 void main() {
