@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer Scratch {
+    uint scratch[];
+};
+
+layout(binding = 2) buffer OutFaces {
+    int out_faces[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+void main() {
+    uint face = gl_GlobalInvocationID.x;
+    if (face >= p.n) return;
+    uint prefix = scratch[p.aux0 + face];
+    uint previous = face > 0u ? scratch[p.aux0 + face - 1u] : 0u;
+    if (prefix == previous) return;
+
+    uint source = face * 3u;
+    uint destination = (prefix - 1u) * 3u;
+    ivec3 vertices = ivec3(
+        faces[source + 0u],
+        faces[source + 1u],
+        faces[source + 2u]);
+    if (any(lessThan(vertices, ivec3(0))) ||
+        any(greaterThanEqual(uvec3(vertices), uvec3(p.aux2)))) return;
+    uvec3 remapped = uvec3(
+        scratch[p.aux1 + uint(vertices.x)],
+        scratch[p.aux1 + uint(vertices.y)],
+        scratch[p.aux1 + uint(vertices.z)]);
+    if (any(equal(remapped, uvec3(0u)))) return;
+    out_faces[destination + 0u] = int(remapped.x - 1u);
+    out_faces[destination + 1u] = int(remapped.y - 1u);
+    out_faces[destination + 2u] = int(remapped.z - 1u);
+}

@@ -29,6 +29,7 @@
 #include "vkmesh_mark_duplicate_faces_spv.h"
 #include "vkmesh_mark_hole_faces_spv.h"
 #include "vkmesh_mark_hole_roots_spv.h"
+#include "vkmesh_mark_kept_face_vertices_spv.h"
 #include "vkmesh_merge_edges_spv.h"
 #include "vkmesh_merge_simplify_edge_keys_spv.h"
 #include "vkmesh_merge_face_keys_spv.h"
@@ -42,6 +43,8 @@
 #include "vkmesh_simplify_collapse_edges_spv.h"
 #include "vkmesh_simplify_edge_cost_spv.h"
 #include "vkmesh_simplify_propagate_cost_spv.h"
+#include "vkmesh_scatter_simplified_faces_spv.h"
+#include "vkmesh_scatter_simplified_vertices_spv.h"
 #include "vkmesh_union_face_edges_spv.h"
 #include "vkmesh_union_boundary_edges_spv.h"
 #include "vkmesh_union_corner_edges_spv.h"
@@ -198,6 +201,9 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST,
     VKMESH_PIPE_SIMPLIFY_BEST_EDGE,
     VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES,
+    VKMESH_PIPE_MARK_KEPT_FACE_VERTICES,
+    VKMESH_PIPE_SCATTER_SIMPLIFIED_FACES,
+    VKMESH_PIPE_SCATTER_SIMPLIFIED_VERTICES,
     VKMESH_PIPE_ASSIGN_CORNER_VERTICES,
     VKMESH_PIPE_WRITE_REPAIRED_MESH,
     VKMESH_PIPE_COMPONENT_AREA,
@@ -322,6 +328,9 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_simplify_propagate_cost_spv, sizeof(vkmesh_simplify_propagate_cost_spv), "simplify_propagate_cost" },
     { vkmesh_simplify_best_edge_spv, sizeof(vkmesh_simplify_best_edge_spv), "simplify_best_edge" },
     { vkmesh_simplify_collapse_edges_spv, sizeof(vkmesh_simplify_collapse_edges_spv), "simplify_collapse_edges" },
+    { vkmesh_mark_kept_face_vertices_spv, sizeof(vkmesh_mark_kept_face_vertices_spv), "mark_kept_face_vertices" },
+    { vkmesh_scatter_simplified_faces_spv, sizeof(vkmesh_scatter_simplified_faces_spv), "scatter_simplified_faces" },
+    { vkmesh_scatter_simplified_vertices_spv, sizeof(vkmesh_scatter_simplified_vertices_spv), "scatter_simplified_vertices" },
     { vkmesh_assign_corner_vertices_spv, sizeof(vkmesh_assign_corner_vertices_spv), "assign_corner_vertices" },
     { vkmesh_write_repaired_mesh_spv, sizeof(vkmesh_write_repaired_mesh_spv), "write_repaired_mesh" },
     { vkmesh_component_area_spv, sizeof(vkmesh_component_area_spv), "component_area" },
@@ -1625,6 +1634,8 @@ static int vkmesh_append_scan_u32_inclusive(
     vkmesh_vk_buffer * input,
     vkmesh_vk_buffer * output,
     uint32_t count,
+    uint32_t input_offset,
+    uint32_t output_offset,
     vkmesh_vk_buffer * dummy,
     vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS],
     vkmesh_dispatch_command * commands,
@@ -1632,8 +1643,8 @@ static int vkmesh_append_scan_u32_inclusive(
     uint32_t * command_count) {
     if (vk == NULL || input == NULL || output == NULL || dummy == NULL || count == 0u ||
         block_sums == NULL || commands == NULL || command_count == NULL ||
-        input->bytes < (size_t) count * sizeof(uint32_t) ||
-        output->bytes < (size_t) count * sizeof(uint32_t) ||
+        (uint64_t) input_offset + count > input->bytes / sizeof(uint32_t) ||
+        (uint64_t) output_offset + count > output->bytes / sizeof(uint32_t) ||
         dummy->bytes < sizeof(uint32_t)) {
         return 0;
     }
@@ -1645,6 +1656,8 @@ static int vkmesh_append_scan_u32_inclusive(
     vkmesh_vk_buffer * level_input = input;
     vkmesh_vk_buffer * level_output = output;
     uint32_t level_element_count = count;
+    uint32_t level_input_offset = input_offset;
+    uint32_t level_output_offset = output_offset;
     for (;;) {
         uint32_t groups = (level_element_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
         vkmesh_vk_buffer * level_block_sums = dummy;
@@ -1667,12 +1680,16 @@ static int vkmesh_append_scan_u32_inclusive(
         command->buffers[2] = *level_block_sums;
         command->buffers[3] = *dummy;
         command->push.n = level_element_count;
+        command->push.aux0 = level_input_offset;
+        command->push.aux1 = level_output_offset;
         command->groups_x = groups;
         if (groups == 1u) break;
 
         level_element_count = groups;
         level_input = &block_sums[level_count];
         level_output = &block_sums[level_count];
+        level_input_offset = 0u;
+        level_output_offset = 0u;
         ++level_count;
     }
 
@@ -1688,6 +1705,7 @@ static int vkmesh_append_scan_u32_inclusive(
         command->buffers[2] = *dummy;
         command->buffers[3] = *dummy;
         command->push.n = data_count;
+        command->push.aux0 = depth == 1u ? output_offset : 0u;
         uint32_t groups = (data_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
         command->groups_x = groups;
     }
@@ -1712,6 +1730,8 @@ static int vkmesh_scan_u32_inclusive(
             input,
             output,
             count,
+            0u,
+            0u,
             dummy,
             block_sums,
             commands,
@@ -5575,6 +5595,8 @@ static int vkmesh_device_simplify_step(
             &boundary_flags,
             &offset_a_buffer,
             offset_count,
+            0u,
+            0u,
             &counter,
             workspace->scan_sums,
             adjacency_commands,
@@ -5648,9 +5670,13 @@ static int vkmesh_device_simplify_step(
     (void) qem_base;
     if (scratch_count > UINT32_MAX) goto cleanup;
     if (!vk_buffer_ensure_capacity(
-            vk, (size_t) scratch_count * sizeof(uint32_t), edge_scratch_buffer)) goto cleanup;
+            vk, (size_t) scratch_count * sizeof(uint32_t), edge_scratch_buffer) ||
+        !vk_buffer_ensure_capacity(
+            vk,
+            (size_t) vertex_count * 3u * sizeof(float),
+            &next_vertices)) goto cleanup;
 
-    vkmesh_dispatch_command simplify_commands[12];
+    vkmesh_dispatch_command simplify_commands[VKMESH_DISPATCH_BATCH_MAX];
     memset(simplify_commands, 0, sizeof(simplify_commands));
     vkmesh_vk_buffer copy_buffers[4];
     copy_buffers[0] = *scan_in;
@@ -5788,22 +5814,108 @@ static int vkmesh_device_simplify_step(
     memcpy(simplify_commands[11].buffers, collapse_buffers, sizeof(collapse_buffers));
     simplify_commands[11].push = push;
     simplify_commands[11].groups_x = unique_groups;
-    if (!vkmesh_dispatch_batch(vk, simplify_commands, 12u)) goto cleanup;
-    /* The packed copies make adjacency and boundary storage reusable by
-       compaction as output faces and the vertex map. */
+    uint32_t simplify_command_count = 12u;
 
-    uint32_t collapsed_u32 = ((const uint32_t *) edge_scratch_buffer->mapped)[counter_base];
+    vkmesh_dispatch_command * simplify_command =
+        &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = vertex_count;
+    push.aux1 = (uint32_t) qem_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_command->buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = vertex_groups;
+
+    vkmesh_vk_buffer mark_vertex_buffers[4];
+    mark_vertex_buffers[0] = dm->faces;
+    mark_vertex_buffers[1] = *edge_scratch_buffer;
+    mark_vertex_buffers[2] = counter;
+    mark_vertex_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = face_count;
+    push.aux0 = vertex_count;
+    push.aux1 = (uint32_t) face_keep_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_MARK_KEPT_FACE_VERTICES;
+    memcpy(simplify_command->buffers, mark_vertex_buffers, sizeof(mark_vertex_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = face_groups;
+
+    uint32_t compact_scan_counts[2] = { face_count, vertex_count };
+    uint32_t compact_scan_offsets[2] = { (uint32_t) face_keep_base, (uint32_t) qem_base };
+    if (vertex_count > face_count) {
+        compact_scan_counts[0] = vertex_count;
+        compact_scan_counts[1] = face_count;
+        compact_scan_offsets[0] = (uint32_t) qem_base;
+        compact_scan_offsets[1] = (uint32_t) face_keep_base;
+    }
+    for (uint32_t i = 0u; i < 2u; ++i) {
+        if (!vkmesh_append_scan_u32_inclusive(
+                vk,
+                edge_scratch_buffer,
+                edge_scratch_buffer,
+                compact_scan_counts[i],
+                compact_scan_offsets[i],
+                compact_scan_offsets[i],
+                &counter,
+                workspace->scan_sums,
+                simplify_commands,
+                VKMESH_DISPATCH_BATCH_MAX,
+                &simplify_command_count)) goto cleanup;
+    }
+    if (simplify_command_count > VKMESH_DISPATCH_BATCH_MAX - 2u) goto cleanup;
+
+    vkmesh_vk_buffer scatter_face_buffers[4];
+    scatter_face_buffers[0] = dm->faces;
+    scatter_face_buffers[1] = *edge_scratch_buffer;
+    scatter_face_buffers[2] = adjacency_buffer;
+    scatter_face_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = face_count;
+    push.aux0 = (uint32_t) face_keep_base;
+    push.aux1 = (uint32_t) qem_base;
+    push.aux2 = vertex_count;
+    simplify_command->pipeline_kind = VKMESH_PIPE_SCATTER_SIMPLIFIED_FACES;
+    memcpy(simplify_command->buffers, scatter_face_buffers, sizeof(scatter_face_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = face_groups;
+
+    vkmesh_vk_buffer scatter_vertex_buffers[4];
+    scatter_vertex_buffers[0] = dm->vertices;
+    scatter_vertex_buffers[1] = *edge_scratch_buffer;
+    scatter_vertex_buffers[2] = next_vertices;
+    scatter_vertex_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = vertex_count;
+    push.aux0 = (uint32_t) qem_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_SCATTER_SIMPLIFIED_VERTICES;
+    memcpy(simplify_command->buffers, scatter_vertex_buffers, sizeof(scatter_vertex_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = vertex_groups;
+
+    if (!vkmesh_dispatch_batch(vk, simplify_commands, simplify_command_count)) goto cleanup;
+
+    const uint32_t * scratch_words = (const uint32_t *) edge_scratch_buffer->mapped;
+    const uint32_t collapsed_u32 = scratch_words[counter_base];
     uint32_t removed_u32 = 0u;
-    if (collapsed_u32 > 0u &&
-        !compact_device_mesh_from_flags_reuse(
-            dm,
-            edge_scratch_buffer,
-            (uint32_t) face_keep_base,
-            &adjacency_buffer,
-            &next_vertices,
-            &boundary_flags,
-            &counter,
-            &removed_u32)) goto cleanup;
+    if (collapsed_u32 > 0u) {
+        const uint32_t keep_count = scratch_words[face_keep_base + face_count - 1u];
+        const uint32_t compact_vertex_count = scratch_words[qem_base + vertex_count - 1u];
+        if (keep_count == 0u || keep_count > face_count ||
+            compact_vertex_count == 0u || compact_vertex_count > vertex_count) goto cleanup;
+        removed_u32 = face_count - keep_count;
+
+        vkmesh_vk_buffer previous_faces = dm->faces;
+        dm->faces = adjacency_buffer;
+        adjacency_buffer = previous_faces;
+        vkmesh_vk_buffer previous_vertices = dm->vertices;
+        dm->vertices = next_vertices;
+        next_vertices = previous_vertices;
+        dm->n_faces = keep_count;
+        dm->n_vertices = compact_vertex_count;
+    }
     if (collapsed_edges != NULL) *collapsed_edges = collapsed_u32;
     if (removed_faces != NULL) *removed_faces = removed_u32;
     ok = 1;

@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) buffer Scratch {
+    uint scratch[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+void mark_vertex(int vertex) {
+    if (vertex >= 0 && uint(vertex) < p.aux0) atomicOr(scratch[uint(vertex)], 1u);
+}
+
+void main() {
+    uint face = gl_GlobalInvocationID.x;
+    if (face >= p.n || scratch[p.aux1 + face] == 0u) return;
+    uint base = face * 3u;
+    mark_vertex(faces[base + 0u]);
+    mark_vertex(faces[base + 1u]);
+    mark_vertex(faces[base + 2u]);
+}

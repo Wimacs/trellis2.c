@@ -45,7 +45,7 @@ void shared_store(bool ping_is_destination, uint index, uint value) {
 void main() {
     uint lane = gl_LocalInvocationID.x;
     uint index = gl_WorkGroupID.x * BLOCK_SIZE + lane;
-    ping_values[lane] = index < p.n ? in_data[index] : 0u;
+    ping_values[lane] = index < p.n ? in_data[p.aux0 + index] : 0u;
     memoryBarrierShared();
     barrier();
 
@@ -60,6 +60,6 @@ void main() {
     }
 
     uint value = shared_load(ping_is_source, lane);
-    if (index < p.n) out_data[index] = value;
+    if (index < p.n) out_data[p.aux1 + index] = value;
     if (lane == BLOCK_SIZE - 1u) block_sums[gl_WorkGroupID.x] = value;
 }

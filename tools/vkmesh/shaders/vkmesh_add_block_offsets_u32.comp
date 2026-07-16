@@ -34,5 +34,5 @@ void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= p.n) return;
     uint block = index / BLOCK_SIZE;
-    if (block > 0u) data[index] += scanned_block_sums[block - 1u];
+    if (block > 0u) data[p.aux0 + index] += scanned_block_sums[block - 1u];
 }
