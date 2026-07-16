@@ -1184,6 +1184,67 @@ static int test_udf_workspace_chunking(const char * vkmesh_path) {
     return 1;
 }
 
+static int test_udf_balances_skewed_bvh(const char * vkmesh_path) {
+    enum { face_count = 96, vertex_count = face_count * 3 };
+    float vertices[vertex_count * 3];
+    int32_t faces[face_count * 3];
+    for (int i = 0; i < face_count; ++i) {
+        /* Keep the exponential centroid distribution that used to produce a
+           pathologically deep midpoint BVH, but avoid squaring subnormal
+           separations to zero in the float distance shader. */
+        const float x = ldexpf(1.0f, i - face_count / 2);
+        const int vertex = i * 3;
+        vertices[(size_t) (vertex + 0) * 3u + 0u] = x;
+        vertices[(size_t) (vertex + 0) * 3u + 1u] = 0.0f;
+        vertices[(size_t) (vertex + 0) * 3u + 2u] = 0.0f;
+        vertices[(size_t) (vertex + 1) * 3u + 0u] = x;
+        vertices[(size_t) (vertex + 1) * 3u + 1u] = 1e-3f;
+        vertices[(size_t) (vertex + 1) * 3u + 2u] = 0.0f;
+        vertices[(size_t) (vertex + 2) * 3u + 0u] = x;
+        vertices[(size_t) (vertex + 2) * 3u + 1u] = 0.0f;
+        vertices[(size_t) (vertex + 2) * 3u + 2u] = 1e-3f;
+        faces[(size_t) i * 3u + 0u] = vertex + 0;
+        faces[(size_t) i * 3u + 1u] = vertex + 1;
+        faces[(size_t) i * 3u + 2u] = vertex + 2;
+    }
+
+    char mesh_path[PATH_MAX];
+    char points_path[PATH_MAX];
+    char distance_path[PATH_MAX];
+    CHECK_TRUE(trellis_make_temp_path(mesh_path, sizeof(mesh_path), "vkmesh_udf_skew_mesh", ".meshbin"));
+    CHECK_TRUE(trellis_make_temp_path(points_path, sizeof(points_path), "vkmesh_udf_skew_points", ".txt"));
+    CHECK_TRUE(trellis_make_temp_path(distance_path, sizeof(distance_path), "vkmesh_udf_skew_distance", ".txt"));
+    CHECK_TRUE(write_meshbin(mesh_path, vertices, vertex_count, faces, face_count));
+    FILE * points = fopen(points_path, "w");
+    CHECK_TRUE(points != NULL);
+    const float query_x = ldexpf(1.0f, -face_count / 2);
+    int point_ok = fprintf(points, "%.9g 0 0\n", query_x) > 0;
+    if (fclose(points) != 0) point_ok = 0;
+    CHECK_TRUE(point_ok);
+
+    char * args[] = {
+        (char *) vkmesh_path, (char *) "--input", mesh_path,
+        (char *) "--unsigned-distance", points_path,
+        (char *) "--distance-output", distance_path,
+        (char *) "--gpu-workspace-budget-mib", (char *) "64",
+        (char *) "--device", (char *) "0", (char *) "--no-fill-holes", NULL,
+    };
+    const int ran = trellis_run_process_exact(args);
+    float * distances = NULL;
+    uint32_t * nearest_faces = NULL;
+    const int read_ok = ran &&
+        read_distance_results(distance_path, 1, &distances, &nearest_faces);
+    trellis_unlink(mesh_path);
+    trellis_unlink(points_path);
+    trellis_unlink(distance_path);
+    CHECK_TRUE(read_ok);
+    CHECK_TRUE(isfinite(distances[0]) && distances[0] <= 1e-30f);
+    CHECK_TRUE(nearest_faces[0] == 0u);
+    free(distances);
+    free(nearest_faces);
+    return 1;
+}
+
 static int test_remesh_workspace_chunking(const char * vkmesh_path) {
     static const float vertices[12] = {
         -0.35f, -0.35f, -0.35f, 0.35f, -0.35f, -0.35f,
@@ -1680,6 +1741,7 @@ int main(int argc, char ** argv) {
     (void) test_cli_simplify_closed_manifold_progress(argv[1]);
     (void) test_cli_rejects_nan(argv[1]);
     (void) test_udf_workspace_chunking(argv[1]);
+    (void) test_udf_balances_skewed_bvh(argv[1]);
     (void) test_remesh_workspace_chunking(argv[1]);
     (void) test_api_cleanup_removes_unused_vertices();
     (void) test_api_concurrent();

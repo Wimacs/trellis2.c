@@ -38,6 +38,16 @@
 #include "vkmesh_radix_scan_simplify_edge_histogram_spv.h"
 #include "vkmesh_radix_scatter_simplify_edge_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
+#include "vkmesh_remesh_active_hash_spv.h"
+#include "vkmesh_remesh_corner_owners_spv.h"
+#include "vkmesh_remesh_emit_corners_spv.h"
+#include "vkmesh_remesh_load_grid_points_spv.h"
+#include "vkmesh_remesh_simple_dc_spv.h"
+#include "vkmesh_remesh_store_grid_values_spv.h"
+#include "vkmesh_remesh_topology_count_spv.h"
+#include "vkmesh_remesh_emit_vertices_spv.h"
+#include "vkmesh_remesh_emit_faces_spv.h"
+#include "vkmesh_remesh_vertex_hash_spv.h"
 #include "vkmesh_block_scan_u32_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
 #include "vkmesh_sort_edges_spv.h"
@@ -164,6 +174,8 @@ typedef struct vkmesh_remesh_coord {
     int32_t z;
 } vkmesh_remesh_coord;
 
+_Static_assert(sizeof(vkmesh_remesh_coord) == 3u * sizeof(int32_t), "vkmesh_remesh_coord must match GLSL");
+
 typedef struct vkmesh_u64_u32_hash {
     uint64_t * keys;
     uint32_t * vals;
@@ -236,6 +248,16 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_MARK_HOLE_FACES,
     VKMESH_PIPE_WRITE_HOLE_VERTICES,
     VKMESH_PIPE_WRITE_HOLE_FACES,
+    VKMESH_PIPE_REMESH_ACTIVE_HASH,
+    VKMESH_PIPE_REMESH_CORNER_OWNERS,
+    VKMESH_PIPE_REMESH_EMIT_CORNERS,
+    VKMESH_PIPE_REMESH_LOAD_GRID_POINTS,
+    VKMESH_PIPE_REMESH_STORE_GRID_VALUES,
+    VKMESH_PIPE_REMESH_VERTEX_HASH,
+    VKMESH_PIPE_REMESH_SIMPLE_DC,
+    VKMESH_PIPE_REMESH_TOPOLOGY_COUNT,
+    VKMESH_PIPE_REMESH_EMIT_VERTICES,
+    VKMESH_PIPE_REMESH_EMIT_FACES,
     VKMESH_PIPE_UNSIGNED_DISTANCE,
     VKMESH_PIPE_COUNT,
 } vkmesh_pipeline_kind;
@@ -367,6 +389,16 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_mark_hole_faces_spv, sizeof(vkmesh_mark_hole_faces_spv), "mark_hole_faces" },
     { vkmesh_write_hole_vertices_spv, sizeof(vkmesh_write_hole_vertices_spv), "write_hole_vertices" },
     { vkmesh_write_hole_faces_spv, sizeof(vkmesh_write_hole_faces_spv), "write_hole_faces" },
+    { vkmesh_remesh_active_hash_spv, sizeof(vkmesh_remesh_active_hash_spv), "remesh_active_hash" },
+    { vkmesh_remesh_corner_owners_spv, sizeof(vkmesh_remesh_corner_owners_spv), "remesh_corner_owners" },
+    { vkmesh_remesh_emit_corners_spv, sizeof(vkmesh_remesh_emit_corners_spv), "remesh_emit_corners" },
+    { vkmesh_remesh_load_grid_points_spv, sizeof(vkmesh_remesh_load_grid_points_spv), "remesh_load_grid_points" },
+    { vkmesh_remesh_store_grid_values_spv, sizeof(vkmesh_remesh_store_grid_values_spv), "remesh_store_grid_values" },
+    { vkmesh_remesh_vertex_hash_spv, sizeof(vkmesh_remesh_vertex_hash_spv), "remesh_vertex_hash" },
+    { vkmesh_remesh_simple_dc_spv, sizeof(vkmesh_remesh_simple_dc_spv), "remesh_simple_dc" },
+    { vkmesh_remesh_topology_count_spv, sizeof(vkmesh_remesh_topology_count_spv), "remesh_topology_count" },
+    { vkmesh_remesh_emit_vertices_spv, sizeof(vkmesh_remesh_emit_vertices_spv), "remesh_emit_vertices" },
+    { vkmesh_remesh_emit_faces_spv, sizeof(vkmesh_remesh_emit_faces_spv), "remesh_emit_faces" },
     { vkmesh_unsigned_distance_spv, sizeof(vkmesh_unsigned_distance_spv), "unsigned_distance" },
 };
 
@@ -6799,10 +6831,10 @@ static uint32_t bvh_build_recursive(
     uint32_t node_id = (*node_count)++;
     vkmesh_bvh_node * node = &nodes[node_id];
     bvh_bounds_init(node->bmin, node->bmax);
-    for (int i = start; i < start + count; ++i) {
-        bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
-    }
     if (count <= 4) {
+        for (int i = start; i < start + count; ++i) {
+            bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
+        }
         node->left = (uint32_t) start;
         node->meta = 0x80000000u | (uint32_t) count;
         return node_id;
@@ -6812,6 +6844,7 @@ static uint32_t bvh_build_recursive(
     float cmax[3];
     bvh_bounds_init(cmin, cmax);
     for (int i = start; i < start + count; ++i) {
+        bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
         bvh_bounds_add(cmin, cmax, tris[i].centroid, tris[i].centroid);
     }
     float ex[3] = { cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2] };
@@ -6829,7 +6862,14 @@ static uint32_t bvh_build_recursive(
         }
     }
     int left_count = mid - start;
-    if (left_count <= 0 || left_count >= count) left_count = count / 2;
+    /* The GPU traversal uses a fixed 64-entry stack. Midpoint partitioning can
+       isolate one triangle at a time on exponentially spaced input, so keep
+       both children large enough to bound the tree depth. The fallback only
+       changes grouping; child bounds are rebuilt from their actual triangles. */
+    if ((int64_t) left_count * 3 < count ||
+        (int64_t) (count - left_count) * 3 < count) {
+        left_count = count / 2;
+    }
     uint32_t left = bvh_build_recursive(tris, start, left_count, nodes, node_count);
     uint32_t right = bvh_build_recursive(tris, start + left_count, count - left_count, nodes, node_count);
     node->left = left;
@@ -7654,6 +7694,583 @@ static int vkmesh_remesh_build_active_hash(
     return 1;
 }
 
+#define VKMESH_REMESH_GPU_CORNER_MIN_CELLS (1u << 18u)
+
+/* Build the exact active-cell corner union, sample its UDF, run simple Dual
+   Contouring, and emit the compact triangle mesh without materializing the
+   sparse topology on the CPU. */
+static int vkmesh_remesh_build_mesh_gpu(
+    vkmesh_vk * vk,
+    vkmesh_distance_query * query,
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    int resolution,
+    const float center[3],
+    float scale,
+    float eps,
+    int release_query,
+    int64_t * grid_count_out,
+    vkmesh_mesh * mesh_out) {
+    if (grid_count_out == NULL || mesh_out == NULL) return 0;
+    *grid_count_out = 0;
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    if (vk == NULL || query == NULL || query->vk != vk || query->point_capacity == 0u ||
+        coords == NULL || center == NULL || resolution <= 0 || !(scale > 0.0f) ||
+        coord_count < (int64_t) VKMESH_REMESH_GPU_CORNER_MIN_CELLS ||
+        coord_count > (int64_t) (UINT32_MAX / 8u)) {
+        return 0;
+    }
+
+    const uint32_t cell_count = (uint32_t) coord_count;
+    const uint64_t resolution_u64 = (uint64_t) (uint32_t) resolution;
+    const uint64_t grid_dimension_u64 = resolution_u64 + 1u;
+    if (grid_dimension_u64 * grid_dimension_u64 > UINT32_MAX ||
+        grid_dimension_u64 * grid_dimension_u64 * grid_dimension_u64 > UINT32_MAX) {
+        return 0;
+    }
+    for (int64_t i = 0; i < coord_count; ++i) {
+        if (coords[i].x < 0 || coords[i].y < 0 || coords[i].z < 0 ||
+            coords[i].x >= resolution || coords[i].y >= resolution ||
+            coords[i].z >= resolution) {
+            return 0;
+        }
+    }
+
+    const uint64_t hash_need_u64 = ((uint64_t) cell_count * 10u + 6u) / 7u;
+    if (hash_need_u64 > SIZE_MAX) return 0;
+    size_t hash_capacity_size = 0u;
+    if (!vkmesh_next_pow2_size((size_t) hash_need_u64, &hash_capacity_size) ||
+        hash_capacity_size > UINT32_MAX) {
+        return 0;
+    }
+    const uint32_t hash_capacity = (uint32_t) hash_capacity_size;
+
+    const uint64_t max_grid_count_u64 = 2u * (uint64_t) cell_count;
+    const uint64_t vertex_hash_need_u64 = (max_grid_count_u64 * 10u + 6u) / 7u;
+    if (vertex_hash_need_u64 > SIZE_MAX) return 0;
+    size_t max_vertex_hash_capacity_size = 0u;
+    if (!vkmesh_next_pow2_size(
+            (size_t) vertex_hash_need_u64, &max_vertex_hash_capacity_size) ||
+        max_vertex_hash_capacity_size > UINT32_MAX ||
+        max_vertex_hash_capacity_size > SIZE_MAX / (2u * sizeof(uint32_t))) {
+        return 0;
+    }
+    if ((size_t) cell_count > SIZE_MAX / (6u * sizeof(uint32_t))) return 0;
+    const uint64_t max_dc_words_u64 =
+        2u * (uint64_t) max_vertex_hash_capacity_size + 6u * (uint64_t) cell_count;
+    if (max_dc_words_u64 > SIZE_MAX / sizeof(uint32_t)) return 0;
+    const size_t max_dc_bytes = (size_t) max_dc_words_u64 * sizeof(uint32_t);
+
+    /* Packed words:
+       [3*N coords][N+1 counts][N masks][N+1 offsets][6*N reusable tail].
+       The tail first stores [hash keys][hash values], then the emit pass
+       overwrites it with capacity for at most 2*N unique corners. */
+    const uint64_t counts_base_u64 = 3u * (uint64_t) cell_count;
+    const uint64_t offsets_base_u64 = 5u * (uint64_t) cell_count + 1u;
+    const uint64_t tail_base_u64 = 6u * (uint64_t) cell_count + 2u;
+    const uint64_t workspace_words_u64 = 12u * (uint64_t) cell_count + 2u;
+    if (2u * (uint64_t) hash_capacity > 6u * (uint64_t) cell_count ||
+        workspace_words_u64 > SIZE_MAX / sizeof(uint32_t) ||
+        workspace_words_u64 > UINT32_MAX ||
+        tail_base_u64 > UINT32_MAX || offsets_base_u64 > UINT32_MAX ||
+        counts_base_u64 > UINT32_MAX) {
+        return 0;
+    }
+    const uint32_t counts_base = (uint32_t) counts_base_u64;
+    const uint32_t offsets_base = (uint32_t) offsets_base_u64;
+    const uint32_t tail_base = (uint32_t) tail_base_u64;
+    const size_t workspace_bytes = (size_t) workspace_words_u64 * sizeof(uint32_t);
+
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(vk->physical_device, &properties);
+    const VkDeviceSize max_range = properties.limits.maxStorageBufferRange;
+    const uint64_t cell_groups = ((uint64_t) cell_count + 127u) / 128u;
+    const uint64_t scan_groups = ((uint64_t) cell_count + 256u) / 256u;
+    const uint64_t max_vertex_groups = (max_grid_count_u64 + 127u) / 128u;
+    const uint64_t max_hash_fill_groups =
+        ((uint64_t) max_vertex_hash_capacity_size + 127u) / 128u;
+    if ((VkDeviceSize) workspace_bytes > max_range ||
+        (VkDeviceSize) max_dc_bytes > max_range ||
+        cell_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        scan_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        max_vertex_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        max_hash_fill_groups > properties.limits.maxComputeWorkGroupCount[0]) {
+        return 0;
+    }
+
+    size_t scan_reserve = 0u;
+    uint64_t scan_count = (uint64_t) cell_count + 1u;
+    while (scan_count > VKMESH_SCAN_BLOCK_SIZE) {
+        scan_count = (scan_count + VKMESH_SCAN_BLOCK_SIZE - 1u) / VKMESH_SCAN_BLOCK_SIZE;
+        const uint64_t bytes_u64 = scan_count * sizeof(uint32_t) + 64u * 1024u;
+        if (bytes_u64 > SIZE_MAX || scan_reserve > SIZE_MAX - (size_t) bytes_u64) return 0;
+        scan_reserve += (size_t) bytes_u64;
+    }
+    const size_t phase_scratch_bytes = max_dc_bytes > query->buffers[2].bytes ?
+        max_dc_bytes : query->buffers[2].bytes;
+    const size_t phase_sizes[] = {
+        workspace_bytes,
+        phase_scratch_bytes,
+        scan_reserve,
+        6u * 64u * 1024u,
+    };
+    size_t phase_required = 0u;
+    for (size_t i = 0u; i < sizeof(phase_sizes) / sizeof(phase_sizes[0]); ++i) {
+        if (phase_required > SIZE_MAX - phase_sizes[i]) return 0;
+        phase_required += phase_sizes[i];
+    }
+    if (vk->workspace_budget_bytes > 0u) {
+        const size_t available = vk->workspace_budget_bytes > vk->workspace_current_bytes ?
+            vk->workspace_budget_bytes - vk->workspace_current_bytes : 0u;
+        if (phase_required > available) return 0;
+    }
+
+    vkmesh_vk_buffer workspace;
+    vkmesh_vk_buffer dc_buffer;
+    vkmesh_vk_buffer grid_query_buffer;
+    vkmesh_vk_buffer output_buffer;
+    vkmesh_vk_buffer status_buffer;
+    vkmesh_vk_buffer dummy_buffer;
+    vkmesh_vk_buffer scan_sums[VKMESH_SCAN_MAX_LEVELS];
+    memset(&workspace, 0, sizeof(workspace));
+    memset(&dc_buffer, 0, sizeof(dc_buffer));
+    memset(&grid_query_buffer, 0, sizeof(grid_query_buffer));
+    memset(&output_buffer, 0, sizeof(output_buffer));
+    memset(&status_buffer, 0, sizeof(status_buffer));
+    memset(&dummy_buffer, 0, sizeof(dummy_buffer));
+    memset(scan_sums, 0, sizeof(scan_sums));
+    vkmesh_mesh gpu_mesh;
+    memset(&gpu_mesh, 0, sizeof(gpu_mesh));
+    int ok = 0;
+
+    if (!vk_buffer_create_uninitialized(vk, workspace_bytes, &workspace) ||
+        !vk_buffer_create(vk, 6u * sizeof(uint32_t), &status_buffer) ||
+        !vk_buffer_create(vk, sizeof(uint32_t), &dummy_buffer)) {
+        goto cleanup;
+    }
+    uint32_t * workspace_words = (uint32_t *) workspace.mapped;
+    memcpy(workspace_words, coords, (size_t) cell_count * sizeof(vkmesh_remesh_coord));
+
+    vkmesh_dispatch_command commands[VKMESH_SCAN_COMMAND_MAX + 3u];
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    vkmesh_dispatch_command * command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = hash_capacity;
+    command->push.aux1 = tail_base;
+    command->groups_x = (hash_capacity + 127u) / 128u;
+
+    command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_ACTIVE_HASH;
+    command->buffers[0] = workspace;
+    command->buffers[1] = workspace;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_CORNER_OWNERS;
+    command->buffers[0] = workspace;
+    command->buffers[1] = workspace;
+    command->buffers[2] = workspace;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count + 1u,
+            counts_base,
+            offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            commands,
+            VKMESH_SCAN_COMMAND_MAX + 3u,
+            &command_count) ||
+        !vkmesh_dispatch_batch(vk, commands, command_count)) {
+        if (g_vkmesh_last_error == VKMESH_ERROR_NONE) vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        goto cleanup;
+    }
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        fprintf(stderr, "vkmesh: remesh GPU active hash saturated; using CPU corner path\n");
+        goto cleanup;
+    }
+
+    const uint32_t grid_count = workspace_words[offsets_base + cell_count];
+    if (grid_count == 0u || grid_count > cell_count * 2u ||
+        (size_t) grid_count > SIZE_MAX / sizeof(vkmesh_remesh_coord)) {
+        fprintf(stderr,
+            "vkmesh: remesh GPU corner tail exceeded cells=%u corners=%u; using CPU corner path\n",
+            cell_count,
+            grid_count);
+        goto cleanup;
+    }
+    vkmesh_vk_buffer emit_buffers[4] = {
+        workspace, workspace, workspace, workspace,
+    };
+    vkmesh_push emit_push;
+    memset(&emit_push, 0, sizeof(emit_push));
+    emit_push.n = cell_count;
+    if (!vkmesh_dispatch(
+            vk,
+            VKMESH_PIPE_REMESH_EMIT_CORNERS,
+            emit_buffers,
+            &emit_push,
+            (cell_count + 127u) / 128u)) {
+        goto cleanup;
+    }
+
+    float * transform = (float *) status_buffer.mapped;
+    transform[0] = center[0];
+    transform[1] = center[1];
+    transform[2] = center[2];
+    transform[3] = scale;
+    transform[4] = 1.0f / (float) resolution;
+    /* The general distance-query IO is host-cached for CPU callers. Remesh
+       produces and consumes these batches entirely on the GPU, so use the
+       device-preferred memory type and avoid writing millions of points over
+       PCIe on devices without a cached local mapping. */
+    if (!vk_buffer_create_uninitialized(
+            vk, query->buffers[2].bytes, &grid_query_buffer)) {
+        goto cleanup;
+    }
+    uint32_t grid_offset = 0u;
+    while (grid_offset < grid_count) {
+        uint32_t batch = query->point_capacity;
+        if (batch > grid_count - grid_offset) batch = grid_count - grid_offset;
+        vkmesh_dispatch_command query_commands[3];
+        memset(query_commands, 0, sizeof(query_commands));
+
+        query_commands[0].pipeline_kind = VKMESH_PIPE_REMESH_LOAD_GRID_POINTS;
+        query_commands[0].buffers[0] = workspace;
+        query_commands[0].buffers[1] = grid_query_buffer;
+        query_commands[0].buffers[2] = status_buffer;
+        query_commands[0].buffers[3] = dummy_buffer;
+        query_commands[0].push.n = batch;
+        query_commands[0].push.aux0 = grid_offset;
+        query_commands[0].push.aux1 = (uint32_t) resolution;
+        query_commands[0].push.aux2 = tail_base;
+        query_commands[0].groups_x = (batch + 127u) / 128u;
+
+        query_commands[1].pipeline_kind = VKMESH_PIPE_UNSIGNED_DISTANCE;
+        for (uint32_t binding = 0u; binding < 4u; ++binding) {
+            query_commands[1].buffers[binding] = query->buffers[binding];
+        }
+        query_commands[1].buffers[2] = grid_query_buffer;
+        query_commands[1].push.n = batch;
+        query_commands[1].push.aux0 = query->face_count;
+        query_commands[1].push.aux1 = query->node_count;
+        query_commands[1].push.aux2 = query->output_word_offset;
+        query_commands[1].groups_x = (batch + 127u) / 128u;
+
+        query_commands[2].pipeline_kind = VKMESH_PIPE_REMESH_STORE_GRID_VALUES;
+        query_commands[2].buffers[0] = grid_query_buffer;
+        query_commands[2].buffers[1] = workspace;
+        query_commands[2].buffers[2] = dummy_buffer;
+        query_commands[2].buffers[3] = dummy_buffer;
+        query_commands[2].push.n = batch;
+        query_commands[2].push.aux0 = query->output_word_offset;
+        query_commands[2].push.aux1 = counts_base + grid_offset;
+        query_commands[2].push.eps = eps;
+        query_commands[2].groups_x = (batch + 127u) / 128u;
+
+        if (!vkmesh_dispatch_batch(vk, query_commands, 3u)) goto cleanup;
+        ++query->batch_count;
+        grid_offset += batch;
+    }
+    vk_buffer_destroy(vk, &grid_query_buffer);
+
+    const uint64_t vertex_hash_need = ((uint64_t) grid_count * 10u + 6u) / 7u;
+    size_t vertex_hash_capacity_size = 0u;
+    if (vertex_hash_need > SIZE_MAX ||
+        !vkmesh_next_pow2_size((size_t) vertex_hash_need, &vertex_hash_capacity_size) ||
+        vertex_hash_capacity_size > UINT32_MAX ||
+        vertex_hash_capacity_size > SIZE_MAX / (2u * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+    const uint32_t vertex_hash_capacity = (uint32_t) vertex_hash_capacity_size;
+    if (vertex_hash_capacity < hash_capacity) goto cleanup;
+    const uint64_t dc_base_u64 = 2u * (uint64_t) vertex_hash_capacity;
+    const uint64_t dc_words_u64 = dc_base_u64 + 6u * (uint64_t) cell_count;
+    if (dc_base_u64 > UINT32_MAX || dc_words_u64 > UINT32_MAX ||
+        dc_words_u64 > SIZE_MAX / sizeof(uint32_t)) {
+        goto cleanup;
+    }
+    const uint32_t dc_base = (uint32_t) dc_base_u64;
+    const size_t dc_bytes = (size_t) dc_words_u64 * sizeof(uint32_t);
+    if ((VkDeviceSize) dc_bytes > max_range ||
+        !vk_buffer_create_uninitialized(vk, dc_bytes, &dc_buffer)) {
+        goto cleanup;
+    }
+    ((uint32_t *) status_buffer.mapped)[0] = 0u;
+    vkmesh_dispatch_command dc_commands[3];
+    memset(dc_commands, 0, sizeof(dc_commands));
+
+    dc_commands[0].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    dc_commands[0].buffers[0] = dc_buffer;
+    dc_commands[0].buffers[1] = dummy_buffer;
+    dc_commands[0].buffers[2] = dummy_buffer;
+    dc_commands[0].buffers[3] = dummy_buffer;
+    dc_commands[0].push.n = vertex_hash_capacity;
+    dc_commands[0].push.aux0 = 0u;
+    dc_commands[0].push.aux1 = 0u;
+    dc_commands[0].groups_x = (vertex_hash_capacity + 127u) / 128u;
+
+    dc_commands[1].pipeline_kind = VKMESH_PIPE_REMESH_VERTEX_HASH;
+    dc_commands[1].buffers[0] = workspace;
+    dc_commands[1].buffers[1] = dc_buffer;
+    dc_commands[1].buffers[2] = status_buffer;
+    dc_commands[1].buffers[3] = dummy_buffer;
+    dc_commands[1].push.n = grid_count;
+    dc_commands[1].push.aux0 = tail_base;
+    dc_commands[1].push.aux1 = vertex_hash_capacity;
+    dc_commands[1].push.aux2 = (uint32_t) resolution + 1u;
+    dc_commands[1].groups_x = (grid_count + 127u) / 128u;
+
+    dc_commands[2].pipeline_kind = VKMESH_PIPE_REMESH_SIMPLE_DC;
+    dc_commands[2].buffers[0] = workspace;
+    dc_commands[2].buffers[1] = dc_buffer;
+    dc_commands[2].buffers[2] = dc_buffer;
+    dc_commands[2].buffers[3] = status_buffer;
+    dc_commands[2].push.n = cell_count;
+    dc_commands[2].push.aux0 = (uint32_t) resolution + 1u;
+    dc_commands[2].push.aux1 = vertex_hash_capacity;
+    dc_commands[2].push.aux2 = counts_base;
+    dc_commands[2].groups_x = (cell_count + 127u) / 128u;
+    if (!vkmesh_dispatch_batch(vk, dc_commands, 3u)) goto cleanup;
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        fprintf(stderr,
+            "vkmesh: remesh GPU Dual Contouring lookup failed status=%u\n",
+            ((const uint32_t *) status_buffer.mapped)[0]);
+        goto cleanup;
+    }
+
+    /* The corner hash is no longer needed. Reuse the front of the DC buffer
+       for the active-cell hash, and the old count/offset ranges for topology
+       flags and the two compacting scans. */
+    ((uint32_t *) status_buffer.mapped)[0] = 0u;
+    const uint32_t referenced_base = 5u * cell_count + 1u;
+    const uint32_t quad_offsets_base = 6u * cell_count + 1u;
+    const uint32_t vertex_offsets_base = 7u * cell_count + 2u;
+    vkmesh_dispatch_command topology_commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(topology_commands, 0, sizeof(topology_commands));
+    uint32_t topology_command_count = 0u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = dc_buffer;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = hash_capacity;
+    command->groups_x = (hash_capacity + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_VERTEX_HASH;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dc_buffer;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = 0u;
+    command->push.aux1 = hash_capacity;
+    command->push.aux2 = (uint32_t) resolution;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux1 = referenced_base;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_TOPOLOGY_COUNT;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dc_buffer;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->push.aux2 = dc_base;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count + 1u,
+            counts_base,
+            quad_offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            topology_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &topology_command_count) ||
+        !vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count,
+            referenced_base,
+            vertex_offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            topology_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &topology_command_count) ||
+        !vkmesh_dispatch_batch(vk, topology_commands, topology_command_count)) {
+        if (g_vkmesh_last_error == VKMESH_ERROR_NONE) vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        goto cleanup;
+    }
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        fprintf(stderr, "vkmesh: remesh GPU topology hash saturated; using CPU path\n");
+        goto cleanup;
+    }
+
+    const uint32_t quad_count = workspace_words[quad_offsets_base + cell_count];
+    const uint32_t vertex_count = workspace_words[vertex_offsets_base + cell_count - 1u];
+    if (quad_count == 0u || vertex_count == 0u ||
+        (uint64_t) quad_count > 3u * (uint64_t) cell_count || vertex_count > cell_count) {
+        goto cleanup;
+    }
+    const uint64_t output_words_u64 =
+        3u * (uint64_t) vertex_count + 6u * (uint64_t) quad_count;
+    if (output_words_u64 > UINT32_MAX ||
+        output_words_u64 > SIZE_MAX / sizeof(uint32_t)) {
+        goto cleanup;
+    }
+    const size_t output_bytes = (size_t) output_words_u64 * sizeof(uint32_t);
+    if ((VkDeviceSize) output_bytes > max_range) goto cleanup;
+
+    /* Check the budget before releasing a query needed by the CPU fallback.
+       The 64 KiB reserve covers ordinary Vulkan allocation granularity. */
+    size_t current_after_release = vk->workspace_current_bytes;
+    if (release_query) {
+        for (uint32_t i = 0u; i < 4u; ++i) {
+            const size_t bytes = query->buffers[i].allocation_bytes;
+            current_after_release = current_after_release > bytes ?
+                current_after_release - bytes : 0u;
+        }
+    }
+    if (vk->workspace_budget_bytes > 0u) {
+        const size_t available = vk->workspace_budget_bytes > current_after_release ?
+            vk->workspace_budget_bytes - current_after_release : 0u;
+        if (output_bytes > SIZE_MAX - 64u * 1024u ||
+            output_bytes + 64u * 1024u > available) {
+            goto cleanup;
+        }
+    }
+    if (release_query) {
+        if (query->batch_count > 0u) {
+            fprintf(stderr, "vkmesh: remesh distance batches=%u\n", query->batch_count);
+        }
+        vkmesh_distance_query_destroy(query);
+    }
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &scan_sums[i]);
+    }
+    if (!vk_buffer_create_host_cached(vk, output_bytes, &output_buffer)) goto cleanup;
+
+    transform = (float *) status_buffer.mapped;
+    transform[0] = center[0];
+    transform[1] = center[1];
+    transform[2] = center[2];
+    transform[3] = scale;
+    transform[4] = 1.0f / (float) resolution;
+    ((uint32_t *) status_buffer.mapped)[5] = 0u;
+    vkmesh_dispatch_command output_commands[2];
+    memset(output_commands, 0, sizeof(output_commands));
+    output_commands[0].pipeline_kind = VKMESH_PIPE_REMESH_EMIT_VERTICES;
+    output_commands[0].buffers[0] = workspace;
+    output_commands[0].buffers[1] = dc_buffer;
+    output_commands[0].buffers[2] = output_buffer;
+    output_commands[0].buffers[3] = status_buffer;
+    output_commands[0].push.n = cell_count;
+    output_commands[0].push.aux0 = dc_base;
+    output_commands[0].groups_x = (cell_count + 127u) / 128u;
+
+    output_commands[1].pipeline_kind = VKMESH_PIPE_REMESH_EMIT_FACES;
+    output_commands[1].buffers[0] = workspace;
+    output_commands[1].buffers[1] = dc_buffer;
+    output_commands[1].buffers[2] = output_buffer;
+    output_commands[1].buffers[3] = status_buffer;
+    output_commands[1].push.n = cell_count;
+    output_commands[1].push.aux0 = (uint32_t) resolution;
+    output_commands[1].push.aux1 = hash_capacity;
+    output_commands[1].push.aux2 = dc_base;
+    output_commands[1].groups_x = (cell_count + 127u) / 128u;
+    if (!vkmesh_dispatch_batch(vk, output_commands, 2u)) goto cleanup;
+    if (((const uint32_t *) status_buffer.mapped)[5] != 0u) {
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        fprintf(stderr, "vkmesh: remesh GPU face lookup failed\n");
+        goto cleanup;
+    }
+
+    if ((size_t) vertex_count > SIZE_MAX / (3u * sizeof(float)) ||
+        (size_t) quad_count > SIZE_MAX / (6u * sizeof(int32_t))) {
+        goto cleanup;
+    }
+    gpu_mesh.vertices = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
+    gpu_mesh.faces = (int32_t *) malloc((size_t) quad_count * 6u * sizeof(int32_t));
+    if (gpu_mesh.vertices == NULL || gpu_mesh.faces == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        goto cleanup;
+    }
+    memcpy(
+        gpu_mesh.vertices,
+        output_buffer.mapped,
+        (size_t) vertex_count * 3u * sizeof(float));
+    memcpy(
+        gpu_mesh.faces,
+        (const uint32_t *) output_buffer.mapped + 3u * (size_t) vertex_count,
+        (size_t) quad_count * 6u * sizeof(int32_t));
+    gpu_mesh.n_vertices = (int64_t) vertex_count;
+    gpu_mesh.vertex_capacity = (int64_t) vertex_count;
+    gpu_mesh.n_faces = 2 * (int64_t) quad_count;
+    gpu_mesh.face_capacity = gpu_mesh.n_faces;
+
+    *grid_count_out = (int64_t) grid_count;
+    *mesh_out = gpu_mesh;
+    memset(&gpu_mesh, 0, sizeof(gpu_mesh));
+    fprintf(stderr,
+        "vkmesh: remesh GPU corners/DC/topology cells=%u corners=%u vertices=%u faces=%" PRIu64 "\n",
+        cell_count,
+        grid_count,
+        vertex_count,
+        2u * (uint64_t) quad_count);
+    ok = 1;
+
+cleanup:
+    mesh_free(&gpu_mesh);
+    vk_buffer_destroy(vk, &output_buffer);
+    vk_buffer_destroy(vk, &grid_query_buffer);
+    vk_buffer_destroy(vk, &dc_buffer);
+    vk_buffer_destroy(vk, &dummy_buffer);
+    vk_buffer_destroy(vk, &status_buffer);
+    vk_buffer_destroy(vk, &workspace);
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &scan_sums[i]);
+    }
+    return ok;
+}
+
 static int vkmesh_remesh_collect_grid_vertices(
     const vkmesh_remesh_coord * coords,
     int64_t coord_count,
@@ -8254,18 +8871,56 @@ static int vkmesh_remesh_narrow_band_dc_to(
     }
     fprintf(stderr, "vkmesh: remesh active_voxels=%" PRId64 "\n", coord_count);
     if (coord_count > INT32_MAX) goto cleanup;
-    if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
-    fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
-    if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
-    grid_values = (float *) malloc((size_t) grid_vert_count * sizeof(float));
-    if (grid_values == NULL ||
-        !vkmesh_distance_query_coord_values(
-            &distance_query, grid_verts, grid_vert_count, resolution, center, scale, 0, grid_values)) {
-        goto cleanup;
+    const int gpu_mesh_built = vkmesh_remesh_build_mesh_gpu(
+            vk,
+            &distance_query,
+            coords,
+            coord_count,
+            resolution,
+            center,
+            scale,
+            eps,
+            project_back <= 0.0f,
+            &grid_vert_count,
+            &out);
+    if (!gpu_mesh_built) {
+        if (g_vkmesh_last_error != VKMESH_ERROR_NONE ||
+            !vkmesh_remesh_collect_grid_vertices(
+                coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) {
+            goto cleanup;
+        }
+        if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
+        grid_values = (float *) malloc((size_t) grid_vert_count * sizeof(float));
+        if (grid_values == NULL ||
+            !vkmesh_distance_query_coord_values(
+                &distance_query,
+                grid_verts,
+                grid_vert_count,
+                resolution,
+                center,
+                scale,
+                0,
+                grid_values)) {
+            goto cleanup;
+        }
+        free(grid_verts);
+        grid_verts = NULL;
+        for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
+        if (!vkmesh_remesh_simple_dual_contour(
+                coords,
+                coord_count,
+                &vert_hash,
+                grid_values,
+                resolution,
+                &dual,
+                &intersected)) {
+            goto cleanup;
+        }
+        vkmesh_hash_destroy(&vert_hash);
+        free(grid_values);
+        grid_values = NULL;
     }
-    free(grid_verts);
-    grid_verts = NULL;
-    for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
+    fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
 
     if (project_back <= 0.0f) {
         if (distance_query.batch_count > 0u) {
@@ -8273,15 +8928,14 @@ static int vkmesh_remesh_narrow_band_dc_to(
         }
         vkmesh_distance_query_destroy(&distance_query);
     }
-    if (!vkmesh_remesh_simple_dual_contour(
-            coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected)) goto cleanup;
-    vkmesh_hash_destroy(&vert_hash);
-    free(grid_values);
-    grid_values = NULL;
-    /* Keep only one of the two large remesh hash tables alive at a time. */
-    if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
-    if (!vkmesh_remesh_build_mesh_from_dc(
-            coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) goto cleanup;
+    if (!gpu_mesh_built) {
+        /* Keep only one of the two large CPU remesh hash tables alive at a time. */
+        if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
+        if (!vkmesh_remesh_build_mesh_from_dc(
+                coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) {
+            goto cleanup;
+        }
+    }
     fprintf(stderr, "vkmesh: remesh after_dual_contour vertices=%" PRId64 " faces=%" PRId64 "\n", out.n_vertices, out.n_faces);
     free(coords);
     coords = NULL;

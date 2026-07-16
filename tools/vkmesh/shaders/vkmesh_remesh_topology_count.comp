@@ -1,0 +1,108 @@
+#version 450
+
+// Count valid dual-contouring quads and mark every referenced active cell.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Workspace {
+    uint workspace[];
+};
+
+layout(binding = 1) readonly buffer HashAndDc {
+    uint hash_and_dc[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+uint hash_u32(uint key) {
+    key ^= key >> 16u;
+    key *= 0x85ebca6bu;
+    key ^= key >> 13u;
+    key *= 0xc2b2ae35u;
+    key ^= key >> 16u;
+    return key;
+}
+
+uint lookup_index(uint x, uint y, uint z) {
+    uint dimension = p.aux0;
+    if (x >= dimension || y >= dimension || z >= dimension) return 0xffffffffu;
+    uint stored_key = (x * dimension * dimension + y * dimension + z) + 1u;
+    uint capacity = p.aux1;
+    uint slot = hash_u32(stored_key) & (capacity - 1u);
+    for (uint probe = 0u; probe < capacity; ++probe) {
+        uint key = hash_and_dc[slot];
+        if (key == 0u) break;
+        if (key == stored_key) return hash_and_dc[capacity + slot];
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    return 0xffffffffu;
+}
+
+uint neighbor_index(uint axis, uint corner, uvec3 cell) {
+    uvec3 offset = uvec3(0u);
+    if (axis == 0u) {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(0u, 0u, 1u),
+            uvec3(0u, 1u, 1u), uvec3(0u, 1u, 0u));
+        offset = offsets[corner];
+    } else if (axis == 1u) {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(1u, 0u, 0u),
+            uvec3(1u, 0u, 1u), uvec3(0u, 0u, 1u));
+        offset = offsets[corner];
+    } else {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(0u, 1u, 0u),
+            uvec3(1u, 1u, 0u), uvec3(1u, 0u, 0u));
+        offset = offsets[corner];
+    }
+    return corner == 0u ? gl_GlobalInvocationID.x :
+        lookup_index(cell.x + offset.x, cell.y + offset.y, cell.z + offset.z);
+}
+
+void main() {
+    uint cell_index = gl_GlobalInvocationID.x;
+    if (cell_index >= p.n) return;
+
+    uint counts_base = 3u * p.n;
+    uint masks_base = 4u * p.n + 1u;
+    uint referenced_base = 5u * p.n + 1u;
+    if (cell_index == 0u) workspace[counts_base] = 0u;
+
+    uvec3 cell = uvec3(
+        workspace[3u * cell_index + 0u],
+        workspace[3u * cell_index + 1u],
+        workspace[3u * cell_index + 2u]);
+    uint mask = 0u;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        int direction = int(hash_and_dc[p.aux2 + 6u * cell_index + 3u + axis]);
+        if (direction == 0) continue;
+        uint q[4];
+        bool valid = true;
+        for (uint corner = 0u; corner < 4u; ++corner) {
+            q[corner] = neighbor_index(axis, corner, cell);
+            valid = valid && q[corner] != 0xffffffffu;
+        }
+        if (!valid) continue;
+        mask |= 1u << axis;
+        for (uint corner = 0u; corner < 4u; ++corner) {
+            atomicOr(workspace[referenced_base + q[corner]], 1u);
+        }
+    }
+    workspace[counts_base + cell_index + 1u] = bitCount(mask);
+    workspace[masks_base + cell_index] = mask;
+}
