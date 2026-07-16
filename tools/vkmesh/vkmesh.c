@@ -7601,9 +7601,14 @@ static int vkmesh_remesh_build_active_hash(
     vkmesh_u64_u32_hash * hash_out) {
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     if (!vkmesh_hash_init(hash_out, (size_t) coord_count)) return 0;
+    /* hash_init reserves more than twice the requested entries, so this fixed
+       batch cannot reach the grow threshold. */
     for (int64_t i = 0; i < coord_count; ++i) {
         uint64_t key = vkmesh_remesh_coord_key(coords[i].x, coords[i].y, coords[i].z, resolution);
-        if (!vkmesh_hash_insert(hash_out, key, (uint32_t) i)) return 0;
+        if (key == UINT64_MAX || !vkmesh_hash_insert_no_grow(hash_out, key, (uint32_t) i)) {
+            vkmesh_hash_destroy(hash_out);
+            return 0;
+        }
     }
     return 1;
 }
@@ -7662,12 +7667,9 @@ cleanup:
 static float vkmesh_remesh_grid_value(
     const vkmesh_u64_u32_hash * vert_hash,
     const float * values,
-    int resolution,
-    int32_t x,
-    int32_t y,
-    int32_t z,
+    uint64_t key,
     int * ok) {
-    uint32_t idx = vkmesh_hash_lookup(vert_hash, vkmesh_remesh_coord_key(x, y, z, resolution + 1));
+    uint32_t idx = vkmesh_hash_lookup(vert_hash, key);
     if (idx == UINT32_MAX) {
         *ok = 0;
         return 0.0f;
@@ -7686,6 +7688,15 @@ static int vkmesh_remesh_simple_dual_contour(
     *dual_out = NULL;
     *intersected_out = NULL;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if ((uint64_t) coord_count > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        (uint64_t) coord_count > (uint64_t) SIZE_MAX / (3u * sizeof(int8_t))) {
+        return 0;
+    }
+    if (resolution <= 0) return 0;
+    const uint64_t grid_dim = (uint64_t) resolution + 1u;
+    if (grid_dim > UINT64_MAX / grid_dim) return 0;
+    const uint64_t plane_stride = grid_dim * grid_dim;
+    if (grid_dim > UINT64_MAX / plane_stride) return 0;
     float * dual = (float *) malloc((size_t) coord_count * 3u * sizeof(float));
     int8_t * intersected = (int8_t *) malloc((size_t) coord_count * 3u * sizeof(int8_t));
     if (dual == NULL || intersected == NULL) {
@@ -7694,20 +7705,37 @@ static int vkmesh_remesh_simple_dual_contour(
         return 0;
     }
 
-    int ok = 1;
-    for (int64_t i = 0; i < coord_count; ++i) {
+    int missing_corner = 0;
+    int64_t i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(coord_count >= 65536) reduction(|:missing_corner)
+#endif
+    for (i = 0; i < coord_count; ++i) {
         int32_t vx = coords[i].x;
         int32_t vy = coords[i].y;
         int32_t vz = coords[i].z;
         float corner[2][2][2];
+        int cell_ok = 1;
+        if (vx < 0 || vy < 0 || vz < 0 ||
+            vx >= resolution || vy >= resolution || vz >= resolution) {
+            missing_corner = 1;
+            continue;
+        }
+        const uint64_t base_key =
+            ((uint64_t) vx * grid_dim + (uint64_t) vy) * grid_dim + (uint64_t) vz;
         for (int dy = 0; dy <= 1; ++dy) {
             for (int dz = 0; dz <= 1; ++dz) {
                 for (int dx = 0; dx <= 1; ++dx) {
+                    const uint64_t key = base_key +
+                        (uint64_t) dx * plane_stride + (uint64_t) dy * grid_dim + (uint64_t) dz;
                     corner[dx][dy][dz] = vkmesh_remesh_grid_value(
-                        vert_hash, grid_values, resolution, vx + dx, vy + dy, vz + dz, &ok);
-                    if (!ok) goto fail;
+                        vert_hash, grid_values, key, &cell_ok);
                 }
             }
+        }
+        if (!cell_ok) {
+            missing_corner = 1;
+            continue;
         }
         float sum[3] = { 0.0f, 0.0f, 0.0f };
         int count = 0;
@@ -7776,6 +7804,7 @@ static int vkmesh_remesh_simple_dual_contour(
             dual[(size_t) i * 3u + 2u] = (float) vz + 0.5f;
         }
     }
+    if (missing_corner) goto fail;
 
     *dual_out = dual;
     *intersected_out = intersected;
@@ -7852,7 +7881,10 @@ static int vkmesh_remesh_build_mesh_from_dc(
     float scale,
     vkmesh_mesh * out) {
     memset(out, 0, sizeof(*out));
-    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if (coord_count <= 0 || coord_count > INT32_MAX ||
+        (uint64_t) coord_count > (uint64_t) SIZE_MAX / sizeof(int32_t)) {
+        return 0;
+    }
     static const int32_t neighbor_offsets[3][4][3] = {
         { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 1 }, { 0, 1, 0 } },
         { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 0, 1 }, { 0, 0, 1 } },
@@ -7923,27 +7955,38 @@ static int vkmesh_remesh_build_mesh_from_dc(
     out->face_capacity = out->n_faces;
 
     const float inv_res = 1.0f / (float) resolution;
-    for (int64_t i = 0; i < coord_count; ++i) {
-        int32_t dst = vertex_map[i];
+    int64_t cell_i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(coord_count >= 65536)
+#endif
+    for (cell_i = 0; cell_i < coord_count; ++cell_i) {
+        int32_t dst = vertex_map[cell_i];
         if (dst < 0) continue;
-        out->vertices[(size_t) dst * 3u + 0u] = (dual[(size_t) i * 3u + 0u] * inv_res - 0.5f) * scale + center[0];
-        out->vertices[(size_t) dst * 3u + 1u] = (dual[(size_t) i * 3u + 1u] * inv_res - 0.5f) * scale + center[1];
-        out->vertices[(size_t) dst * 3u + 2u] = (dual[(size_t) i * 3u + 2u] * inv_res - 0.5f) * scale + center[2];
+        out->vertices[(size_t) dst * 3u + 0u] =
+            (dual[(size_t) cell_i * 3u + 0u] * inv_res - 0.5f) * scale + center[0];
+        out->vertices[(size_t) dst * 3u + 1u] =
+            (dual[(size_t) cell_i * 3u + 1u] * inv_res - 0.5f) * scale + center[1];
+        out->vertices[(size_t) dst * 3u + 2u] =
+            (dual[(size_t) cell_i * 3u + 2u] * inv_res - 0.5f) * scale + center[2];
     }
 
-    int64_t face_dst = 0;
-    for (int64_t i = 0; i < quad_count; ++i) {
+    int64_t quad_i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(quad_count >= 65536)
+#endif
+    for (quad_i = 0; quad_i < quad_count; ++quad_i) {
         int32_t q[4];
-        for (int k = 0; k < 4; ++k) q[k] = vertex_map[quads[(size_t) i * 4u + (size_t) k]];
-        const int * split1 = dirs[i] == 1 ? split_1_p : split_1_n;
-        const int * split2 = dirs[i] == 1 ? split_2_p : split_2_n;
+        for (int k = 0; k < 4; ++k) {
+            q[k] = vertex_map[quads[(size_t) quad_i * 4u + (size_t) k]];
+        }
+        const int * split1 = dirs[quad_i] == 1 ? split_1_p : split_1_n;
+        const int * split2 = dirs[quad_i] == 1 ? split_2_p : split_2_n;
         float align0 = vkmesh_remesh_split_align(out->vertices, q, split1);
         float align1 = vkmesh_remesh_split_align(out->vertices, q, split2);
         const int * split = align0 > align1 ? split1 : split2;
         for (int k = 0; k < 6; ++k) {
-            out->faces[(size_t) face_dst * 3u + (size_t) k] = q[split[k]];
+            out->faces[(size_t) quad_i * 6u + (size_t) k] = q[split[k]];
         }
-        face_dst += 2;
     }
     ok = 1;
 
@@ -8136,6 +8179,7 @@ static int vkmesh_remesh_narrow_band_dc_to(
         goto cleanup;
     }
     fprintf(stderr, "vkmesh: remesh active_voxels=%" PRId64 "\n", coord_count);
+    if (coord_count > INT32_MAX) goto cleanup;
     if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
     fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
     if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
