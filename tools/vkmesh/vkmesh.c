@@ -210,6 +210,7 @@ typedef enum vkmesh_pipeline_kind {
 } vkmesh_pipeline_kind;
 
 #define VKMESH_DISPATCH_BATCH_MAX 32u
+#define VKMESH_PROFILE_QUERY_MAX (2u * VKMESH_DISPATCH_BATCH_MAX)
 
 typedef struct vkmesh_vk {
     VkInstance instance;
@@ -225,6 +226,12 @@ typedef struct vkmesh_vk {
     VkDescriptorSet descriptor_sets[VKMESH_DISPATCH_BATCH_MAX];
     VkCommandBuffer command_buffer;
     VkFence completion_fence;
+    VkQueryPool profile_query_pool;
+    double profile_timestamp_period_ns;
+    double profile_pipeline_ms[VKMESH_PIPE_COUNT];
+    uint64_t profile_dispatch_count[VKMESH_PIPE_COUNT];
+    uint32_t profile_timestamp_valid_bits;
+    int profile_enabled;
     size_t workspace_budget_bytes;
     size_t workspace_current_bytes;
     size_t workspace_peak_bytes;
@@ -892,6 +899,24 @@ static void vkmesh_vk_destroy(vkmesh_vk * vk) {
             (double) vk->workspace_budget_bytes / (1024.0 * 1024.0),
             (double) vk->workspace_current_bytes / (1024.0 * 1024.0));
     }
+    if (vk->profile_enabled) {
+        double total_ms = 0.0;
+        for (uint32_t i = 0u; i < VKMESH_PIPE_COUNT; ++i) {
+            total_ms += vk->profile_pipeline_ms[i];
+        }
+        fprintf(stderr, "vkmesh: GPU profile total %.3f ms\n", total_ms);
+        for (uint32_t i = 0u; i < VKMESH_PIPE_COUNT; ++i) {
+            if (vk->profile_dispatch_count[i] == 0u) continue;
+            fprintf(stderr,
+                "vkmesh: GPU profile %-32s %9.3f ms (%" PRIu64 " dispatches)\n",
+                vkmesh_shaders[i].name,
+                vk->profile_pipeline_ms[i],
+                vk->profile_dispatch_count[i]);
+        }
+    }
+    if (vk->profile_query_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(vk->device, vk->profile_query_pool, NULL);
+    }
     if (vk->completion_fence != VK_NULL_HANDLE) vkDestroyFence(vk->device, vk->completion_fence, NULL);
     if (vk->descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk->device, vk->descriptor_pool, NULL);
     for (uint32_t i = 0; i < VKMESH_PIPE_COUNT; ++i) {
@@ -1028,6 +1053,7 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
         if ((families[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
             vk->physical_device = selected;
             vk->queue_family = q;
+            vk->profile_timestamp_valid_bits = families[q].timestampValidBits;
             found = 1;
             break;
         }
@@ -1042,6 +1068,16 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
 
     VkPhysicalDeviceProperties device_props;
     vkGetPhysicalDeviceProperties(vk->physical_device, &device_props);
+    const char * profile_env = getenv("TRELLIS_VKMESH_PROFILE");
+    const int profile_requested =
+        profile_env != NULL && profile_env[0] != '\0' && strcmp(profile_env, "0") != 0;
+    if (profile_requested && device_props.limits.timestampComputeAndGraphics &&
+        vk->profile_timestamp_valid_bits > 0u) {
+        vk->profile_enabled = 1;
+        vk->profile_timestamp_period_ns = (double) device_props.limits.timestampPeriod;
+    } else if (profile_requested) {
+        fprintf(stderr, "vkmesh: GPU profiling unavailable on the selected compute queue\n");
+    }
     vk->workspace_budget_bytes = vkmesh_resolve_workspace_budget(vk->physical_device);
     fprintf(stderr,
         "vkmesh: using Vulkan device %d: %s (GPU workspace budget %.1f MiB)\n",
@@ -1071,6 +1107,20 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
         return 0;
     }
     vkGetDeviceQueue(vk->device, vk->queue_family, 0, &vk->queue);
+
+    if (vk->profile_enabled) {
+        VkQueryPoolCreateInfo query_info;
+        memset(&query_info, 0, sizeof(query_info));
+        query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_info.queryCount = VKMESH_PROFILE_QUERY_MAX;
+        result = vkCreateQueryPool(vk->device, &query_info, NULL, &vk->profile_query_pool);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "vkmesh: GPU profiling disabled because timestamp query creation failed\n");
+            vk->profile_enabled = 0;
+            vk->profile_query_pool = VK_NULL_HANDLE;
+        }
+    }
 
     VkCommandPoolCreateInfo pool_info;
     memset(&pool_info, 0, sizeof(pool_info));
@@ -1174,6 +1224,58 @@ static int vkmesh_submit_and_wait(vkmesh_vk * vk, const VkSubmitInfo * submit) {
     return 1;
 }
 
+static void vkmesh_profile_reset(vkmesh_vk * vk, VkCommandBuffer command_buffer) {
+    if (!vk->profile_enabled) return;
+    vkCmdResetQueryPool(command_buffer, vk->profile_query_pool, 0u, VKMESH_PROFILE_QUERY_MAX);
+}
+
+static void vkmesh_profile_timestamp(
+    vkmesh_vk * vk,
+    VkCommandBuffer command_buffer,
+    uint32_t query,
+    VkPipelineStageFlagBits stage) {
+    if (!vk->profile_enabled) return;
+    vkCmdWriteTimestamp(command_buffer, stage, vk->profile_query_pool, query);
+}
+
+static void vkmesh_profile_collect(
+    vkmesh_vk * vk,
+    const vkmesh_pipeline_kind * pipelines,
+    uint32_t dispatch_count) {
+    if (!vk->profile_enabled || dispatch_count == 0u ||
+        dispatch_count > VKMESH_DISPATCH_BATCH_MAX) {
+        return;
+    }
+
+    uint64_t timestamps[VKMESH_PROFILE_QUERY_MAX];
+    const uint32_t query_count = 2u * dispatch_count;
+    VkResult result = vkGetQueryPoolResults(
+        vk->device,
+        vk->profile_query_pool,
+        0u,
+        query_count,
+        (size_t) query_count * sizeof(timestamps[0]),
+        timestamps,
+        sizeof(timestamps[0]),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkmesh: GPU profiling disabled because timestamp readback failed\n");
+        vk->profile_enabled = 0;
+        return;
+    }
+
+    const uint64_t timestamp_mask = vk->profile_timestamp_valid_bits < 64u ?
+        (UINT64_C(1) << vk->profile_timestamp_valid_bits) - UINT64_C(1) : UINT64_MAX;
+    for (uint32_t i = 0u; i < dispatch_count; ++i) {
+        const uint64_t elapsed_ticks =
+            (timestamps[2u * i + 1u] - timestamps[2u * i]) & timestamp_mask;
+        const vkmesh_pipeline_kind pipeline = pipelines[i];
+        vk->profile_pipeline_ms[pipeline] +=
+            (double) elapsed_ticks * vk->profile_timestamp_period_ns * 1.0e-6;
+        ++vk->profile_dispatch_count[pipeline];
+    }
+}
+
 static void vkmesh_update_descriptor_set_handle(
     vkmesh_vk * vk,
     VkDescriptorSet descriptor_set,
@@ -1215,10 +1317,13 @@ static int vkmesh_dispatch(
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     result = vkBeginCommandBuffer(vk->command_buffer, &begin);
     if (!vkmesh_check_vk_result("vkBeginCommandBuffer", result)) return 0;
+    vkmesh_profile_reset(vk, vk->command_buffer);
+    vkmesh_profile_timestamp(vk, vk->command_buffer, 0u, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
     vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
     vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_sets[0], 0, NULL);
     vkCmdPushConstants(vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push), push);
     vkCmdDispatch(vk->command_buffer, groups_x, 1, 1);
+    vkmesh_profile_timestamp(vk, vk->command_buffer, 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1237,7 +1342,9 @@ static int vkmesh_dispatch(
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
-    return vkmesh_submit_and_wait(vk, &submit);
+    const int ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, &pipeline_kind, 1u);
+    return ok;
 }
 
 static int vkmesh_dispatch_batch(
@@ -1263,13 +1370,18 @@ static int vkmesh_dispatch_batch(
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     result = vkBeginCommandBuffer(vk->command_buffer, &begin);
     if (!vkmesh_check_vk_result("vkBeginCommandBuffer(batch)", result)) return 0;
+    vkmesh_profile_reset(vk, vk->command_buffer);
 
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkmesh_pipeline_kind profile_pipelines[VKMESH_DISPATCH_BATCH_MAX];
     for (uint32_t i = 0u; i < command_count; ++i) {
         const vkmesh_dispatch_command * command = &commands[i];
+        profile_pipelines[i] = command->pipeline_kind;
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * i, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         vkCmdBindPipeline(
             vk->command_buffer,
             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1291,6 +1403,8 @@ static int vkmesh_dispatch_batch(
             sizeof(command->push),
             &command->push);
         vkCmdDispatch(vk->command_buffer, command->groups_x, 1, 1);
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * i + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
         const int is_last = i + 1u == command_count;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1318,6 +1432,7 @@ static int vkmesh_dispatch_batch(
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
     ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, profile_pipelines, command_count);
     return ok;
 }
 
@@ -1401,6 +1516,7 @@ static int vkmesh_sort_records_vulkan(
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     result = vkBeginCommandBuffer(vk->command_buffer, &begin);
     if (!vkmesh_check_vk_result("vkBeginCommandBuffer(sort)", result)) goto cleanup;
+    vkmesh_profile_reset(vk, vk->command_buffer);
 
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
@@ -1414,7 +1530,15 @@ static int vkmesh_sort_records_vulkan(
     vkCmdPushConstants(
         vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
         0, sizeof(push), &push);
+    vkmesh_pipeline_kind profile_pipelines[VKMESH_DISPATCH_BATCH_MAX];
+    uint32_t profile_dispatch_count = 0u;
+    profile_pipelines[profile_dispatch_count] = pipeline_kind;
+    vkmesh_profile_timestamp(
+        vk, vk->command_buffer, 2u * profile_dispatch_count, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
     vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+    vkmesh_profile_timestamp(
+        vk, vk->command_buffer, 2u * profile_dispatch_count + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    ++profile_dispatch_count;
 
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
@@ -1441,7 +1565,17 @@ static int vkmesh_sort_records_vulkan(
         vkCmdPushConstants(
             vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
             0, sizeof(push), &push);
+        if (profile_dispatch_count >= VKMESH_DISPATCH_BATCH_MAX) {
+            (void) vkEndCommandBuffer(vk->command_buffer);
+            goto cleanup;
+        }
+        profile_pipelines[profile_dispatch_count] = merge_pipeline;
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * profile_dispatch_count, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * profile_dispatch_count + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        ++profile_dispatch_count;
         source_is_temporary ^= 1u;
         ++pass_index;
         if (pass_index < merge_passes) {
@@ -1473,6 +1607,7 @@ static int vkmesh_sort_records_vulkan(
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
     ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, profile_pipelines, profile_dispatch_count);
     if (ok && reusable_temporary_out != NULL && temporary.buffer != VK_NULL_HANDLE) {
         *reusable_temporary_out = temporary;
         memset(&temporary, 0, sizeof(temporary));
