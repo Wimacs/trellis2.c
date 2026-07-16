@@ -7913,10 +7913,11 @@ static int vkmesh_remesh_append_quad(
     return 1;
 }
 
+/* Consumes and clears active_hash on every return path. */
 static int vkmesh_remesh_build_mesh_from_dc(
     const vkmesh_remesh_coord * coords,
     int64_t coord_count,
-    const vkmesh_u64_u32_hash * active_hash,
+    vkmesh_u64_u32_hash * active_hash,
     const float * dual,
     const int8_t * intersected,
     int resolution,
@@ -7926,6 +7927,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     memset(out, 0, sizeof(*out));
     if (coord_count <= 0 || coord_count > INT32_MAX ||
         (uint64_t) coord_count > (uint64_t) SIZE_MAX / sizeof(int32_t)) {
+        vkmesh_hash_destroy(active_hash);
         return 0;
     }
     static const int32_t neighbor_offsets[3][4][3] = {
@@ -7947,6 +7949,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     if (referenced == NULL || vertex_map == NULL) {
         free(referenced);
         free(vertex_map);
+        vkmesh_hash_destroy(active_hash);
         return 0;
     }
 
@@ -7974,6 +7977,8 @@ static int vkmesh_remesh_build_mesh_from_dc(
             for (int k = 0; k < 4; ++k) referenced[q[k]] = 1u;
         }
     }
+    /* Neighbor lookup is the hash's last use; release it before output allocation. */
+    vkmesh_hash_destroy(active_hash);
 
     int64_t vertex_count = 0;
     for (int64_t i = 0; i < coord_count; ++i) {
@@ -8034,6 +8039,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     ok = 1;
 
 cleanup:
+    vkmesh_hash_destroy(active_hash);
     free(quads);
     free(dirs);
     free(referenced);
@@ -8211,6 +8217,10 @@ static int vkmesh_remesh_narrow_band_dc_to(
             UINT32_MAX / 5u)) {
         goto cleanup;
     }
+    free(nodes);
+    nodes = NULL;
+    free(tri_indices);
+    tri_indices = NULL;
     if (!vkmesh_remesh_refine_sparse_grid(
             &distance_query,
             resolution,
@@ -8232,6 +8242,8 @@ static int vkmesh_remesh_narrow_band_dc_to(
             &distance_query, grid_verts, grid_vert_count, resolution, center, scale, 0, grid_values)) {
         goto cleanup;
     }
+    free(grid_verts);
+    grid_verts = NULL;
     for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
 
     if (project_back <= 0.0f) {
@@ -8239,16 +8251,10 @@ static int vkmesh_remesh_narrow_band_dc_to(
             fprintf(stderr, "vkmesh: remesh distance batches=%u\n", distance_query.batch_count);
         }
         vkmesh_distance_query_destroy(&distance_query);
-        free(nodes);
-        nodes = NULL;
-        free(tri_indices);
-        tri_indices = NULL;
     }
     if (!vkmesh_remesh_simple_dual_contour(
             coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected)) goto cleanup;
     vkmesh_hash_destroy(&vert_hash);
-    free(grid_verts);
-    grid_verts = NULL;
     free(grid_values);
     grid_values = NULL;
     /* Keep only one of the two large remesh hash tables alive at a time. */
