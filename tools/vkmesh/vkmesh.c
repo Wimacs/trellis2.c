@@ -2044,7 +2044,7 @@ static int expand_simplify_edge_keys_device(
     /* The radix histogram is optional. Reserve a conservative upper bound for
        the packed scratch, output vertices, and compaction scan buffers. */
     const uint64_t packed_scratch_words =
-        (uint64_t) mesh->n_vertices * 12ull + (uint64_t) mesh->n_faces * 9ull + 2ull;
+        (uint64_t) mesh->n_vertices * 12ull + (uint64_t) mesh->n_faces * 9ull + 3ull;
     if (packed_scratch_words > SIZE_MAX / sizeof(uint32_t)) return 0;
     const size_t packed_scratch_bytes =
         (size_t) packed_scratch_words * sizeof(uint32_t);
@@ -5500,11 +5500,16 @@ static int vkmesh_simplify_step_vulkan(
     const uint64_t best_edge_base = best_cost_base + (uint64_t) face_count;
     const uint64_t face_keep_base = best_edge_base + (uint64_t) face_count;
     const uint64_t counter_base = face_keep_base + (uint64_t) face_count;
-    const uint64_t scratch_count = counter_base + 1ull;
+    const uint64_t threshold_base = counter_base + 1ull;
+    const uint64_t scratch_count = threshold_base + 1ull;
     (void) qem_base;
     if (scratch_count > UINT32_MAX) goto cleanup;
     if (!vk_buffer_create_uninitialized(
             vk, (size_t) scratch_count * sizeof(uint32_t), &scratch)) goto cleanup;
+    memcpy(
+        (uint32_t *) scratch.mapped + (size_t) threshold_base,
+        &threshold,
+        sizeof(threshold));
 
     vkmesh_vk_buffer copy_buffers[4];
     copy_buffers[0] = *scan_in;
@@ -5872,7 +5877,8 @@ static int vkmesh_device_simplify_step(
     const uint64_t best_edge_base = best_cost_base + (uint64_t) face_count;
     const uint64_t face_keep_base = best_edge_base + (uint64_t) face_count;
     const uint64_t counter_base = face_keep_base + (uint64_t) face_count;
-    const uint64_t scratch_count = counter_base + 1ull;
+    const uint64_t threshold_base = counter_base + 1ull;
+    const uint64_t scratch_count = threshold_base + 1ull;
     (void) qem_base;
     if (scratch_count > UINT32_MAX) goto cleanup;
     if (!vk_buffer_ensure_capacity(
@@ -5881,6 +5887,10 @@ static int vkmesh_device_simplify_step(
             vk,
             vertices_bytes,
             &next_vertices)) goto cleanup;
+    memcpy(
+        (uint32_t *) edge_scratch_buffer->mapped + (size_t) threshold_base,
+        &threshold,
+        sizeof(threshold));
 
     vkmesh_dispatch_command simplify_commands[VKMESH_DISPATCH_BATCH_MAX];
     memset(simplify_commands, 0, sizeof(simplify_commands));
