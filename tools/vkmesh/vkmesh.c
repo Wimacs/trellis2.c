@@ -7285,8 +7285,6 @@ static void vkmesh_hash_destroy(vkmesh_u64_u32_hash * map) {
     memset(map, 0, sizeof(*map));
 }
 
-static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key);
-
 static int vkmesh_hash_insert_no_grow(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
     size_t mask = map->capacity - 1u;
     size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
@@ -7335,15 +7333,37 @@ static int vkmesh_hash_grow(vkmesh_u64_u32_hash * map) {
     return 1;
 }
 
-static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
-    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
-    /* insert_no_grow also updates existing keys; preflight only when a new key may require growth. */
-    if (map->count + 1u > map->capacity - map->capacity / 4u &&
-        vkmesh_hash_lookup(map, key) == UINT32_MAX &&
-        !vkmesh_hash_grow(map)) {
+static inline int vkmesh_hash_insert_if_absent(
+    vkmesh_u64_u32_hash * map,
+    uint64_t key,
+    uint32_t value,
+    int * inserted_out) {
+    if (map == NULL || map->keys == NULL || map->capacity == 0 ||
+        key == UINT64_MAX || inserted_out == NULL) {
         return 0;
     }
-    return vkmesh_hash_insert_no_grow(map, key, value);
+    for (;;) {
+        const size_t mask = map->capacity - 1u;
+        size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
+        for (size_t i = 0; i < map->capacity; ++i) {
+            const uint64_t previous = map->keys[slot];
+            if (previous == key) {
+                *inserted_out = 0;
+                return 1;
+            }
+            if (previous == UINT64_MAX) {
+                if (value == UINT32_MAX) return 0;
+                if (map->count + 1u > map->capacity - map->capacity / 4u) break;
+                map->keys[slot] = key;
+                map->vals[slot] = value;
+                map->count += 1u;
+                *inserted_out = 1;
+                return 1;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (!vkmesh_hash_grow(map)) return 0;
+    }
 }
 
 static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key) {
@@ -7624,6 +7644,11 @@ static int vkmesh_remesh_collect_grid_vertices(
     *grid_count_out = 0;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     if ((uint64_t) coord_count > (uint64_t) SIZE_MAX) return 0;
+    if (resolution <= 0) return 0;
+    const uint64_t grid_dim = (uint64_t) resolution + 1u;
+    if (grid_dim > UINT64_MAX / grid_dim) return 0;
+    const uint64_t plane_stride = grid_dim * grid_dim;
+    if (grid_dim > UINT64_MAX / plane_stride) return 0;
     /* Start near the observed unique-corner count and grow only for unusually sparse cells. */
     if (!vkmesh_hash_init(vert_hash_out, (size_t) coord_count)) return 0;
 
@@ -7633,17 +7658,35 @@ static int vkmesh_remesh_collect_grid_vertices(
     int ok = 0;
     if (!vkmesh_remesh_coords_reserve(&grid, &grid_capacity, coord_count)) goto cleanup;
     for (int64_t i = 0; i < coord_count; ++i) {
-        for (int dx = 0; dx <= 1; ++dx) {
+        const int32_t vx = coords[i].x;
+        const int32_t vy = coords[i].y;
+        const int32_t vz = coords[i].z;
+        if (vx < 0 || vy < 0 || vz < 0 ||
+            vx >= resolution || vy >= resolution || vz >= resolution) {
+            goto cleanup;
+        }
+        const uint64_t base_key =
+            ((uint64_t) vx * grid_dim + (uint64_t) vy) * grid_dim + (uint64_t) vz;
+        int first_dx = 0;
+        if (i > 0 && vx > 0 &&
+            coords[i - 1].x == vx - 1 && coords[i - 1].y == vy && coords[i - 1].z == vz) {
+            /* These four corners are the previous +x cell face and were just visited. */
+            first_dx = 1;
+        }
+        for (int dx = first_dx; dx <= 1; ++dx) {
             for (int dy = 0; dy <= 1; ++dy) {
                 for (int dz = 0; dz <= 1; ++dz) {
-                    int32_t x = coords[i].x + dx;
-                    int32_t y = coords[i].y + dy;
-                    int32_t z = coords[i].z + dz;
-                    uint64_t key = vkmesh_remesh_coord_key(x, y, z, resolution + 1);
-                    if (vkmesh_hash_lookup(vert_hash_out, key) != UINT32_MAX) continue;
-                    if (grid_count >= UINT32_MAX) goto cleanup;
-                    if (!vkmesh_remesh_coords_append(&grid, &grid_count, &grid_capacity, x, y, z) ||
-                        !vkmesh_hash_insert(vert_hash_out, key, (uint32_t) (grid_count - 1))) {
+                    const uint64_t key = base_key +
+                        (uint64_t) dx * plane_stride + (uint64_t) dy * grid_dim + (uint64_t) dz;
+                    int inserted = 0;
+                    if (!vkmesh_hash_insert_if_absent(
+                            vert_hash_out, key, (uint32_t) grid_count, &inserted)) {
+                        goto cleanup;
+                    }
+                    if (!inserted) continue;
+                    /* A failed append discards both containers, so no per-key rollback is needed. */
+                    if (!vkmesh_remesh_coords_append(
+                            &grid, &grid_count, &grid_capacity, vx + dx, vy + dy, vz + dz)) {
                         goto cleanup;
                     }
                 }
