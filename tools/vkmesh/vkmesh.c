@@ -803,7 +803,8 @@ static int vk_buffer_create_internal(
     vkmesh_vk * vk,
     size_t bytes,
     vkmesh_vk_buffer * out,
-    int initialize_payload) {
+    int initialize_payload,
+    VkMemoryPropertyFlags preferred_memory_flags) {
     if (vk == NULL || out == NULL || bytes == 0) return 0;
     memset(out, 0, sizeof(*out));
     out->bytes = bytes;
@@ -836,7 +837,7 @@ static int vk_buffer_create_internal(
         vk->physical_device,
         req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        preferred_memory_flags);
     if (memory_type == UINT32_MAX) {
         vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         fprintf(stderr, "vkmesh: selected device has no host-visible coherent storage-buffer memory type\n");
@@ -882,11 +883,15 @@ static int vk_buffer_create_internal(
 }
 
 static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
-    return vk_buffer_create_internal(vk, bytes, out, 1);
+    return vk_buffer_create_internal(vk, bytes, out, 1, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 
 static int vk_buffer_create_uninitialized(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
-    return vk_buffer_create_internal(vk, bytes, out, 0);
+    return vk_buffer_create_internal(vk, bytes, out, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+static int vk_buffer_create_host_cached(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+    return vk_buffer_create_internal(vk, bytes, out, 0, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 }
 
 static int vk_buffer_ensure_capacity(
@@ -6929,9 +6934,9 @@ static int vkmesh_distance_query_init(
         return 0;
     }
 
-    if (!vk_buffer_create(vk, faces_bytes, &query->buffers[0]) ||
-        !vk_buffer_create(vk, vertices_bytes, &query->buffers[1]) ||
-        !vk_buffer_create(vk, aux_bytes, &query->buffers[3])) {
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &query->buffers[0]) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &query->buffers[1]) ||
+        !vk_buffer_create_uninitialized(vk, aux_bytes, &query->buffers[3])) {
         goto fail;
     }
     memcpy(query->buffers[0].mapped, mesh->faces, faces_bytes);
@@ -6972,7 +6977,8 @@ static int vkmesh_distance_query_init(
     }
 
     while (capacity > 0) {
-        if (vk_buffer_create(vk, capacity * 5u * sizeof(uint32_t), &query->buffers[2])) break;
+        /* The CPU rewrites and scans this batch around every dispatch. */
+        if (vk_buffer_create_host_cached(vk, capacity * 5u * sizeof(uint32_t), &query->buffers[2])) break;
         if (capacity <= 128u) goto fail;
         capacity = (capacity / 2u) & ~(size_t) 127u;
     }
@@ -7258,10 +7264,12 @@ static int vkmesh_hash_grow(vkmesh_u64_u32_hash * map) {
 
 static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
     if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
-    if (vkmesh_hash_lookup(map, key) != UINT32_MAX) {
-        return vkmesh_hash_insert_no_grow(map, key, value);
+    /* insert_no_grow also updates existing keys; preflight only when a new key may require growth. */
+    if (map->count + 1u > map->capacity - map->capacity / 4u &&
+        vkmesh_hash_lookup(map, key) == UINT32_MAX &&
+        !vkmesh_hash_grow(map)) {
+        return 0;
     }
-    if (map->count + 1u > map->capacity - map->capacity / 4u && !vkmesh_hash_grow(map)) return 0;
     return vkmesh_hash_insert_no_grow(map, key, value);
 }
 
@@ -7545,6 +7553,7 @@ static int vkmesh_remesh_collect_grid_vertices(
     int64_t grid_count = 0;
     int64_t grid_capacity = 0;
     int ok = 0;
+    if (!vkmesh_remesh_coords_reserve(&grid, &grid_capacity, coord_count)) goto cleanup;
     for (int64_t i = 0; i < coord_count; ++i) {
         for (int dx = 0; dx <= 1; ++dx) {
             for (int dy = 0; dy <= 1; ++dy) {
@@ -7605,7 +7614,7 @@ static int vkmesh_remesh_simple_dual_contour(
     *intersected_out = NULL;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     float * dual = (float *) malloc((size_t) coord_count * 3u * sizeof(float));
-    int8_t * intersected = (int8_t *) calloc((size_t) coord_count * 3u, sizeof(int8_t));
+    int8_t * intersected = (int8_t *) malloc((size_t) coord_count * 3u * sizeof(int8_t));
     if (dual == NULL || intersected == NULL) {
         free(dual);
         free(intersected);
@@ -7617,14 +7626,23 @@ static int vkmesh_remesh_simple_dual_contour(
         int32_t vx = coords[i].x;
         int32_t vy = coords[i].y;
         int32_t vz = coords[i].z;
+        float corner[2][2][2];
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dz = 0; dz <= 1; ++dz) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    corner[dx][dy][dz] = vkmesh_remesh_grid_value(
+                        vert_hash, grid_values, resolution, vx + dx, vy + dy, vz + dz, &ok);
+                    if (!ok) goto fail;
+                }
+            }
+        }
         float sum[3] = { 0.0f, 0.0f, 0.0f };
         int count = 0;
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx, vy + u, vz + v, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + 1, vy + u, vz + v, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[0][u][v];
+                float val2 = corner[1][u][v];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) vx + t;
@@ -7641,9 +7659,8 @@ static int vkmesh_remesh_simple_dual_contour(
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy, vz + v, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + 1, vz + v, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[u][0][v];
+                float val2 = corner[u][1][v];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) (vx + u);
@@ -7660,9 +7677,8 @@ static int vkmesh_remesh_simple_dual_contour(
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz + 1, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[u][v][0];
+                float val2 = corner[u][v][1];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) (vx + u);
@@ -7791,9 +7807,10 @@ static int vkmesh_remesh_build_mesh_from_dc(
         for (int axis = 0; axis < 3; ++axis) {
             int32_t dir = (int32_t) intersected[(size_t) i * 3u + (size_t) axis];
             if (dir == 0) continue;
-            int32_t q[4];
+            /* The zero offset is this unique active cell, already indexed by i. */
+            int32_t q[4] = { (int32_t) i, 0, 0, 0 };
             int valid = 1;
-            for (int k = 0; k < 4; ++k) {
+            for (int k = 1; k < 4; ++k) {
                 int32_t x = coords[i].x + neighbor_offsets[axis][k][0];
                 int32_t y = coords[i].y + neighbor_offsets[axis][k][1];
                 int32_t z = coords[i].z + neighbor_offsets[axis][k][2];
@@ -8046,7 +8063,6 @@ static int vkmesh_remesh_narrow_band_dc_to(
         goto cleanup;
     }
     fprintf(stderr, "vkmesh: remesh active_voxels=%" PRId64 "\n", coord_count);
-    if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
     if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
     fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
     if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
@@ -8075,6 +8091,8 @@ static int vkmesh_remesh_narrow_band_dc_to(
     grid_verts = NULL;
     free(grid_values);
     grid_values = NULL;
+    /* Keep only one of the two large remesh hash tables alive at a time. */
+    if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
     if (!vkmesh_remesh_build_mesh_from_dc(
             coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) goto cleanup;
     fprintf(stderr, "vkmesh: remesh after_dual_contour vertices=%" PRId64 " faces=%" PRId64 "\n", out.n_vertices, out.n_faces);
