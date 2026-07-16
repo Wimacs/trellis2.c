@@ -2425,7 +2425,7 @@ static int compact_device_mesh_from_flags_reuse(
 
     uint32_t keep_count = ((const uint32_t *) counter->mapped)[0];
     if (keep_count == 0u || keep_count > dm->n_faces || keep_count > UINT32_MAX / 3u) goto cleanup;
-    if (removed_faces != NULL) *removed_faces = dm->n_faces - keep_count;
+    const uint32_t removed_count = dm->n_faces - keep_count;
 
     ((uint32_t *) counter->mapped)[0] = 0u;
     vkmesh_vk_buffer assign_buffers[4];
@@ -2439,6 +2439,11 @@ static int compact_device_mesh_from_flags_reuse(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_ASSIGN_VERTEX_MAP, assign_buffers, &push, groups)) goto cleanup;
     uint32_t vertex_count = ((const uint32_t *) counter->mapped)[0];
     if (vertex_count == 0u || vertex_count > dm->n_vertices) goto cleanup;
+    if (removed_count == 0u && vertex_count == dm->n_vertices) {
+        /* Nothing changed. Keep the original buffers and their stable order. */
+        ok = 1;
+        goto cleanup;
+    }
     const size_t vertices_bytes = (size_t) vertex_count * 3u * sizeof(float);
     if (!vk_buffer_ensure_capacity(vk, vertices_bytes, out_vertices)) goto cleanup;
 
@@ -2491,6 +2496,7 @@ static int compact_device_mesh_from_flags_reuse(
     }
     dm->n_faces = keep_count;
     dm->n_vertices = vertex_count;
+    if (removed_faces != NULL) *removed_faces = removed_count;
     ok = 1;
 
 cleanup:

@@ -1018,6 +1018,43 @@ typedef struct api_thread_args {
     int valid;
 } api_thread_args;
 
+static int test_api_cleanup_removes_unused_vertices(void) {
+    static float vertices[15] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        9.0f, 9.0f, 9.0f,
+    };
+    static int32_t faces[12] = {
+        0, 2, 1,
+        0, 1, 3,
+        1, 2, 3,
+        2, 0, 3,
+    };
+    trellis_mesh_host input;
+    trellis_mesh_host output;
+    trellis_vkmesh_postprocess_options options;
+    memset(&input, 0, sizeof(input));
+    memset(&output, 0, sizeof(output));
+    memset(&options, 0, sizeof(options));
+    input.vertices = vertices;
+    input.faces = faces;
+    input.n_vertices = 5;
+    input.n_faces = 4;
+    options.no_simplify = 1;
+    options.device = 0;
+
+    trellis_status status = trellis_vkmesh_postprocess(
+        &input, &output, NULL, &options);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    CHECK_TRUE(output.n_vertices == 4 && output.n_faces == 4);
+    CHECK_TRUE(mesh_is_closed_and_clean(
+        output.vertices, output.faces, output.n_vertices, output.n_faces));
+    trellis_mesh_free(&output);
+    return 1;
+}
+
 static void run_api_thread(api_thread_args * args) {
     trellis_vkmesh_postprocess_options options;
     memset(&options, 0, sizeof(options));
@@ -1289,6 +1326,7 @@ int main(int argc, char ** argv) {
     (void) test_cli_rejects_nan(argv[1]);
     (void) test_udf_workspace_chunking(argv[1]);
     (void) test_remesh_workspace_chunking(argv[1]);
+    (void) test_api_cleanup_removes_unused_vertices();
     (void) test_api_concurrent();
     (void) test_api_validation();
     (void) test_api_remesh_no_simplify_finalizes_components();
