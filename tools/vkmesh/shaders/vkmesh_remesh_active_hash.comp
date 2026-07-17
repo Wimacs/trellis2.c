@@ -1,0 +1,63 @@
+#version 450
+
+// Build a compact active-cell hash in the reusable tail of the packed remesh
+// workspace. Zero is the empty-key sentinel.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Coordinates {
+    int coordinates[];
+};
+
+layout(binding = 1) buffer HashData {
+    uint hash_data[];
+};
+
+layout(binding = 2) buffer Status {
+    uint status[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+uint hash_u32(uint key) {
+    key ^= key >> 16u;
+    key *= 0x85ebca6bu;
+    key ^= key >> 13u;
+    key *= 0xc2b2ae35u;
+    key ^= key >> 16u;
+    return key;
+}
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= p.n) return;
+
+    uint resolution = p.aux0;
+    uint capacity = p.aux1;
+    uint hash_base = 6u * p.n + 2u;
+    uint x = uint(coordinates[3u * cell + 0u]);
+    uint y = uint(coordinates[3u * cell + 1u]);
+    uint z = uint(coordinates[3u * cell + 2u]);
+    uint stored_key = (x * resolution * resolution + y * resolution + z) + 1u;
+    uint slot = hash_u32(stored_key) & (capacity - 1u);
+
+    for (uint probe = 0u; probe < capacity; ++probe) {
+        uint previous = atomicCompSwap(hash_data[hash_base + slot], 0u, stored_key);
+        if (previous == 0u || previous == stored_key) {
+            hash_data[hash_base + capacity + slot] = cell;
+            return;
+        }
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    atomicOr(status[0], 1u);
+}

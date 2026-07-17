@@ -32,6 +32,7 @@ uint offset_base() { return p.aux0 * 10u; }
 uint adjacency_base() { return offset_base() + p.aux0 + 1u; }
 uint boundary_base() { return adjacency_base() + p.aux2; }
 uint cost_base() { return boundary_base() + p.aux0; }
+uint threshold_base() { return cost_base() + p.n + 3u * p.aux1 + 1u; }
 
 vec3 load_vertex(uint v) {
     return vec3(vertices[v * 3u + 0u], vertices[v * 3u + 1u], vertices[v * 3u + 2u]);
@@ -44,6 +45,209 @@ uvec3 load_face(uint f) {
 
 bool face_contains(uvec3 f, uint v) {
     return f.x == v || f.y == v || f.z == v;
+}
+
+bool finite_float(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+bool finite_vec3(vec3 value) {
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+const uint INVALID_VERTEX = 0xffffffffu;
+const uint MAX_STAR_FACES = 64u;
+
+bool valid_topology_face(uvec3 f) {
+    return f.x < p.aux0 && f.y < p.aux0 && f.z < p.aux0 &&
+           f.x != f.y && f.y != f.z && f.z != f.x;
+}
+
+uint opposite_vertex(uvec3 f, uint v0, uint v1) {
+    if (!face_contains(f, v0) || !face_contains(f, v1)) return INVALID_VERTEX;
+    if (f.x != v0 && f.x != v1) return f.x;
+    if (f.y != v0 && f.y != v1) return f.y;
+    if (f.z != v0 && f.z != v1) return f.z;
+    return INVALID_VERTEX;
+}
+
+int directed_edge_sign(uvec3 f, uint v0, uint v1) {
+    if ((f.x == v0 && f.y == v1) ||
+        (f.y == v0 && f.z == v1) ||
+        (f.z == v0 && f.x == v1)) {
+        return 1;
+    }
+    if ((f.x == v1 && f.y == v0) ||
+        (f.y == v1 && f.z == v0) ||
+        (f.z == v1 && f.x == v0)) {
+        return -1;
+    }
+    return 0;
+}
+
+uint hash_vertex(uint v) {
+    v ^= v >> 16u;
+    v *= 0x7feb352du;
+    v ^= v >> 15u;
+    v *= 0x846ca68bu;
+    return v ^ (v >> 16u);
+}
+
+void add_neighbor_mask(inout uint mask0, inout uint mask1, uint v) {
+    uint hash = hash_vertex(v);
+    mask0 |= 1u << (hash & 31u);
+    mask1 |= 1u << ((hash >> 16u) & 31u);
+}
+
+bool maybe_neighbor(uint mask0, uint mask1, uint v) {
+    uint hash = hash_vertex(v);
+    return (mask0 & (1u << (hash & 31u))) != 0u &&
+           (mask1 & (1u << ((hash >> 16u) & 31u))) != 0u;
+}
+
+bool exact_neighbor(uint vertex, uint candidate) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + vertex];
+    uint end = scratch[ob + vertex + 1u];
+    if (begin > end || end > p.aux2) return false;
+    for (uint item = begin; item < end; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, vertex)) return false;
+        if (face_contains(f, candidate)) return true;
+    }
+    return false;
+}
+
+bool exact_face_exists(uint v0, uint v1, uint v2) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + v0];
+    uint end = scratch[ob + v0 + 1u];
+    if (begin > end || end > p.aux2) return false;
+    for (uint item = begin; item < end; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v0)) return false;
+        if (face_contains(f, v1) && face_contains(f, v2)) return true;
+    }
+    return false;
+}
+
+bool is_allowed_common_neighbor(uint candidate, uint incidence, uint opposite0, uint opposite1) {
+    return candidate == opposite0 || (incidence == 2u && candidate == opposite1);
+}
+
+bool has_forbidden_common_neighbor(
+    uint candidate,
+    uint edge_v0,
+    uint edge_v1,
+    uint incidence,
+    uint opposite0,
+    uint opposite1,
+    uint mask0,
+    uint mask1) {
+    if (candidate == edge_v0 || candidate == edge_v1 ||
+        is_allowed_common_neighbor(candidate, incidence, opposite0, opposite1)) {
+        return false;
+    }
+    // The masks are negative filters only.  A possible hit is always checked
+    // against the exact CSR, so hash collisions cannot reject a valid edge.
+    return maybe_neighbor(mask0, mask1, candidate) && exact_neighbor(edge_v1, candidate);
+}
+
+bool collapse_link_ok(uint v0, uint v1) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin0 = scratch[ob + v0];
+    uint end0 = scratch[ob + v0 + 1u];
+    uint begin1 = scratch[ob + v1];
+    uint end1 = scratch[ob + v1 + 1u];
+    if (begin0 > end0 || begin1 > end1 || end0 > p.aux2 || end1 > p.aux2) return false;
+    uint degree0 = end0 - begin0;
+    uint degree1 = end1 - begin1;
+    if (degree0 == 0u || degree1 == 0u ||
+        degree0 > MAX_STAR_FACES || degree1 > MAX_STAR_FACES) {
+        return false;
+    }
+
+    uint incidence0 = 0u;
+    uint opposite0 = INVALID_VERTEX;
+    uint opposite1 = INVALID_VERTEX;
+    int sign0 = 0;
+    int sign1 = 0;
+    for (uint item = begin0; item < end0; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v0)) return false;
+        if (!face_contains(f, v1)) continue;
+        if (incidence0 >= 2u) return false;
+        uint opposite = opposite_vertex(f, v0, v1);
+        int sign = directed_edge_sign(f, v0, v1);
+        if (opposite == INVALID_VERTEX || sign == 0) return false;
+        if (incidence0 == 0u) {
+            opposite0 = opposite;
+            sign0 = sign;
+        } else {
+            opposite1 = opposite;
+            sign1 = sign;
+        }
+        incidence0 += 1u;
+    }
+
+    uint incidence1 = 0u;
+    uint neighbor_mask0 = 0u;
+    uint neighbor_mask1 = 0u;
+    for (uint item = begin1; item < end1; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) return false;
+        uvec3 f = load_face(face_id);
+        if (!valid_topology_face(f) || !face_contains(f, v1)) return false;
+        if (face_contains(f, v0)) incidence1 += 1u;
+        if (f.x != v0 && f.x != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.x);
+        if (f.y != v0 && f.y != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.y);
+        if (f.z != v0 && f.z != v1) add_neighbor_mask(neighbor_mask0, neighbor_mask1, f.z);
+    }
+    if (incidence0 != incidence1) return false;
+
+    bool boundary0 = scratch[boundary_base() + v0] != 0u;
+    bool boundary1 = scratch[boundary_base() + v1] != 0u;
+    if (incidence0 == 1u) {
+        if (!boundary0 || !boundary1) return false;
+    } else if (incidence0 == 2u) {
+        if (boundary0 || boundary1 || opposite0 == opposite1 || sign0 == sign1) return false;
+    } else {
+        return false;
+    }
+
+    for (uint item = begin0; item < end0; ++item) {
+        uvec3 f = load_face(scratch[ab + item]);
+        if (has_forbidden_common_neighbor(
+                f.x, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1) ||
+            has_forbidden_common_neighbor(
+                f.y, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1) ||
+            has_forbidden_common_neighbor(
+                f.z, v0, v1, incidence0, opposite0, opposite1,
+                neighbor_mask0, neighbor_mask1)) {
+            return false;
+        }
+    }
+
+    // Vertex-only link tests miss the tetrahedron case: both opposite
+    // vertices are allowed common neighbors, but the two retained faces
+    // become duplicates after the collapse.
+    if (incidence0 == 2u &&
+        exact_face_exists(v0, opposite0, opposite1) &&
+        exact_face_exists(v1, opposite0, opposite1)) {
+        return false;
+    }
+    return true;
 }
 
 float qem_eval(uint v0, uint v1, vec3 pos) {
@@ -70,7 +274,11 @@ bool process_incident(uint face_id, uint keep_v, uint other_v, vec3 new_pos, ino
     vec3 a = load_vertex(f.x);
     vec3 b = load_vertex(f.y);
     vec3 c = load_vertex(f.z);
-    vec3 old_n = cross(b - a, c - a);
+    if (!finite_vec3(a) || !finite_vec3(b) || !finite_vec3(c) || !finite_vec3(new_pos)) return false;
+    vec3 old_e0 = c - b;
+    vec3 old_e1 = b - a;
+    vec3 old_e2 = c - a;
+    vec3 old_n = cross(old_e1, old_e2);
 
     vec3 na = (f.x == keep_v) ? new_pos : a;
     vec3 nb = (f.y == keep_v) ? new_pos : b;
@@ -78,13 +286,43 @@ bool process_incident(uint face_id, uint keep_v, uint other_v, vec3 new_pos, ino
     vec3 new_e1 = nb - na;
     vec3 new_e2 = nc - na;
     vec3 new_n = cross(new_e1, new_e2);
-    if (dot(old_n, new_n) < 0.0) return false;
+    if (!finite_vec3(old_n) || !finite_vec3(new_n)) return false;
 
     vec3 new_e0 = nc - nb;
-    float area2 = length(new_n);
-    float denom = dot(new_e0, new_e0) + dot(new_e1, new_e1) + dot(new_e2, new_e2);
-    denom = max(denom, 1.0e-24);
+    if (!finite_vec3(new_e0) || !finite_vec3(new_e1) || !finite_vec3(new_e2)) return false;
+    float edge0_sq = dot(new_e0, new_e0);
+    float edge1_sq = dot(new_e1, new_e1);
+    float edge2_sq = dot(new_e2, new_e2);
+    float new_cross_sq = dot(new_n, new_n);
+    float max_edge_sq = max(edge0_sq, max(edge1_sq, edge2_sq));
+    float min_cross_sq = 4.0e-12 * max_edge_sq * max_edge_sq;
+    float normal_dot = dot(old_n, new_n);
+    float old_edge0_sq = dot(old_e0, old_e0);
+    float old_edge1_sq = dot(old_e1, old_e1);
+    float old_edge2_sq = dot(old_e2, old_e2);
+    float old_cross_sq = dot(old_n, old_n);
+    float old_max_edge_sq = max(old_edge0_sq, max(old_edge1_sq, old_edge2_sq));
+    float old_min_cross_sq = 4.0e-12 * old_max_edge_sq * old_max_edge_sq;
+    if (!finite_float(edge0_sq) || !finite_float(edge1_sq) || !finite_float(edge2_sq) ||
+        !finite_float(new_cross_sq) || !finite_float(max_edge_sq) || !finite_float(min_cross_sq) ||
+        !finite_float(normal_dot) || !finite_float(old_edge0_sq) || !finite_float(old_edge1_sq) ||
+        !finite_float(old_edge2_sq) || !finite_float(old_cross_sq) ||
+        !finite_float(old_max_edge_sq) || !finite_float(old_min_cross_sq)) {
+        return false;
+    }
+    // Orientation is meaningful only for a well-conditioned source face.
+    // Let a collapse repair an already-degenerate input face, while the hard
+    // new-area floor below still prevents retaining or creating a flat face.
+    if (old_cross_sq > old_min_cross_sq && normal_dot <= 0.0) return false;
+    // Scale-relative hard floor: triangle area <= 1e-6 * longest_edge^2.
+    // Squared cross products avoid a sqrt in the rejection path.
+    if (new_cross_sq <= min_cross_sq) return false;
+
+    float area2 = sqrt(new_cross_sq);
+    float denom = edge0_sq + edge1_sq + edge2_sq;
+    if (!finite_float(area2) || !finite_float(denom) || denom <= 0.0) return false;
     float shape = clamp(2.0 * sqrt(3.0) * area2 / denom, 0.0, 1.0);
+    if (!finite_float(shape)) return false;
     skinny += 1.0 - shape;
     num_tri += 1u;
     return true;
@@ -109,23 +347,38 @@ void main() {
     uint v0 = edges[edge_id * 2u + 0u];
     uint v1 = edges[edge_id * 2u + 1u];
     uint cost_index = cost_base() + edge_id;
-    if (v0 >= p.aux0 || v1 >= p.aux0) {
+    if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) {
         scratch[cost_index] = floatBitsToUint(uintBitsToFloat(0x7f800000u));
         return;
     }
-
     vec3 p0 = load_vertex(v0);
     vec3 p1 = load_vertex(v1);
+    if (!finite_vec3(p0) || !finite_vec3(p1)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
     float w0 = 0.5;
     bool b0 = scratch[boundary_base() + v0] != 0u;
     bool b1 = scratch[boundary_base() + v1] != 0u;
     if (b0 && !b1) w0 = 1.0;
     else if (!b0 && b1) w0 = 0.0;
     vec3 pos = p0 * w0 + p1 * (1.0 - w0);
+    if (!finite_vec3(pos)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
 
-    float cost = qem_eval(v0, v1, pos);
     float len2 = dot(p1 - p0, p1 - p0);
-    cost += p.eps * len2;
+    float cost = qem_eval(v0, v1, pos) + p.eps * len2;
+    float threshold = uintBitsToFloat(scratch[threshold_base()]);
+    if (!finite_float(len2) || !finite_float(cost) || cost > threshold) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
+    if (!collapse_link_ok(v0, v1)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
 
     float skinny = 0.0;
     uint num_tri = 0u;

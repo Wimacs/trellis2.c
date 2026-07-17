@@ -5,6 +5,7 @@
 #endif
 
 #include "vkmesh_accumulate_hole_components_spv.h"
+#include "vkmesh_add_block_offsets_u32_spv.h"
 #include "vkmesh_apply_orientation_flips_spv.h"
 #include "vkmesh_assign_vertex_map_spv.h"
 #include "vkmesh_assign_corner_vertices_spv.h"
@@ -17,6 +18,7 @@
 #include "vkmesh_copy_u32_spv.h"
 #include "vkmesh_degenerate_faces_spv.h"
 #include "vkmesh_expand_edges_spv.h"
+#include "vkmesh_expand_simplify_edge_keys_spv.h"
 #include "vkmesh_face_keys_spv.h"
 #include "vkmesh_fill_u32_spv.h"
 #include "vkmesh_component_area_spv.h"
@@ -24,19 +26,39 @@
 #include "vkmesh_init_u32_sequence_spv.h"
 #include "vkmesh_init_orientation_state_spv.h"
 #include "vkmesh_mark_boundary_edges_spv.h"
-#include "vkmesh_mark_component_keep_spv.h"
 #include "vkmesh_mark_duplicate_faces_spv.h"
 #include "vkmesh_mark_hole_faces_spv.h"
 #include "vkmesh_mark_hole_roots_spv.h"
+#include "vkmesh_mark_kept_face_vertices_spv.h"
+#include "vkmesh_merge_edges_spv.h"
+#include "vkmesh_merge_simplify_edge_keys_spv.h"
+#include "vkmesh_merge_face_keys_spv.h"
+#include "vkmesh_radix_histogram_simplify_edge_keys_spv.h"
+#include "vkmesh_radix_offset_simplify_edge_histogram_spv.h"
+#include "vkmesh_radix_scan_simplify_edge_histogram_spv.h"
+#include "vkmesh_radix_scatter_simplify_edge_keys_spv.h"
 #include "vkmesh_remap_faces_spv.h"
-#include "vkmesh_scan_u32_stride_spv.h"
+#include "vkmesh_remesh_active_hash_spv.h"
+#include "vkmesh_remesh_corner_owners_spv.h"
+#include "vkmesh_remesh_emit_corners_spv.h"
+#include "vkmesh_remesh_load_grid_points_spv.h"
+#include "vkmesh_remesh_simple_dc_spv.h"
+#include "vkmesh_remesh_store_grid_values_spv.h"
+#include "vkmesh_remesh_topology_count_spv.h"
+#include "vkmesh_remesh_emit_vertices_spv.h"
+#include "vkmesh_remesh_emit_faces_spv.h"
+#include "vkmesh_remesh_vertex_hash_spv.h"
+#include "vkmesh_block_scan_u32_spv.h"
 #include "vkmesh_seed_vertex_offsets_spv.h"
 #include "vkmesh_sort_edges_spv.h"
+#include "vkmesh_sort_simplify_edge_keys_spv.h"
 #include "vkmesh_sort_face_keys_spv.h"
 #include "vkmesh_simplify_best_edge_spv.h"
 #include "vkmesh_simplify_collapse_edges_spv.h"
 #include "vkmesh_simplify_edge_cost_spv.h"
 #include "vkmesh_simplify_propagate_cost_spv.h"
+#include "vkmesh_scatter_simplified_faces_spv.h"
+#include "vkmesh_scatter_simplified_vertices_spv.h"
 #include "vkmesh_union_face_edges_spv.h"
 #include "vkmesh_union_boundary_edges_spv.h"
 #include "vkmesh_union_corner_edges_spv.h"
@@ -76,10 +98,27 @@ typedef struct vkmesh_mesh {
 typedef struct vkmesh_edge {
     uint32_t min_v;
     uint32_t max_v;
-    uint32_t a;
-    uint32_t b;
-    uint32_t face;
+    /* Low bit is direction: 0=min->max, 1=max->min. */
+    uint32_t payload;
 } vkmesh_edge;
+
+_Static_assert(sizeof(vkmesh_edge) == 3u * sizeof(uint32_t), "vkmesh_edge must match GLSL");
+
+static uint32_t vkmesh_edge_make_payload(uint32_t face, uint32_t a, uint32_t b) {
+    return (face << 1u) | (a != b && a > b ? 1u : 0u);
+}
+
+static uint32_t vkmesh_edge_face(const vkmesh_edge * edge) {
+    return edge->payload >> 1u;
+}
+
+static uint32_t vkmesh_edge_start(const vkmesh_edge * edge) {
+    return (edge->payload & 1u) != 0u ? edge->max_v : edge->min_v;
+}
+
+static uint32_t vkmesh_edge_end(const vkmesh_edge * edge) {
+    return (edge->payload & 1u) != 0u ? edge->min_v : edge->max_v;
+}
 
 typedef struct vkmesh_boundary_edge {
     int32_t a;
@@ -101,6 +140,8 @@ typedef struct vkmesh_face_pair {
     uint32_t v0;
     uint32_t v1;
 } vkmesh_face_pair;
+
+enum { VKMESH_COMPONENT_MAX_UNION_PASSES = 32 };
 
 typedef struct vkmesh_qem {
     double m[10];
@@ -133,6 +174,8 @@ typedef struct vkmesh_remesh_coord {
     int32_t z;
 } vkmesh_remesh_coord;
 
+_Static_assert(sizeof(vkmesh_remesh_coord) == 3u * sizeof(int32_t), "vkmesh_remesh_coord must match GLSL");
+
 typedef struct vkmesh_u64_u32_hash {
     uint64_t * keys;
     uint32_t * vals;
@@ -150,10 +193,19 @@ typedef struct vkmesh_vk_buffer {
 
 typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_EXPAND_EDGES = 0,
+    VKMESH_PIPE_EXPAND_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_DEGENERATE_FACES,
     VKMESH_PIPE_FACE_KEYS,
     VKMESH_PIPE_SORT_EDGES,
+    VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_SORT_FACE_KEYS,
+    VKMESH_PIPE_MERGE_EDGES,
+    VKMESH_PIPE_MERGE_SIMPLIFY_EDGE_KEYS,
+    VKMESH_PIPE_MERGE_FACE_KEYS,
+    VKMESH_PIPE_RADIX_HISTOGRAM_SIMPLIFY_EDGE_KEYS,
+    VKMESH_PIPE_RADIX_SCAN_SIMPLIFY_EDGE_HISTOGRAM,
+    VKMESH_PIPE_RADIX_OFFSET_SIMPLIFY_EDGE_HISTOGRAM,
+    VKMESH_PIPE_RADIX_SCATTER_SIMPLIFY_EDGE_KEYS,
     VKMESH_PIPE_MARK_DUPLICATE_FACES,
     VKMESH_PIPE_MARK_BOUNDARY_EDGES,
     VKMESH_PIPE_BOUNDARY_DEGREE_OWNER,
@@ -171,7 +223,8 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_INIT_U32_SEQUENCE,
     VKMESH_PIPE_INIT_ORIENTATION_STATE,
     VKMESH_PIPE_SEED_VERTEX_OFFSETS,
-    VKMESH_PIPE_SCAN_U32_STRIDE,
+    VKMESH_PIPE_BLOCK_SCAN_U32,
+    VKMESH_PIPE_ADD_BLOCK_OFFSETS_U32,
     VKMESH_PIPE_UNION_FACE_EDGES,
     VKMESH_PIPE_UNION_BOUNDARY_EDGES,
     VKMESH_PIPE_UNION_CORNER_EDGES,
@@ -185,17 +238,32 @@ typedef enum vkmesh_pipeline_kind {
     VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST,
     VKMESH_PIPE_SIMPLIFY_BEST_EDGE,
     VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES,
+    VKMESH_PIPE_MARK_KEPT_FACE_VERTICES,
+    VKMESH_PIPE_SCATTER_SIMPLIFIED_FACES,
+    VKMESH_PIPE_SCATTER_SIMPLIFIED_VERTICES,
     VKMESH_PIPE_ASSIGN_CORNER_VERTICES,
     VKMESH_PIPE_WRITE_REPAIRED_MESH,
     VKMESH_PIPE_COMPONENT_AREA,
-    VKMESH_PIPE_MARK_COMPONENT_KEEP,
     VKMESH_PIPE_MARK_HOLE_ROOTS,
     VKMESH_PIPE_MARK_HOLE_FACES,
     VKMESH_PIPE_WRITE_HOLE_VERTICES,
     VKMESH_PIPE_WRITE_HOLE_FACES,
+    VKMESH_PIPE_REMESH_ACTIVE_HASH,
+    VKMESH_PIPE_REMESH_CORNER_OWNERS,
+    VKMESH_PIPE_REMESH_EMIT_CORNERS,
+    VKMESH_PIPE_REMESH_LOAD_GRID_POINTS,
+    VKMESH_PIPE_REMESH_STORE_GRID_VALUES,
+    VKMESH_PIPE_REMESH_VERTEX_HASH,
+    VKMESH_PIPE_REMESH_SIMPLE_DC,
+    VKMESH_PIPE_REMESH_TOPOLOGY_COUNT,
+    VKMESH_PIPE_REMESH_EMIT_VERTICES,
+    VKMESH_PIPE_REMESH_EMIT_FACES,
     VKMESH_PIPE_UNSIGNED_DISTANCE,
     VKMESH_PIPE_COUNT,
 } vkmesh_pipeline_kind;
+
+#define VKMESH_DISPATCH_BATCH_MAX 32u
+#define VKMESH_PROFILE_QUERY_MAX (2u * VKMESH_DISPATCH_BATCH_MAX)
 
 typedef struct vkmesh_vk {
     VkInstance instance;
@@ -208,12 +276,20 @@ typedef struct vkmesh_vk {
     VkPipelineLayout pipeline_layout;
     VkPipeline pipelines[VKMESH_PIPE_COUNT];
     VkDescriptorPool descriptor_pool;
-    VkDescriptorSet descriptor_set;
+    VkDescriptorSet descriptor_sets[VKMESH_DISPATCH_BATCH_MAX];
     VkCommandBuffer command_buffer;
     VkFence completion_fence;
+    VkQueryPool profile_query_pool;
+    double profile_timestamp_period_ns;
+    double profile_pipeline_ms[VKMESH_PIPE_COUNT];
+    uint64_t profile_dispatch_count[VKMESH_PIPE_COUNT];
+    uint32_t profile_timestamp_valid_bits;
+    int profile_enabled;
     size_t workspace_budget_bytes;
     size_t workspace_current_bytes;
     size_t workspace_peak_bytes;
+    uint32_t workspace_memory_type;
+    int workspace_memory_type_reported;
 } vkmesh_vk;
 
 typedef struct vkmesh_device_mesh {
@@ -243,6 +319,13 @@ typedef struct vkmesh_push {
     float rel_eps;
 } vkmesh_push;
 
+typedef struct vkmesh_dispatch_command {
+    vkmesh_pipeline_kind pipeline_kind;
+    vkmesh_vk_buffer buffers[4];
+    vkmesh_push push;
+    uint32_t groups_x;
+} vkmesh_dispatch_command;
+
 typedef struct vkmesh_shader_blob {
     const unsigned char * data;
     unsigned int len;
@@ -251,10 +334,19 @@ typedef struct vkmesh_shader_blob {
 
 static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_expand_edges_spv, sizeof(vkmesh_expand_edges_spv), "expand_edges" },
+    { vkmesh_expand_simplify_edge_keys_spv, sizeof(vkmesh_expand_simplify_edge_keys_spv), "expand_simplify_edge_keys" },
     { vkmesh_degenerate_faces_spv, sizeof(vkmesh_degenerate_faces_spv), "degenerate_faces" },
     { vkmesh_face_keys_spv, sizeof(vkmesh_face_keys_spv), "face_keys" },
     { vkmesh_sort_edges_spv, sizeof(vkmesh_sort_edges_spv), "sort_edges" },
+    { vkmesh_sort_simplify_edge_keys_spv, sizeof(vkmesh_sort_simplify_edge_keys_spv), "sort_simplify_edge_keys" },
     { vkmesh_sort_face_keys_spv, sizeof(vkmesh_sort_face_keys_spv), "sort_face_keys" },
+    { vkmesh_merge_edges_spv, sizeof(vkmesh_merge_edges_spv), "merge_edges" },
+    { vkmesh_merge_simplify_edge_keys_spv, sizeof(vkmesh_merge_simplify_edge_keys_spv), "merge_simplify_edge_keys" },
+    { vkmesh_merge_face_keys_spv, sizeof(vkmesh_merge_face_keys_spv), "merge_face_keys" },
+    { vkmesh_radix_histogram_simplify_edge_keys_spv, sizeof(vkmesh_radix_histogram_simplify_edge_keys_spv), "radix_histogram_simplify_edge_keys" },
+    { vkmesh_radix_scan_simplify_edge_histogram_spv, sizeof(vkmesh_radix_scan_simplify_edge_histogram_spv), "radix_scan_simplify_edge_histogram" },
+    { vkmesh_radix_offset_simplify_edge_histogram_spv, sizeof(vkmesh_radix_offset_simplify_edge_histogram_spv), "radix_offset_simplify_edge_histogram" },
+    { vkmesh_radix_scatter_simplify_edge_keys_spv, sizeof(vkmesh_radix_scatter_simplify_edge_keys_spv), "radix_scatter_simplify_edge_keys" },
     { vkmesh_mark_duplicate_faces_spv, sizeof(vkmesh_mark_duplicate_faces_spv), "mark_duplicate_faces" },
     { vkmesh_mark_boundary_edges_spv, sizeof(vkmesh_mark_boundary_edges_spv), "mark_boundary_edges" },
     { vkmesh_boundary_degree_owner_spv, sizeof(vkmesh_boundary_degree_owner_spv), "boundary_degree_owner" },
@@ -272,7 +364,8 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_init_u32_sequence_spv, sizeof(vkmesh_init_u32_sequence_spv), "init_u32_sequence" },
     { vkmesh_init_orientation_state_spv, sizeof(vkmesh_init_orientation_state_spv), "init_orientation_state" },
     { vkmesh_seed_vertex_offsets_spv, sizeof(vkmesh_seed_vertex_offsets_spv), "seed_vertex_offsets" },
-    { vkmesh_scan_u32_stride_spv, sizeof(vkmesh_scan_u32_stride_spv), "scan_u32_stride" },
+    { vkmesh_block_scan_u32_spv, sizeof(vkmesh_block_scan_u32_spv), "block_scan_u32" },
+    { vkmesh_add_block_offsets_u32_spv, sizeof(vkmesh_add_block_offsets_u32_spv), "add_block_offsets_u32" },
     { vkmesh_union_face_edges_spv, sizeof(vkmesh_union_face_edges_spv), "union_face_edges" },
     { vkmesh_union_boundary_edges_spv, sizeof(vkmesh_union_boundary_edges_spv), "union_boundary_edges" },
     { vkmesh_union_corner_edges_spv, sizeof(vkmesh_union_corner_edges_spv), "union_corner_edges" },
@@ -286,14 +379,26 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_simplify_propagate_cost_spv, sizeof(vkmesh_simplify_propagate_cost_spv), "simplify_propagate_cost" },
     { vkmesh_simplify_best_edge_spv, sizeof(vkmesh_simplify_best_edge_spv), "simplify_best_edge" },
     { vkmesh_simplify_collapse_edges_spv, sizeof(vkmesh_simplify_collapse_edges_spv), "simplify_collapse_edges" },
+    { vkmesh_mark_kept_face_vertices_spv, sizeof(vkmesh_mark_kept_face_vertices_spv), "mark_kept_face_vertices" },
+    { vkmesh_scatter_simplified_faces_spv, sizeof(vkmesh_scatter_simplified_faces_spv), "scatter_simplified_faces" },
+    { vkmesh_scatter_simplified_vertices_spv, sizeof(vkmesh_scatter_simplified_vertices_spv), "scatter_simplified_vertices" },
     { vkmesh_assign_corner_vertices_spv, sizeof(vkmesh_assign_corner_vertices_spv), "assign_corner_vertices" },
     { vkmesh_write_repaired_mesh_spv, sizeof(vkmesh_write_repaired_mesh_spv), "write_repaired_mesh" },
     { vkmesh_component_area_spv, sizeof(vkmesh_component_area_spv), "component_area" },
-    { vkmesh_mark_component_keep_spv, sizeof(vkmesh_mark_component_keep_spv), "mark_component_keep" },
     { vkmesh_mark_hole_roots_spv, sizeof(vkmesh_mark_hole_roots_spv), "mark_hole_roots" },
     { vkmesh_mark_hole_faces_spv, sizeof(vkmesh_mark_hole_faces_spv), "mark_hole_faces" },
     { vkmesh_write_hole_vertices_spv, sizeof(vkmesh_write_hole_vertices_spv), "write_hole_vertices" },
     { vkmesh_write_hole_faces_spv, sizeof(vkmesh_write_hole_faces_spv), "write_hole_faces" },
+    { vkmesh_remesh_active_hash_spv, sizeof(vkmesh_remesh_active_hash_spv), "remesh_active_hash" },
+    { vkmesh_remesh_corner_owners_spv, sizeof(vkmesh_remesh_corner_owners_spv), "remesh_corner_owners" },
+    { vkmesh_remesh_emit_corners_spv, sizeof(vkmesh_remesh_emit_corners_spv), "remesh_emit_corners" },
+    { vkmesh_remesh_load_grid_points_spv, sizeof(vkmesh_remesh_load_grid_points_spv), "remesh_load_grid_points" },
+    { vkmesh_remesh_store_grid_values_spv, sizeof(vkmesh_remesh_store_grid_values_spv), "remesh_store_grid_values" },
+    { vkmesh_remesh_vertex_hash_spv, sizeof(vkmesh_remesh_vertex_hash_spv), "remesh_vertex_hash" },
+    { vkmesh_remesh_simple_dc_spv, sizeof(vkmesh_remesh_simple_dc_spv), "remesh_simple_dc" },
+    { vkmesh_remesh_topology_count_spv, sizeof(vkmesh_remesh_topology_count_spv), "remesh_topology_count" },
+    { vkmesh_remesh_emit_vertices_spv, sizeof(vkmesh_remesh_emit_vertices_spv), "remesh_emit_vertices" },
+    { vkmesh_remesh_emit_faces_spv, sizeof(vkmesh_remesh_emit_faces_spv), "remesh_emit_faces" },
     { vkmesh_unsigned_distance_spv, sizeof(vkmesh_unsigned_distance_spv), "unsigned_distance" },
 };
 
@@ -314,12 +419,48 @@ typedef enum vkmesh_error_kind {
     VKMESH_ERROR_OUT_OF_MEMORY,
     VKMESH_ERROR_VULKAN_UNAVAILABLE,
     VKMESH_ERROR_VULKAN,
+    VKMESH_ERROR_ALGORITHM,
 } vkmesh_error_kind;
 
 static VKMESH_THREAD_LOCAL vkmesh_error_kind g_vkmesh_last_error = VKMESH_ERROR_NONE;
+static VKMESH_THREAD_LOCAL int g_vkmesh_fatal_error_reported = 0;
 
 static void vkmesh_set_error(vkmesh_error_kind error) {
-    g_vkmesh_last_error = error;
+    if (error != VKMESH_ERROR_NONE && g_vkmesh_last_error == VKMESH_ERROR_NONE) {
+        g_vkmesh_last_error = error;
+    }
+}
+
+static void vkmesh_begin_operation(void) {
+    g_vkmesh_last_error = VKMESH_ERROR_NONE;
+    g_vkmesh_fatal_error_reported = 0;
+}
+
+static const char * vkmesh_error_name(vkmesh_error_kind error) {
+    switch (error) {
+        case VKMESH_ERROR_INVALID_ARGUMENT: return "invalid argument";
+        case VKMESH_ERROR_OUT_OF_MEMORY: return "out of memory";
+        case VKMESH_ERROR_VULKAN_UNAVAILABLE: return "Vulkan unavailable";
+        case VKMESH_ERROR_VULKAN: return "Vulkan runtime error";
+        case VKMESH_ERROR_ALGORITHM: return "algorithm failure";
+        default: return "no explicit error";
+    }
+}
+
+/* A zero error preserves the existing algorithm-alternate behavior. Once a
+   concrete failure has been recorded, retrying the same workload through
+   another Vulkan-heavy path only hides the cause and can turn OOM into a
+   minutes-long CPU/Vulkan retry chain. */
+static int vkmesh_fatal_error_blocks_fallback(const char * stage) {
+    if (g_vkmesh_last_error == VKMESH_ERROR_NONE) return 0;
+    if (!g_vkmesh_fatal_error_reported) {
+        fprintf(stderr,
+            "vkmesh: %s failed with %s; refusing fallback\n",
+            stage != NULL ? stage : "operation",
+            vkmesh_error_name(g_vkmesh_last_error));
+        g_vkmesh_fatal_error_reported = 1;
+    }
+    return 1;
 }
 
 static int vkmesh_check_vk_result(const char * operation, VkResult result) {
@@ -594,15 +735,21 @@ static int write_meshbin(const char * path, const vkmesh_mesh * mesh) {
     return 1;
 }
 
-static uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits, VkMemoryPropertyFlags flags) {
+static uint32_t find_memory_type(
+    VkPhysicalDevice physical,
+    uint32_t type_bits,
+    VkMemoryPropertyFlags required_flags,
+    VkMemoryPropertyFlags preferred_flags) {
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(physical, &props);
+    uint32_t fallback = UINT32_MAX;
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-        if ((type_bits & (1u << i)) != 0 && (props.memoryTypes[i].propertyFlags & flags) == flags) {
-            return i;
-        }
+        if ((type_bits & (1u << i)) == 0 ||
+            (props.memoryTypes[i].propertyFlags & required_flags) != required_flags) continue;
+        if (fallback == UINT32_MAX) fallback = i;
+        if ((props.memoryTypes[i].propertyFlags & preferred_flags) == preferred_flags) return i;
     }
-    return UINT32_MAX;
+    return fallback;
 }
 
 static int vkmesh_device_supports_memory_budget(VkPhysicalDevice physical) {
@@ -656,13 +803,24 @@ static size_t vkmesh_resolve_workspace_budget(VkPhysicalDevice physical) {
     if (has_budget) props2.pNext = &budget_props;
     vkGetPhysicalDeviceMemoryProperties2(physical, &props2);
 
+    const VkMemoryPropertyFlags required =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    int has_preferred_type = 0;
+    for (uint32_t i = 0; i < props2.memoryProperties.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags flags = props2.memoryProperties.memoryTypes[i].propertyFlags;
+        if ((flags & required) == required && (flags & preferred) == preferred) {
+            has_preferred_type = 1;
+            break;
+        }
+    }
+
     VkDeviceSize best_heap_budget = 0;
     VkDeviceSize best_heap_available = 0;
     for (uint32_t i = 0; i < props2.memoryProperties.memoryTypeCount; ++i) {
         const VkMemoryType * type = &props2.memoryProperties.memoryTypes[i];
-        const VkMemoryPropertyFlags required =
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         if ((type->propertyFlags & required) != required) continue;
+        if (has_preferred_type && (type->propertyFlags & preferred) != preferred) continue;
         const uint32_t heap_index = type->heapIndex;
         VkDeviceSize heap_budget = has_budget ?
             budget_props.heapBudget[heap_index] : props2.memoryProperties.memoryHeaps[heap_index].size;
@@ -690,7 +848,12 @@ static size_t vkmesh_resolve_workspace_budget(VkPhysicalDevice physical) {
 static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b);
 static int vkmesh_vk_init(vkmesh_vk * vk);
 
-static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+static int vk_buffer_create_internal(
+    vkmesh_vk * vk,
+    size_t bytes,
+    vkmesh_vk_buffer * out,
+    int initialize_payload,
+    VkMemoryPropertyFlags preferred_memory_flags) {
     if (vk == NULL || out == NULL || bytes == 0) return 0;
     memset(out, 0, sizeof(*out));
     out->bytes = bytes;
@@ -722,13 +885,28 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
     uint32_t memory_type = find_memory_type(
         vk->physical_device,
         req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        preferred_memory_flags);
     if (memory_type == UINT32_MAX) {
         vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         fprintf(stderr, "vkmesh: selected device has no host-visible coherent storage-buffer memory type\n");
         vkDestroyBuffer(vk->device, out->buffer, NULL);
         memset(out, 0, sizeof(*out));
         return 0;
+    }
+    if (!vk->workspace_memory_type_reported) {
+        VkPhysicalDeviceMemoryProperties memory_props;
+        vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &memory_props);
+        const VkMemoryType * type = &memory_props.memoryTypes[memory_type];
+        vk->workspace_memory_type = memory_type;
+        vk->workspace_memory_type_reported = 1;
+        fprintf(stderr,
+            "vkmesh: workspace memory type=%u heap=%u device_local=%d host_visible=%d coherent=%d\n",
+            memory_type,
+            type->heapIndex,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
+            (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0);
     }
 
     VkMemoryAllocateInfo alloc_info;
@@ -749,15 +927,37 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
     if (vk->workspace_current_bytes > vk->workspace_peak_bytes) {
         vk->workspace_peak_bytes = vk->workspace_current_bytes;
     }
-    memset(out->mapped, 0, bytes);
+    if (initialize_payload) memset(out->mapped, 0, bytes);
     return 1;
+}
+
+static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+    return vk_buffer_create_internal(vk, bytes, out, 1, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+static int vk_buffer_create_uninitialized(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+    return vk_buffer_create_internal(vk, bytes, out, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+static int vk_buffer_create_host_cached(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out) {
+    return vk_buffer_create_internal(vk, bytes, out, 0, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+}
+
+static int vk_buffer_ensure_capacity(
+    vkmesh_vk * vk,
+    size_t bytes,
+    vkmesh_vk_buffer * buffer) {
+    if (vk == NULL || buffer == NULL || bytes == 0u) return 0;
+    if (buffer->buffer != VK_NULL_HANDLE && buffer->bytes >= bytes) return 1;
+    vk_buffer_destroy(vk, buffer);
+    return vk_buffer_create_uninitialized(vk, bytes, buffer);
 }
 
 static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b) {
     if (b == NULL) return;
     if (b->mapped != NULL) vkUnmapMemory(vk->device, b->memory);
-    if (b->memory != VK_NULL_HANDLE) vkFreeMemory(vk->device, b->memory, NULL);
     if (b->buffer != VK_NULL_HANDLE) vkDestroyBuffer(vk->device, b->buffer, NULL);
+    if (b->memory != VK_NULL_HANDLE) vkFreeMemory(vk->device, b->memory, NULL);
     if (vk != NULL && b->allocation_bytes <= vk->workspace_current_bytes) {
         vk->workspace_current_bytes -= b->allocation_bytes;
     }
@@ -773,6 +973,24 @@ static void vkmesh_vk_destroy(vkmesh_vk * vk) {
             (double) vk->workspace_peak_bytes / (1024.0 * 1024.0),
             (double) vk->workspace_budget_bytes / (1024.0 * 1024.0),
             (double) vk->workspace_current_bytes / (1024.0 * 1024.0));
+    }
+    if (vk->profile_enabled) {
+        double total_ms = 0.0;
+        for (uint32_t i = 0u; i < VKMESH_PIPE_COUNT; ++i) {
+            total_ms += vk->profile_pipeline_ms[i];
+        }
+        fprintf(stderr, "vkmesh: GPU profile total %.3f ms\n", total_ms);
+        for (uint32_t i = 0u; i < VKMESH_PIPE_COUNT; ++i) {
+            if (vk->profile_dispatch_count[i] == 0u) continue;
+            fprintf(stderr,
+                "vkmesh: GPU profile %-32s %9.3f ms (%" PRIu64 " dispatches)\n",
+                vkmesh_shaders[i].name,
+                vk->profile_pipeline_ms[i],
+                vk->profile_dispatch_count[i]);
+        }
+    }
+    if (vk->profile_query_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(vk->device, vk->profile_query_pool, NULL);
     }
     if (vk->completion_fence != VK_NULL_HANDLE) vkDestroyFence(vk->device, vk->completion_fence, NULL);
     if (vk->descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk->device, vk->descriptor_pool, NULL);
@@ -853,19 +1071,24 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
     VkResult result = vkCreateInstance(&instance_info, NULL, &vk->instance);
-    if (!vkmesh_check_vk_result("vkCreateInstance", result)) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+    if (result != VK_SUCCESS) {
+        if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        }
+        (void) vkmesh_check_vk_result("vkCreateInstance", result);
         return 0;
     }
 
     uint32_t physical_count = 0;
     result = vkEnumeratePhysicalDevices(vk->instance, &physical_count, NULL);
     if (result != VK_SUCCESS || physical_count == 0) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         if (result != VK_SUCCESS) {
+            if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+            }
             (void) vkmesh_check_vk_result("vkEnumeratePhysicalDevices(count)", result);
-            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         } else {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
             fprintf(stderr, "vkmesh: no Vulkan physical devices\n");
         }
         return 0;
@@ -905,6 +1128,7 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
         if ((families[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
             vk->physical_device = selected;
             vk->queue_family = q;
+            vk->profile_timestamp_valid_bits = families[q].timestampValidBits;
             found = 1;
             break;
         }
@@ -919,6 +1143,16 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
 
     VkPhysicalDeviceProperties device_props;
     vkGetPhysicalDeviceProperties(vk->physical_device, &device_props);
+    const char * profile_env = getenv("TRELLIS_VKMESH_PROFILE");
+    const int profile_requested =
+        profile_env != NULL && profile_env[0] != '\0' && strcmp(profile_env, "0") != 0;
+    if (profile_requested && device_props.limits.timestampComputeAndGraphics &&
+        vk->profile_timestamp_valid_bits > 0u) {
+        vk->profile_enabled = 1;
+        vk->profile_timestamp_period_ns = (double) device_props.limits.timestampPeriod;
+    } else if (profile_requested) {
+        fprintf(stderr, "vkmesh: GPU profiling unavailable on the selected compute queue\n");
+    }
     vk->workspace_budget_bytes = vkmesh_resolve_workspace_budget(vk->physical_device);
     fprintf(stderr,
         "vkmesh: using Vulkan device %d: %s (GPU workspace budget %.1f MiB)\n",
@@ -940,11 +1174,28 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     result = vkCreateDevice(vk->physical_device, &device_info, NULL, &vk->device);
-    if (!vkmesh_check_vk_result("vkCreateDevice", result)) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+    if (result != VK_SUCCESS) {
+        if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        }
+        (void) vkmesh_check_vk_result("vkCreateDevice", result);
         return 0;
     }
     vkGetDeviceQueue(vk->device, vk->queue_family, 0, &vk->queue);
+
+    if (vk->profile_enabled) {
+        VkQueryPoolCreateInfo query_info;
+        memset(&query_info, 0, sizeof(query_info));
+        query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_info.queryCount = VKMESH_PROFILE_QUERY_MAX;
+        result = vkCreateQueryPool(vk->device, &query_info, NULL, &vk->profile_query_pool);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "vkmesh: GPU profiling disabled because timestamp query creation failed\n");
+            vk->profile_enabled = 0;
+            vk->profile_query_pool = VK_NULL_HANDLE;
+        }
+    }
 
     VkCommandPoolCreateInfo pool_info;
     memset(&pool_info, 0, sizeof(pool_info));
@@ -992,24 +1243,28 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     VkDescriptorPoolSize pool_size;
     memset(&pool_size, 0, sizeof(pool_size));
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 12;
+    pool_size.descriptorCount = 4u * VKMESH_DISPATCH_BATCH_MAX;
     VkDescriptorPoolCreateInfo descriptor_pool_info;
     memset(&descriptor_pool_info, 0, sizeof(descriptor_pool_info));
     descriptor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descriptor_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    descriptor_pool_info.maxSets = 3;
+    descriptor_pool_info.maxSets = VKMESH_DISPATCH_BATCH_MAX;
     descriptor_pool_info.poolSizeCount = 1;
     descriptor_pool_info.pPoolSizes = &pool_size;
     result = vkCreateDescriptorPool(vk->device, &descriptor_pool_info, NULL, &vk->descriptor_pool);
     if (!vkmesh_check_vk_result("vkCreateDescriptorPool", result)) return 0;
 
+    VkDescriptorSetLayout set_layouts[VKMESH_DISPATCH_BATCH_MAX];
+    for (uint32_t i = 0u; i < VKMESH_DISPATCH_BATCH_MAX; ++i) {
+        set_layouts[i] = vk->descriptor_set_layout;
+    }
     VkDescriptorSetAllocateInfo set_alloc;
     memset(&set_alloc, 0, sizeof(set_alloc));
     set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     set_alloc.descriptorPool = vk->descriptor_pool;
-    set_alloc.descriptorSetCount = 1;
-    set_alloc.pSetLayouts = &vk->descriptor_set_layout;
-    result = vkAllocateDescriptorSets(vk->device, &set_alloc, &vk->descriptor_set);
+    set_alloc.descriptorSetCount = VKMESH_DISPATCH_BATCH_MAX;
+    set_alloc.pSetLayouts = set_layouts;
+    result = vkAllocateDescriptorSets(vk->device, &set_alloc, vk->descriptor_sets);
     if (!vkmesh_check_vk_result("vkAllocateDescriptorSets", result)) return 0;
 
     VkCommandBufferAllocateInfo cmd_alloc;
@@ -1038,17 +1293,68 @@ static int vkmesh_submit_and_wait(vkmesh_vk * vk, const VkSubmitInfo * submit) {
         result = vkWaitForFences(vk->device, 1, &vk->completion_fence, VK_TRUE, UINT64_MAX);
     }
     if (result != VK_SUCCESS) {
-        vkmesh_set_error(VKMESH_ERROR_VULKAN);
-        fprintf(stderr, "vkmesh: Vulkan submit/wait failed: VkResult=%d\n", (int) result);
+        (void) vkmesh_check_vk_result("Vulkan submit/wait", result);
         return 0;
     }
     return 1;
 }
 
+static void vkmesh_profile_reset(vkmesh_vk * vk, VkCommandBuffer command_buffer) {
+    if (!vk->profile_enabled) return;
+    vkCmdResetQueryPool(command_buffer, vk->profile_query_pool, 0u, VKMESH_PROFILE_QUERY_MAX);
+}
+
+static void vkmesh_profile_timestamp(
+    vkmesh_vk * vk,
+    VkCommandBuffer command_buffer,
+    uint32_t query,
+    VkPipelineStageFlagBits stage) {
+    if (!vk->profile_enabled) return;
+    vkCmdWriteTimestamp(command_buffer, stage, vk->profile_query_pool, query);
+}
+
+static void vkmesh_profile_collect(
+    vkmesh_vk * vk,
+    const vkmesh_pipeline_kind * pipelines,
+    uint32_t dispatch_count) {
+    if (!vk->profile_enabled || dispatch_count == 0u ||
+        dispatch_count > VKMESH_DISPATCH_BATCH_MAX) {
+        return;
+    }
+
+    uint64_t timestamps[VKMESH_PROFILE_QUERY_MAX];
+    const uint32_t query_count = 2u * dispatch_count;
+    VkResult result = vkGetQueryPoolResults(
+        vk->device,
+        vk->profile_query_pool,
+        0u,
+        query_count,
+        (size_t) query_count * sizeof(timestamps[0]),
+        timestamps,
+        sizeof(timestamps[0]),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkmesh: GPU profiling disabled because timestamp readback failed\n");
+        vk->profile_enabled = 0;
+        return;
+    }
+
+    const uint64_t timestamp_mask = vk->profile_timestamp_valid_bits < 64u ?
+        (UINT64_C(1) << vk->profile_timestamp_valid_bits) - UINT64_C(1) : UINT64_MAX;
+    for (uint32_t i = 0u; i < dispatch_count; ++i) {
+        const uint64_t elapsed_ticks =
+            (timestamps[2u * i + 1u] - timestamps[2u * i]) & timestamp_mask;
+        const vkmesh_pipeline_kind pipeline = pipelines[i];
+        vk->profile_pipeline_ms[pipeline] +=
+            (double) elapsed_ticks * vk->profile_timestamp_period_ns * 1.0e-6;
+        ++vk->profile_dispatch_count[pipeline];
+    }
+}
+
 static void vkmesh_update_descriptor_set_handle(
     vkmesh_vk * vk,
     VkDescriptorSet descriptor_set,
-    vkmesh_vk_buffer buffers[4]) {
+    const vkmesh_vk_buffer buffers[4]) {
     VkDescriptorBufferInfo infos[4];
     VkWriteDescriptorSet writes[4];
     memset(infos, 0, sizeof(infos));
@@ -1068,7 +1374,31 @@ static void vkmesh_update_descriptor_set_handle(
 }
 
 static void vkmesh_update_descriptor_set(vkmesh_vk * vk, vkmesh_vk_buffer buffers[4]) {
-    vkmesh_update_descriptor_set_handle(vk, vk->descriptor_set, buffers);
+    vkmesh_update_descriptor_set_handle(vk, vk->descriptor_sets[0], buffers);
+}
+
+static void vkmesh_update_batch_descriptor_sets(
+    vkmesh_vk * vk,
+    const vkmesh_dispatch_command * commands,
+    uint32_t command_count) {
+    VkDescriptorBufferInfo infos[4u * VKMESH_DISPATCH_BATCH_MAX];
+    VkWriteDescriptorSet writes[4u * VKMESH_DISPATCH_BATCH_MAX];
+    memset(infos, 0, sizeof(infos));
+    memset(writes, 0, sizeof(writes));
+    for (uint32_t command = 0u; command < command_count; ++command) {
+        for (uint32_t binding = 0u; binding < 4u; ++binding) {
+            const uint32_t index = command * 4u + binding;
+            infos[index].buffer = commands[command].buffers[binding].buffer;
+            infos[index].range = (VkDeviceSize) commands[command].buffers[binding].bytes;
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = vk->descriptor_sets[command];
+            writes[index].dstBinding = binding;
+            writes[index].descriptorCount = 1u;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[index].pBufferInfo = &infos[index];
+        }
+    }
+    vkUpdateDescriptorSets(vk->device, 4u * command_count, writes, 0u, NULL);
 }
 
 static int vkmesh_dispatch(
@@ -1078,16 +1408,21 @@ static int vkmesh_dispatch(
     const vkmesh_push * push,
     uint32_t groups_x) {
     vkmesh_update_descriptor_set(vk, buffers);
-    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
+    VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (!vkmesh_check_vk_result("vkResetCommandBuffer", result)) return 0;
 
     VkCommandBufferBeginInfo begin;
     memset(&begin, 0, sizeof(begin));
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+    if (!vkmesh_check_vk_result("vkBeginCommandBuffer", result)) return 0;
+    vkmesh_profile_reset(vk, vk->command_buffer);
+    vkmesh_profile_timestamp(vk, vk->command_buffer, 0u, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
     vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
-    vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
+    vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_sets[0], 0, NULL);
     vkCmdPushConstants(vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push), push);
     vkCmdDispatch(vk->command_buffer, groups_x, 1, 1);
+    vkmesh_profile_timestamp(vk, vk->command_buffer, 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1098,14 +1433,106 @@ static int vkmesh_dispatch(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
         0, 1, &barrier, 0, NULL, 0, NULL);
-    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkEndCommandBuffer", result)) return 0;
 
     VkSubmitInfo submit;
     memset(&submit, 0, sizeof(submit));
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
-    return vkmesh_submit_and_wait(vk, &submit);
+    const int ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, &pipeline_kind, 1u);
+    return ok;
+}
+
+static int vkmesh_dispatch_batch(
+    vkmesh_vk * vk,
+    const vkmesh_dispatch_command * commands,
+    uint32_t command_count) {
+    if (vk == NULL || commands == NULL || command_count == 0u ||
+        command_count > VKMESH_DISPATCH_BATCH_MAX) {
+        return 0;
+    }
+
+    for (uint32_t i = 0u; i < command_count; ++i) {
+        if (commands[i].pipeline_kind >= VKMESH_PIPE_COUNT || commands[i].groups_x == 0u) return 0;
+    }
+    vkmesh_update_batch_descriptor_sets(vk, commands, command_count);
+
+    int ok = 0;
+    VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (!vkmesh_check_vk_result("vkResetCommandBuffer(batch)", result)) return 0;
+
+    VkCommandBufferBeginInfo begin;
+    memset(&begin, 0, sizeof(begin));
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+    if (!vkmesh_check_vk_result("vkBeginCommandBuffer(batch)", result)) return 0;
+    vkmesh_profile_reset(vk, vk->command_buffer);
+
+    VkMemoryBarrier barrier;
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkmesh_pipeline_kind profile_pipelines[VKMESH_DISPATCH_BATCH_MAX];
+    for (uint32_t i = 0u; i < command_count; ++i) {
+        const vkmesh_dispatch_command * command = &commands[i];
+        profile_pipelines[i] = command->pipeline_kind;
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * i, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        vkCmdBindPipeline(
+            vk->command_buffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            vk->pipelines[command->pipeline_kind]);
+        vkCmdBindDescriptorSets(
+            vk->command_buffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            vk->pipeline_layout,
+            0,
+            1,
+            &vk->descriptor_sets[i],
+            0,
+            NULL);
+        vkCmdPushConstants(
+            vk->command_buffer,
+            vk->pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            sizeof(command->push),
+            &command->push);
+        vkCmdDispatch(vk->command_buffer, command->groups_x, 1, 1);
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * i + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+        const int is_last = i + 1u == command_count;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        if (is_last) barrier.dstAccessMask |= VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(
+            vk->command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            is_last ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT
+                    : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &barrier,
+            0,
+            NULL,
+            0,
+            NULL);
+    }
+
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkEndCommandBuffer(batch)", result)) return 0;
+
+    VkSubmitInfo submit;
+    memset(&submit, 0, sizeof(submit));
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &vk->command_buffer;
+    ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, profile_pipelines, command_count);
+    return ok;
 }
 
 static int vkmesh_dispatch_pair(
@@ -1118,174 +1545,424 @@ static int vkmesh_dispatch_pair(
     vkmesh_vk_buffer second_buffers[4],
     uint32_t second_n,
     uint32_t second_groups) {
-    VkDescriptorSetLayout layouts[2] = { vk->descriptor_set_layout, vk->descriptor_set_layout };
-    VkDescriptorSetAllocateInfo alloc;
-    memset(&alloc, 0, sizeof(alloc));
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = vk->descriptor_pool;
-    alloc.descriptorSetCount = 2;
-    alloc.pSetLayouts = layouts;
-    VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkResult result = vkAllocateDescriptorSets(vk->device, &alloc, sets);
-    if (!vkmesh_check_vk_result("vkAllocateDescriptorSets(batch)", result)) return 0;
-    vkmesh_update_descriptor_set_handle(vk, sets[0], first_buffers);
-    vkmesh_update_descriptor_set_handle(vk, sets[1], second_buffers);
-
-    int ok = 0;
-    if (vkResetCommandBuffer(vk->command_buffer, 0) == VK_SUCCESS) {
-        VkCommandBufferBeginInfo begin;
-        memset(&begin, 0, sizeof(begin));
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        if (vkBeginCommandBuffer(vk->command_buffer, &begin) == VK_SUCCESS) {
-            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[first_kind]);
-            vkCmdBindDescriptorSets(
-                vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &sets[0], 0, NULL);
-            vkCmdPushConstants(
-                vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*first_push), first_push);
-            vkCmdDispatch(vk->command_buffer, first_groups, 1, 1);
-
-            VkMemoryBarrier barrier;
-            memset(&barrier, 0, sizeof(barrier));
-            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(
-                vk->command_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &barrier, 0, NULL, 0, NULL);
-
-            vkmesh_push second_push;
-            memset(&second_push, 0, sizeof(second_push));
-            second_push.n = second_n;
-            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[second_kind]);
-            vkCmdBindDescriptorSets(
-                vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &sets[1], 0, NULL);
-            vkCmdPushConstants(
-                vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(second_push), &second_push);
-            vkCmdDispatch(vk->command_buffer, second_groups, 1, 1);
-
-            barrier.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-            vkCmdPipelineBarrier(
-                vk->command_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                0, 1, &barrier, 0, NULL, 0, NULL);
-            if (vkEndCommandBuffer(vk->command_buffer) == VK_SUCCESS) {
-                VkSubmitInfo submit;
-                memset(&submit, 0, sizeof(submit));
-                submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                submit.commandBufferCount = 1;
-                submit.pCommandBuffers = &vk->command_buffer;
-                ok = vkmesh_submit_and_wait(vk, &submit);
-            }
-        }
-    }
-    result = vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 2, sets);
-    if (!vkmesh_check_vk_result("vkFreeDescriptorSets(batch)", result)) ok = 0;
-    return ok;
+    vkmesh_dispatch_command commands[2];
+    memset(commands, 0, sizeof(commands));
+    commands[0].pipeline_kind = first_kind;
+    memcpy(commands[0].buffers, first_buffers, sizeof(commands[0].buffers));
+    commands[0].push = *first_push;
+    commands[0].groups_x = first_groups;
+    commands[1].pipeline_kind = second_kind;
+    memcpy(commands[1].buffers, second_buffers, sizeof(commands[1].buffers));
+    commands[1].push.n = second_n;
+    commands[1].groups_x = second_groups;
+    return vkmesh_dispatch_batch(vk, commands, 2u);
 }
 
-static size_t next_power_of_two_size(size_t n) {
-    size_t p = 1;
-    while (p < n) {
-        if (p > SIZE_MAX / 2) return 0;
-        p *= 2;
-    }
-    return p;
-}
-
-/* Bitonic sort passes recorded per submission. The full ladder is O(log2(n)^2)
-   dependent dispatches -- ~250 of them for a few million edge records -- and
-   recording all of them into one command buffer makes a single GPU job long
-   enough to overrun the kernel's compute-ring lockup timeout on a slow device,
-   which wedges the GPU and kills the display along with it. 0 keeps the whole
-   ladder in one submission. */
-#define VKMESH_DEFAULT_SORT_FLUSH_PASSES 8u
-
-static uint32_t vkmesh_resolve_sort_flush_passes(void) {
-    const char * env = getenv("TRELLIS_VKMESH_SORT_FLUSH_PASSES");
-    if (env != NULL && env[0] != '\0') {
-        int parsed = 0;
-        if (parse_int_arg(env, &parsed) && parsed >= 0) {
-            return (uint32_t) parsed;
-        }
-        fprintf(stderr,
-            "vkmesh: ignoring invalid TRELLIS_VKMESH_SORT_FLUSH_PASSES='%s'\n",
-            env);
-    }
-    return VKMESH_DEFAULT_SORT_FLUSH_PASSES;
-}
+#define VKMESH_SORT_TILE_SIZE 256u
 
 static int vkmesh_sort_records_vulkan(
     vkmesh_vk * vk,
     vkmesh_vk_buffer * records,
     vkmesh_vk_buffer * dummy,
     size_t record_count,
-    vkmesh_pipeline_kind pipeline_kind) {
+    vkmesh_pipeline_kind pipeline_kind,
+    vkmesh_vk_buffer * reusable_temporary) {
     if (record_count <= 1) return 1;
     if (record_count > UINT32_MAX) return 0;
 
+    size_t record_size = 0;
+    vkmesh_pipeline_kind merge_pipeline = VKMESH_PIPE_COUNT;
+    if (pipeline_kind == VKMESH_PIPE_SORT_EDGES) {
+        record_size = sizeof(vkmesh_edge);
+        merge_pipeline = VKMESH_PIPE_MERGE_EDGES;
+    } else if (pipeline_kind == VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS) {
+        record_size = 2u * sizeof(uint32_t);
+        merge_pipeline = VKMESH_PIPE_MERGE_SIMPLIFY_EDGE_KEYS;
+    } else if (pipeline_kind == VKMESH_PIPE_SORT_FACE_KEYS) {
+        record_size = sizeof(vkmesh_face_key);
+        merge_pipeline = VKMESH_PIPE_MERGE_FACE_KEYS;
+    } else {
+        return 0;
+    }
+    if (record_count > SIZE_MAX / record_size || records->bytes < record_count * record_size) return 0;
+
+    uint32_t merge_passes = 0u;
+    for (size_t width = VKMESH_SORT_TILE_SIZE; width < record_count; width <<= 1u) {
+        ++merge_passes;
+    }
+
+    vkmesh_vk_buffer local_temporary;
+    memset(&local_temporary, 0, sizeof(local_temporary));
+    vkmesh_vk_buffer * temporary =
+        reusable_temporary != NULL ? reusable_temporary : &local_temporary;
+    int ok = 0;
+    if (merge_passes > 0u &&
+        !vk_buffer_ensure_capacity(vk, record_count * record_size, temporary)) goto cleanup;
+
+    /* Both sort pipelines keep the same descriptors for the entire batch.
+       Push parity chooses the source/destination without descriptor updates. */
     vkmesh_vk_buffer buffers[4];
     buffers[0] = *records;
-    buffers[1] = *dummy;
+    buffers[1] = merge_passes > 0u ? *temporary : *records;
     buffers[2] = *dummy;
     buffers[3] = *dummy;
     vkmesh_update_descriptor_set(vk, buffers);
-    if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
+    VkResult result = vkResetCommandBuffer(vk->command_buffer, 0);
+    if (!vkmesh_check_vk_result("vkResetCommandBuffer(sort)", result)) goto cleanup;
 
     VkCommandBufferBeginInfo begin;
     memset(&begin, 0, sizeof(begin));
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin);
+    if (!vkmesh_check_vk_result("vkBeginCommandBuffer(sort)", result)) goto cleanup;
+    vkmesh_profile_reset(vk, vk->command_buffer);
 
+    vkmesh_push push;
+    memset(&push, 0, sizeof(push));
+    push.n = (uint32_t) record_count;
+    push.aux1 = merge_passes & 1u;
+    uint32_t groups = (uint32_t) ((record_count + VKMESH_SORT_TILE_SIZE - 1u) / VKMESH_SORT_TILE_SIZE);
+    vkCmdBindDescriptorSets(
+        vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout,
+        0, 1, &vk->descriptor_sets[0], 0, NULL);
     vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
-    vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
+    vkCmdPushConstants(
+        vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, sizeof(push), &push);
+    vkmesh_pipeline_kind profile_pipelines[VKMESH_DISPATCH_BATCH_MAX];
+    uint32_t profile_dispatch_count = 0u;
+    profile_pipelines[profile_dispatch_count] = pipeline_kind;
+    vkmesh_profile_timestamp(
+        vk, vk->command_buffer, 2u * profile_dispatch_count, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+    vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+    vkmesh_profile_timestamp(
+        vk, vk->command_buffer, 2u * profile_dispatch_count + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    ++profile_dispatch_count;
+
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    uint32_t groups = (uint32_t) ((record_count + 255u) / 256u);
-    const uint32_t flush_every = vkmesh_resolve_sort_flush_passes();
-    uint32_t recorded = 0;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    if (merge_passes > 0u) {
+        vkCmdPipelineBarrier(
+            vk->command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[merge_pipeline]);
+    }
+
+    uint32_t source_is_temporary = merge_passes & 1u;
+    uint32_t pass_index = 0u;
+    for (size_t width = VKMESH_SORT_TILE_SIZE; width < record_count; width <<= 1u) {
+        memset(&push, 0, sizeof(push));
+        push.n = (uint32_t) record_count;
+        push.aux0 = (uint32_t) width;
+        push.aux1 = source_is_temporary;
+        vkCmdPushConstants(
+            vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(push), &push);
+        if (profile_dispatch_count >= VKMESH_DISPATCH_BATCH_MAX) {
+            (void) vkEndCommandBuffer(vk->command_buffer);
+            goto cleanup;
+        }
+        profile_pipelines[profile_dispatch_count] = merge_pipeline;
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * profile_dispatch_count, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        vkCmdDispatch(vk->command_buffer, groups, 1, 1);
+        vkmesh_profile_timestamp(
+            vk, vk->command_buffer, 2u * profile_dispatch_count + 1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        ++profile_dispatch_count;
+        source_is_temporary ^= 1u;
+        ++pass_index;
+        if (pass_index < merge_passes) {
+            vkCmdPipelineBarrier(
+                vk->command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &barrier, 0, NULL, 0, NULL);
+        }
+    }
+    if (source_is_temporary != 0u || pass_index != merge_passes) {
+        (void) vkEndCommandBuffer(vk->command_buffer);
+        goto cleanup;
+    }
+
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(
+        vk->command_buffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkEndCommandBuffer(sort)", result)) goto cleanup;
 
     VkSubmitInfo submit;
     memset(&submit, 0, sizeof(submit));
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
+    ok = vkmesh_submit_and_wait(vk, &submit);
+    if (ok) vkmesh_profile_collect(vk, profile_pipelines, profile_dispatch_count);
 
-    for (size_t k = 2u; k <= record_count; k <<= 1u) {
-        for (size_t j = k >> 1u; j > 0u; j >>= 1u) {
-            vkmesh_push push;
-            memset(&push, 0, sizeof(push));
-            push.n = (uint32_t) record_count;
-            push.aux0 = (uint32_t) k;
-            push.aux1 = (uint32_t) j;
-            vkCmdPushConstants(vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-            vkCmdDispatch(vk->command_buffer, groups, 1, 1);
-            vkCmdPipelineBarrier(
-                vk->command_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                0, 1, &barrier, 0, NULL, 0, NULL);
-            ++recorded;
-            if (flush_every == 0 || (recorded % flush_every) != 0) continue;
+cleanup:
+    vk_buffer_destroy(vk, &local_temporary);
+    return ok;
+}
 
-            /* Each pass depends on the previous one, so submitting here and
-               waiting preserves the ordering the barrier gave us. */
-            if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
-            if (!vkmesh_submit_and_wait(vk, &submit)) return 0;
-            if (vkResetCommandBuffer(vk->command_buffer, 0) != VK_SUCCESS) return 0;
-            if (vkBeginCommandBuffer(vk->command_buffer, &begin) != VK_SUCCESS) return 0;
-            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[pipeline_kind]);
-            vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &vk->descriptor_set, 0, NULL);
-        }
+#define VKMESH_SCAN_BLOCK_SIZE 256u
+#define VKMESH_SCAN_MAX_LEVELS 8u
+#define VKMESH_SCAN_COMMAND_MAX (2u * VKMESH_SCAN_MAX_LEVELS + 1u)
+
+/* Append an inclusive scan to an existing dispatch batch. Each upward pass
+   scans blocks locally; downward passes add the scanned parent sum. */
+static int vkmesh_append_scan_u32_inclusive(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * input,
+    vkmesh_vk_buffer * output,
+    uint32_t count,
+    uint32_t input_offset,
+    uint32_t output_offset,
+    vkmesh_vk_buffer * dummy,
+    vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS],
+    vkmesh_dispatch_command * commands,
+    uint32_t command_capacity,
+    uint32_t * command_count) {
+    if (vk == NULL || input == NULL || output == NULL || dummy == NULL || count == 0u ||
+        block_sums == NULL || commands == NULL || command_count == NULL ||
+        (uint64_t) input_offset + count > input->bytes / sizeof(uint32_t) ||
+        (uint64_t) output_offset + count > output->bytes / sizeof(uint32_t) ||
+        dummy->bytes < sizeof(uint32_t)) {
+        return 0;
     }
-    if (vkEndCommandBuffer(vk->command_buffer) != VK_SUCCESS) return 0;
-    return vkmesh_submit_and_wait(vk, &submit);
+
+    uint32_t block_sum_counts[VKMESH_SCAN_MAX_LEVELS];
+    memset(block_sum_counts, 0, sizeof(block_sum_counts));
+    uint32_t level_count = 0u;
+
+    vkmesh_vk_buffer * level_input = input;
+    vkmesh_vk_buffer * level_output = output;
+    uint32_t level_element_count = count;
+    uint32_t level_input_offset = input_offset;
+    uint32_t level_output_offset = output_offset;
+    for (;;) {
+        uint32_t groups = (level_element_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
+        vkmesh_vk_buffer * level_block_sums = dummy;
+        if (groups > 1u) {
+            if (level_count >= VKMESH_SCAN_MAX_LEVELS ||
+                !vk_buffer_ensure_capacity(
+                    vk, (size_t) groups * sizeof(uint32_t), &block_sums[level_count])) {
+                return 0;
+            }
+            block_sum_counts[level_count] = groups;
+            level_block_sums = &block_sums[level_count];
+        }
+
+        if (*command_count >= command_capacity) return 0;
+        vkmesh_dispatch_command * command = &commands[(*command_count)++];
+        memset(command, 0, sizeof(*command));
+        command->pipeline_kind = VKMESH_PIPE_BLOCK_SCAN_U32;
+        command->buffers[0] = *level_input;
+        command->buffers[1] = *level_output;
+        command->buffers[2] = *level_block_sums;
+        command->buffers[3] = *dummy;
+        command->push.n = level_element_count;
+        command->push.aux0 = level_input_offset;
+        command->push.aux1 = level_output_offset;
+        command->groups_x = groups;
+        if (groups == 1u) break;
+
+        level_element_count = groups;
+        level_input = &block_sums[level_count];
+        level_output = &block_sums[level_count];
+        level_input_offset = 0u;
+        level_output_offset = 0u;
+        ++level_count;
+    }
+
+    for (uint32_t depth = level_count; depth > 0u; --depth) {
+        vkmesh_vk_buffer * data = depth == 1u ? output : &block_sums[depth - 2u];
+        uint32_t data_count = depth == 1u ? count : block_sum_counts[depth - 2u];
+        if (*command_count >= command_capacity) return 0;
+        vkmesh_dispatch_command * command = &commands[(*command_count)++];
+        memset(command, 0, sizeof(*command));
+        command->pipeline_kind = VKMESH_PIPE_ADD_BLOCK_OFFSETS_U32;
+        command->buffers[0] = *data;
+        command->buffers[1] = block_sums[depth - 1u];
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = data_count;
+        command->push.aux0 = depth == 1u ? output_offset : 0u;
+        uint32_t groups = (data_count - 1u) / VKMESH_SCAN_BLOCK_SIZE + 1u;
+        command->groups_x = groups;
+    }
+    return 1;
+}
+
+/* Inclusive scan with a fixed output buffer and one submit. */
+static int vkmesh_scan_u32_inclusive(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * input,
+    vkmesh_vk_buffer * output,
+    uint32_t count,
+    vkmesh_vk_buffer * dummy) {
+    vkmesh_vk_buffer block_sums[VKMESH_SCAN_MAX_LEVELS];
+    vkmesh_dispatch_command commands[VKMESH_SCAN_COMMAND_MAX];
+    memset(block_sums, 0, sizeof(block_sums));
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    int ok = 0;
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            input,
+            output,
+            count,
+            0u,
+            0u,
+            dummy,
+            block_sums,
+            commands,
+            VKMESH_SCAN_COMMAND_MAX,
+            &command_count)) goto cleanup;
+    ok = vkmesh_dispatch_batch(vk, commands, command_count);
+
+cleanup:
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &block_sums[i]);
+    }
+    return ok;
+}
+
+#define VKMESH_RADIX_ITEMS_PER_GROUP 1024u
+#define VKMESH_RADIX_MIN_KEYS (1u << 18u)
+#define VKMESH_RADIX_MAX_KEYS (65535u * VKMESH_RADIX_ITEMS_PER_GROUP)
+
+static int vkmesh_radix_histogram_fits(
+    const vkmesh_vk * vk,
+    const vkmesh_vk_buffer * histogram,
+    size_t bytes,
+    size_t reserve_bytes) {
+    if (vk->workspace_budget_bytes == 0u || histogram->bytes >= bytes) return 1;
+    size_t live_without_histogram = vk->workspace_current_bytes;
+    if (histogram->allocation_bytes <= live_without_histogram) {
+        live_without_histogram -= histogram->allocation_bytes;
+    }
+    const size_t allocation_slack = 64u * 1024u;
+    if (bytes > SIZE_MAX - allocation_slack ||
+        bytes + allocation_slack > SIZE_MAX - reserve_bytes ||
+        live_without_histogram > vk->workspace_budget_bytes) return 0;
+    return bytes + allocation_slack + reserve_bytes <=
+        vk->workspace_budget_bytes - live_without_histogram;
+}
+
+static int vkmesh_sort_simplify_edge_keys_radix(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * records,
+    vkmesh_vk_buffer * temporary,
+    vkmesh_vk_buffer * histogram,
+    vkmesh_vk_buffer * dummy,
+    uint32_t record_count) {
+    const uint32_t block_count = record_count / VKMESH_RADIX_ITEMS_PER_GROUP +
+        (record_count % VKMESH_RADIX_ITEMS_PER_GROUP != 0u);
+    const uint32_t histogram_count = block_count * 256u;
+    const size_t key_bytes = (size_t) record_count * 2u * sizeof(uint32_t);
+    const size_t histogram_bytes =
+        ((size_t) histogram_count + 256u) * sizeof(uint32_t);
+    if (records->bytes < key_bytes || dummy->bytes < sizeof(uint32_t) ||
+        !vk_buffer_ensure_capacity(vk, key_bytes, temporary) ||
+        !vk_buffer_ensure_capacity(vk, histogram_bytes, histogram)) {
+        return 0;
+    }
+
+    vkmesh_dispatch_command commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    for (uint32_t pass = 0u; pass < 8u; ++pass) {
+        vkmesh_vk_buffer source = (pass & 1u) == 0u ? *records : *temporary;
+        vkmesh_vk_buffer destination = (pass & 1u) == 0u ? *temporary : *records;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        vkmesh_dispatch_command * command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_HISTOGRAM_SIMPLIFY_EDGE_KEYS;
+        command->buffers[0] = source;
+        command->buffers[1] = *histogram;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = record_count;
+        command->push.aux0 = pass;
+        command->push.aux1 = block_count;
+        command->groups_x = block_count;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_SCAN_SIMPLIFY_EDGE_HISTOGRAM;
+        command->buffers[0] = *histogram;
+        command->buffers[1] = *dummy;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = block_count;
+        command->groups_x = 256u;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_OFFSET_SIMPLIFY_EDGE_HISTOGRAM;
+        command->buffers[0] = *histogram;
+        command->buffers[1] = *dummy;
+        command->buffers[2] = *dummy;
+        command->buffers[3] = *dummy;
+        command->push.n = block_count;
+        command->groups_x = 1u;
+
+        if (command_count >= VKMESH_DISPATCH_BATCH_MAX) return 0;
+        command = &commands[command_count++];
+        command->pipeline_kind = VKMESH_PIPE_RADIX_SCATTER_SIMPLIFY_EDGE_KEYS;
+        command->buffers[0] = source;
+        command->buffers[1] = *histogram;
+        command->buffers[2] = destination;
+        command->buffers[3] = *dummy;
+        command->push.n = record_count;
+        command->push.aux0 = pass;
+        command->push.aux1 = block_count;
+        command->groups_x = block_count;
+    }
+    return vkmesh_dispatch_batch(vk, commands, command_count);
+}
+
+static int vkmesh_sort_simplify_edge_keys(
+    vkmesh_vk * vk,
+    vkmesh_vk_buffer * records,
+    vkmesh_vk_buffer * temporary,
+    vkmesh_vk_buffer * histogram,
+    vkmesh_vk_buffer * dummy,
+    uint32_t record_count,
+    size_t radix_reserve_bytes) {
+    const uint32_t block_count = record_count / VKMESH_RADIX_ITEMS_PER_GROUP +
+        (record_count % VKMESH_RADIX_ITEMS_PER_GROUP != 0u);
+    const size_t histogram_bytes =
+        ((size_t) block_count * 256u + 256u) * sizeof(uint32_t);
+    const size_t key_bytes = (size_t) record_count * 2u * sizeof(uint32_t);
+    const size_t temporary_growth = temporary != NULL &&
+        key_bytes > temporary->allocation_bytes ?
+        key_bytes - temporary->allocation_bytes : 0u;
+    if (radix_reserve_bytes > SIZE_MAX - temporary_growth) radix_reserve_bytes = SIZE_MAX;
+    else radix_reserve_bytes += temporary_growth;
+    if (histogram != NULL &&
+        record_count >= VKMESH_RADIX_MIN_KEYS && record_count <= VKMESH_RADIX_MAX_KEYS &&
+        vkmesh_radix_histogram_fits(
+            vk, histogram, histogram_bytes, radix_reserve_bytes)) {
+        return vkmesh_sort_simplify_edge_keys_radix(
+            vk, records, temporary, histogram, dummy, record_count);
+    }
+    return vkmesh_sort_records_vulkan(
+        vk,
+        records,
+        dummy,
+        record_count,
+        VKMESH_PIPE_SORT_SIMPLIFY_EDGE_KEYS,
+        temporary);
 }
 
 static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_out, int64_t * edge_count_out) {
@@ -1306,32 +1983,23 @@ static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_ou
     const size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
     const size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
     const size_t edge_count = (size_t) mesh->n_faces * 3u;
-    const size_t edge_sort_count = next_power_of_two_size(edge_count);
-    if (edge_sort_count == 0 || edge_sort_count > UINT32_MAX) goto cleanup;
-    const size_t edges_bytes = edge_sort_count * sizeof(vkmesh_edge);
-    if (!vk_buffer_create(vk, faces_bytes, &buffers[0]) ||
-        !vk_buffer_create(vk, vertices_bytes, &buffers[1]) ||
-        !vk_buffer_create(vk, edges_bytes, &buffers[2]) ||
-        !vk_buffer_create(vk, 4u * sizeof(uint32_t), &buffers[3])) {
+    if (edge_count > UINT32_MAX) goto cleanup;
+    const size_t edges_bytes = edge_count * sizeof(vkmesh_edge);
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &buffers[0]) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &buffers[1]) ||
+        !vk_buffer_create_uninitialized(vk, edges_bytes, &buffers[2]) ||
+        !vk_buffer_create_uninitialized(vk, 4u * sizeof(uint32_t), &buffers[3])) {
         goto cleanup;
     }
     memcpy(buffers[0].mapped, mesh->faces, faces_bytes);
     memcpy(buffers[1].mapped, mesh->vertices, vertices_bytes);
-    vkmesh_edge * mapped_edges = (vkmesh_edge *) buffers[2].mapped;
-    for (size_t i = edge_count; i < edge_sort_count; ++i) {
-        mapped_edges[i].min_v = UINT32_MAX;
-        mapped_edges[i].max_v = UINT32_MAX;
-        mapped_edges[i].a = UINT32_MAX;
-        mapped_edges[i].b = UINT32_MAX;
-        mapped_edges[i].face = UINT32_MAX;
-    }
-
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = (uint32_t) ((mesh->n_faces + 127) / 128);
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_EDGES, buffers, &push, groups)) goto cleanup;
-    if (!vkmesh_sort_records_vulkan(vk, &buffers[2], &buffers[3], edge_sort_count, VKMESH_PIPE_SORT_EDGES)) goto cleanup;
+    if (!vkmesh_sort_records_vulkan(
+            vk, &buffers[2], &buffers[3], edge_count, VKMESH_PIPE_SORT_EDGES, NULL)) goto cleanup;
 
     vkmesh_edge * edges = (vkmesh_edge *) malloc(edge_count * sizeof(vkmesh_edge));
     if (edges == NULL) goto cleanup;
@@ -1365,23 +2033,13 @@ static int expand_edges_device(
     }
 
     const size_t edge_count = (size_t) mesh->n_faces * 3u;
-    const size_t edge_sort_count = next_power_of_two_size(edge_count);
-    if (edge_sort_count == 0 || edge_sort_count > UINT32_MAX) return 0;
-    const size_t edges_bytes = edge_sort_count * sizeof(vkmesh_edge);
-    if (!vk_buffer_create(vk, edges_bytes, edges_buffer_out) ||
-        !vk_buffer_create(vk, 4u * sizeof(uint32_t), dummy_buffer_out)) {
+    if (edge_count > UINT32_MAX) return 0;
+    const size_t edges_bytes = edge_count * sizeof(vkmesh_edge);
+    if (!vk_buffer_create_uninitialized(vk, edges_bytes, edges_buffer_out) ||
+        !vk_buffer_create_uninitialized(vk, 4u * sizeof(uint32_t), dummy_buffer_out)) {
         vk_buffer_destroy(vk, edges_buffer_out);
         vk_buffer_destroy(vk, dummy_buffer_out);
         return 0;
-    }
-
-    vkmesh_edge * mapped_edges = (vkmesh_edge *) edges_buffer_out->mapped;
-    for (size_t i = edge_count; i < edge_sort_count; ++i) {
-        mapped_edges[i].min_v = UINT32_MAX;
-        mapped_edges[i].max_v = UINT32_MAX;
-        mapped_edges[i].a = UINT32_MAX;
-        mapped_edges[i].b = UINT32_MAX;
-        mapped_edges[i].face = UINT32_MAX;
     }
 
     vkmesh_vk_buffer buffers[4];
@@ -1394,13 +2052,97 @@ static int expand_edges_device(
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = (uint32_t) ((mesh->n_faces + 127) / 128);
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_EDGES, buffers, &push, groups) ||
-        !vkmesh_sort_records_vulkan(vk, edges_buffer_out, dummy_buffer_out, edge_sort_count, VKMESH_PIPE_SORT_EDGES)) {
+        !vkmesh_sort_records_vulkan(
+            vk, edges_buffer_out, dummy_buffer_out, edge_count, VKMESH_PIPE_SORT_EDGES, NULL)) {
         vk_buffer_destroy(vk, edges_buffer_out);
         vk_buffer_destroy(vk, dummy_buffer_out);
         return 0;
     }
     *edge_count_out = edge_count;
-    *edge_sort_count_out = edge_sort_count;
+    *edge_sort_count_out = edge_count;
+    return 1;
+}
+
+static int expand_simplify_edge_keys_device(
+    vkmesh_vk * vk,
+    const vkmesh_mesh * mesh,
+    vkmesh_vk_buffer * faces_buffer,
+    vkmesh_vk_buffer * vertices_buffer,
+    vkmesh_vk_buffer * edge_keys_buffer_out,
+    vkmesh_vk_buffer * reusable_temporary_out,
+    vkmesh_vk_buffer * radix_histogram,
+    size_t * edge_count_out) {
+    if (edge_count_out != NULL) *edge_count_out = 0;
+    if (vk == NULL || mesh == NULL || faces_buffer == NULL || vertices_buffer == NULL ||
+        edge_keys_buffer_out == NULL || edge_count_out == NULL ||
+        mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX / 3u) {
+        return 0;
+    }
+
+    const size_t edge_count = (size_t) mesh->n_faces * 3u;
+    const size_t edge_keys_bytes = edge_count * 2u * sizeof(uint32_t);
+    if (!vk_buffer_ensure_capacity(vk, edge_keys_bytes, edge_keys_buffer_out)) return 0;
+
+    /* The key expansion shader uses faces and the key output. Vertices also
+       provide a valid existing descriptor for its intentionally unused slots,
+       avoiding a separate four-byte dummy allocation. */
+    vkmesh_vk_buffer buffers[4];
+    buffers[0] = *faces_buffer;
+    buffers[1] = *vertices_buffer;
+    buffers[2] = *edge_keys_buffer_out;
+    buffers[3] = *vertices_buffer;
+    vkmesh_push push;
+    memset(&push, 0, sizeof(push));
+    push.n = (uint32_t) mesh->n_faces;
+    uint32_t groups = ((uint32_t) mesh->n_faces + 127u) / 128u;
+    /* The radix histogram is optional. Reserve a conservative upper bound for
+       the packed scratch, output vertices, and compaction scan buffers. */
+    const uint64_t packed_scratch_words =
+        (uint64_t) mesh->n_vertices * 12ull + (uint64_t) mesh->n_faces * 9ull + 3ull;
+    if (packed_scratch_words > SIZE_MAX / sizeof(uint32_t)) return 0;
+    const size_t packed_scratch_bytes =
+        (size_t) packed_scratch_words * sizeof(uint32_t);
+    const size_t packed_scratch_growth =
+        packed_scratch_bytes > edge_keys_buffer_out->allocation_bytes ?
+        packed_scratch_bytes - edge_keys_buffer_out->allocation_bytes : 0u;
+    const size_t output_vertices_bytes =
+        (size_t) mesh->n_vertices * 3u * sizeof(float);
+    size_t compact_scan_reserve = 0u;
+    uint64_t scan_count = (uint64_t) mesh->n_faces > (uint64_t) mesh->n_vertices ?
+        (uint64_t) mesh->n_faces : (uint64_t) mesh->n_vertices;
+    while (scan_count > VKMESH_SCAN_BLOCK_SIZE) {
+        scan_count = (scan_count + VKMESH_SCAN_BLOCK_SIZE - 1u) / VKMESH_SCAN_BLOCK_SIZE;
+        const size_t level_bytes = (size_t) scan_count * sizeof(uint32_t) + 64u * 1024u;
+        if (compact_scan_reserve > SIZE_MAX - level_bytes) {
+            compact_scan_reserve = SIZE_MAX;
+            break;
+        }
+        compact_scan_reserve += level_bytes;
+    }
+    size_t radix_reserve_bytes = packed_scratch_growth;
+    if (radix_reserve_bytes > SIZE_MAX - output_vertices_bytes) {
+        radix_reserve_bytes = SIZE_MAX;
+    } else {
+        radix_reserve_bytes += output_vertices_bytes;
+    }
+    if (radix_reserve_bytes > SIZE_MAX - compact_scan_reserve) {
+        radix_reserve_bytes = SIZE_MAX;
+    } else {
+        radix_reserve_bytes += compact_scan_reserve;
+    }
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_EXPAND_SIMPLIFY_EDGE_KEYS, buffers, &push, groups) ||
+        !vkmesh_sort_simplify_edge_keys(
+            vk,
+            edge_keys_buffer_out,
+            reusable_temporary_out,
+            radix_histogram,
+            vertices_buffer,
+            (uint32_t) edge_count,
+            radix_reserve_bytes)) {
+        vk_buffer_destroy(vk, edge_keys_buffer_out);
+        return 0;
+    }
+    *edge_count_out = edge_count;
     return 1;
 }
 
@@ -1462,6 +2204,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
     if (referenced == NULL || map == NULL) {
         free(referenced);
         free(map);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
         return 0;
     }
     for (int64_t i = 0; i < mesh->n_faces; ++i) {
@@ -1483,6 +2226,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
         if (new_vertices == NULL) {
             free(referenced);
             free(map);
+            vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
             return 0;
         }
         if (mesh->has_uvs && mesh->uvs != NULL) {
@@ -1491,6 +2235,7 @@ static int mesh_remove_unreferenced_vertices(vkmesh_mesh * mesh) {
                 free(new_vertices);
                 free(referenced);
                 free(map);
+                vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
                 return 0;
             }
         }
@@ -1529,7 +2274,10 @@ static int mesh_remove_faces_by_mask(vkmesh_mesh * mesh, const uint8_t * keep_ma
     int32_t * new_faces = NULL;
     if (keep_count > 0) {
         new_faces = (int32_t *) malloc((size_t) keep_count * 3u * sizeof(int32_t));
-        if (new_faces == NULL) return 0;
+        if (new_faces == NULL) {
+            vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+            return 0;
+        }
     }
     int64_t dst = 0;
     for (int64_t i = 0; i < mesh->n_faces; ++i) {
@@ -1566,8 +2314,8 @@ static int vkmesh_device_mesh_upload(vkmesh_vk * vk, const vkmesh_mesh * mesh, v
     dm->n_faces = (uint32_t) mesh->n_faces;
     const size_t vertices_bytes = (size_t) dm->n_vertices * 3u * sizeof(float);
     const size_t faces_bytes = (size_t) dm->n_faces * 3u * sizeof(int32_t);
-    if (!vk_buffer_create(vk, vertices_bytes, &dm->vertices) ||
-        !vk_buffer_create(vk, faces_bytes, &dm->faces)) {
+    if (!vk_buffer_create_uninitialized(vk, vertices_bytes, &dm->vertices) ||
+        !vk_buffer_create_uninitialized(vk, faces_bytes, &dm->faces)) {
         vkmesh_device_mesh_destroy(dm);
         return 0;
     }
@@ -1581,15 +2329,75 @@ static int vkmesh_device_mesh_download(vkmesh_device_mesh * dm, vkmesh_mesh * me
         dm->n_vertices == 0u || dm->n_faces == 0u) {
         return 0;
     }
-    float * vertices = (float *) malloc((size_t) dm->n_vertices * 3u * sizeof(float));
-    int32_t * faces = (int32_t *) malloc((size_t) dm->n_faces * 3u * sizeof(int32_t));
+    if ((size_t) dm->n_vertices > SIZE_MAX / (3u * sizeof(float)) ||
+        (size_t) dm->n_faces > SIZE_MAX / (3u * sizeof(int32_t))) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    const size_t vertices_bytes = (size_t) dm->n_vertices * 3u * sizeof(float);
+    const size_t faces_bytes = (size_t) dm->n_faces * 3u * sizeof(int32_t);
+    float * vertices = (float *) malloc(vertices_bytes);
+    int32_t * faces = (int32_t *) malloc(faces_bytes);
     if (vertices == NULL || faces == NULL) {
         free(vertices);
         free(faces);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
         return 0;
     }
-    memcpy(vertices, dm->vertices.mapped, (size_t) dm->n_vertices * 3u * sizeof(float));
-    memcpy(faces, dm->faces.mapped, (size_t) dm->n_faces * 3u * sizeof(int32_t));
+
+    vkmesh_vk * vk = dm->vk;
+    vkmesh_vk_buffer readback;
+    memset(&readback, 0, sizeof(readback));
+    const size_t available = vk->workspace_budget_bytes > vk->workspace_current_bytes ?
+        vk->workspace_budget_bytes - vk->workspace_current_bytes : 0u;
+    const size_t readback_bytes = vertices_bytes <= SIZE_MAX - faces_bytes ?
+        vertices_bytes + faces_bytes : 0u;
+    const uint32_t vertex_words = dm->n_vertices <= UINT32_MAX / 3u ?
+        dm->n_vertices * 3u : 0u;
+    const uint32_t face_words = dm->n_faces <= UINT32_MAX / 3u ?
+        dm->n_faces * 3u : 0u;
+    const int use_cached_readback =
+        readback_bytes > 0u && vertex_words > 0u && face_words > 0u &&
+        vertex_words <= UINT32_MAX - face_words &&
+        (vk->workspace_budget_bytes == 0u || readback_bytes <= available);
+    if (use_cached_readback) {
+        const vkmesh_error_kind previous_error = g_vkmesh_last_error;
+        if (!vk_buffer_create_host_cached(vk, readback_bytes, &readback)) {
+            if (previous_error != VKMESH_ERROR_NONE ||
+                g_vkmesh_last_error != VKMESH_ERROR_OUT_OF_MEMORY) {
+                goto fail;
+            }
+            /* Cached staging is optional. Preserve the old direct-read path if
+               its allocation does not fit a tight workspace or memory heap. */
+            g_vkmesh_last_error = VKMESH_ERROR_NONE;
+        }
+    }
+    if (readback.buffer != VK_NULL_HANDLE) {
+        vkmesh_dispatch_command commands[2];
+        memset(commands, 0, sizeof(commands));
+        commands[0].pipeline_kind = VKMESH_PIPE_COPY_U32;
+        commands[0].buffers[0] = dm->vertices;
+        commands[0].buffers[1] = readback;
+        commands[0].buffers[2] = readback;
+        commands[0].buffers[3] = readback;
+        commands[0].push.n = vertex_words;
+        commands[0].groups_x = (vertex_words - 1u) / 128u + 1u;
+        commands[1].pipeline_kind = VKMESH_PIPE_COPY_U32;
+        commands[1].buffers[0] = dm->faces;
+        commands[1].buffers[1] = readback;
+        commands[1].buffers[2] = readback;
+        commands[1].buffers[3] = readback;
+        commands[1].push.n = face_words;
+        commands[1].push.aux1 = vertex_words;
+        commands[1].groups_x = (face_words - 1u) / 128u + 1u;
+        if (!vkmesh_dispatch_batch(vk, commands, 2u)) goto fail;
+        memcpy(vertices, readback.mapped, vertices_bytes);
+        memcpy(faces, (const uint8_t *) readback.mapped + vertices_bytes, faces_bytes);
+    } else {
+        memcpy(vertices, dm->vertices.mapped, vertices_bytes);
+        memcpy(faces, dm->faces.mapped, faces_bytes);
+    }
+    vk_buffer_destroy(vk, &readback);
     free(mesh->vertices);
     free(mesh->uvs);
     free(mesh->faces);
@@ -1602,12 +2410,22 @@ static int vkmesh_device_mesh_download(vkmesh_device_mesh * dm, vkmesh_mesh * me
     mesh->face_capacity = mesh->n_faces;
     mesh->has_uvs = 0;
     return 1;
+
+fail:
+    vk_buffer_destroy(vk, &readback);
+    free(vertices);
+    free(faces);
+    return 0;
 }
 
-static int compact_device_mesh_from_flags(
+static int compact_device_mesh_from_flags_reuse(
     vkmesh_device_mesh * dm,
     vkmesh_vk_buffer * flags_buffer,
     uint32_t flags_offset,
+    vkmesh_vk_buffer * reusable_out_faces,
+    vkmesh_vk_buffer * reusable_out_vertices,
+    vkmesh_vk_buffer * reusable_vertex_map,
+    vkmesh_vk_buffer * reusable_counter,
     uint32_t * removed_faces) {
     if (removed_faces != NULL) *removed_faces = 0u;
     if (dm == NULL || dm->vk == NULL || flags_buffer == NULL ||
@@ -1615,32 +2433,38 @@ static int compact_device_mesh_from_flags(
         return 0;
     }
     vkmesh_vk * vk = dm->vk;
-    vkmesh_vk_buffer out_faces;
-    vkmesh_vk_buffer counter;
-    vkmesh_vk_buffer vertex_map;
-    vkmesh_vk_buffer out_vertices;
-    memset(&out_faces, 0, sizeof(out_faces));
-    memset(&counter, 0, sizeof(counter));
-    memset(&vertex_map, 0, sizeof(vertex_map));
-    memset(&out_vertices, 0, sizeof(out_vertices));
+    vkmesh_vk_buffer local_out_faces;
+    vkmesh_vk_buffer local_out_vertices;
+    vkmesh_vk_buffer local_vertex_map;
+    vkmesh_vk_buffer local_counter;
+    memset(&local_out_faces, 0, sizeof(local_out_faces));
+    memset(&local_out_vertices, 0, sizeof(local_out_vertices));
+    memset(&local_vertex_map, 0, sizeof(local_vertex_map));
+    memset(&local_counter, 0, sizeof(local_counter));
+
+    vkmesh_vk_buffer * out_faces =
+        reusable_out_faces != NULL ? reusable_out_faces : &local_out_faces;
+    vkmesh_vk_buffer * out_vertices =
+        reusable_out_vertices != NULL ? reusable_out_vertices : &local_out_vertices;
+    vkmesh_vk_buffer * vertex_map =
+        reusable_vertex_map != NULL ? reusable_vertex_map : &local_vertex_map;
+    vkmesh_vk_buffer * counter =
+        reusable_counter != NULL ? reusable_counter : &local_counter;
 
     const size_t faces_bytes = (size_t) dm->n_faces * 3u * sizeof(int32_t);
     const size_t vertex_map_bytes = (size_t) dm->n_vertices * sizeof(int32_t);
-    const size_t vertices_bytes = (size_t) dm->n_vertices * 3u * sizeof(float);
     int ok = 0;
-    if (!vk_buffer_create(vk, faces_bytes, &out_faces) ||
-        !vk_buffer_create(vk, sizeof(uint32_t), &counter) ||
-        !vk_buffer_create(vk, vertex_map_bytes, &vertex_map) ||
-        !vk_buffer_create(vk, vertices_bytes, &out_vertices)) {
-        goto cleanup;
-    }
-    memset(vertex_map.mapped, 0xff, vertex_map_bytes);
+    if (!vk_buffer_ensure_capacity(vk, faces_bytes, out_faces) ||
+        !vk_buffer_ensure_capacity(vk, vertex_map_bytes, vertex_map) ||
+        !vk_buffer_ensure_capacity(vk, sizeof(uint32_t), counter)) goto cleanup;
+    ((uint32_t *) counter->mapped)[0] = 0u;
+    memset(vertex_map->mapped, 0xff, vertex_map_bytes);
 
     vkmesh_vk_buffer compact_buffers[4];
     compact_buffers[0] = dm->faces;
     compact_buffers[1] = *flags_buffer;
-    compact_buffers[2] = out_faces;
-    compact_buffers[3] = counter;
+    compact_buffers[2] = *out_faces;
+    compact_buffers[3] = *counter;
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = dm->n_faces;
@@ -1648,58 +2472,97 @@ static int compact_device_mesh_from_flags(
     uint32_t groups = (dm->n_faces + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_FACES, compact_buffers, &push, groups)) goto cleanup;
 
-    uint32_t keep_count = ((const uint32_t *) counter.mapped)[0];
-    if (keep_count == 0u || keep_count > dm->n_faces) goto cleanup;
-    if (removed_faces != NULL) *removed_faces = dm->n_faces - keep_count;
+    uint32_t keep_count = ((const uint32_t *) counter->mapped)[0];
+    if (keep_count == 0u || keep_count > dm->n_faces || keep_count > UINT32_MAX / 3u) goto cleanup;
+    const uint32_t removed_count = dm->n_faces - keep_count;
 
-    ((uint32_t *) counter.mapped)[0] = 0u;
+    ((uint32_t *) counter->mapped)[0] = 0u;
     vkmesh_vk_buffer assign_buffers[4];
-    assign_buffers[0] = out_faces;
-    assign_buffers[1] = vertex_map;
-    assign_buffers[2] = counter;
-    assign_buffers[3] = counter;
+    assign_buffers[0] = *out_faces;
+    assign_buffers[1] = *vertex_map;
+    assign_buffers[2] = *counter;
+    assign_buffers[3] = *counter;
     memset(&push, 0, sizeof(push));
     push.n = keep_count * 3u;
     groups = (push.n + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_ASSIGN_VERTEX_MAP, assign_buffers, &push, groups)) goto cleanup;
-    uint32_t vertex_count = ((const uint32_t *) counter.mapped)[0];
+    uint32_t vertex_count = ((const uint32_t *) counter->mapped)[0];
     if (vertex_count == 0u || vertex_count > dm->n_vertices) goto cleanup;
+    if (removed_count == 0u && vertex_count == dm->n_vertices) {
+        /* Nothing changed. Keep the original buffers and their stable order. */
+        ok = 1;
+        goto cleanup;
+    }
+    const size_t vertices_bytes = (size_t) vertex_count * 3u * sizeof(float);
+    if (!vk_buffer_ensure_capacity(vk, vertices_bytes, out_vertices)) goto cleanup;
+
+    vkmesh_dispatch_command commands[2];
+    memset(commands, 0, sizeof(commands));
 
     vkmesh_vk_buffer remap_buffers[4];
-    remap_buffers[0] = out_faces;
-    remap_buffers[1] = vertex_map;
-    remap_buffers[2] = counter;
-    remap_buffers[3] = counter;
+    remap_buffers[0] = *out_faces;
+    remap_buffers[1] = *vertex_map;
+    remap_buffers[2] = *counter;
+    remap_buffers[3] = *counter;
     memset(&push, 0, sizeof(push));
     push.n = keep_count * 3u;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_REMAP_FACES, remap_buffers, &push, groups)) goto cleanup;
+    commands[0].pipeline_kind = VKMESH_PIPE_REMAP_FACES;
+    memcpy(commands[0].buffers, remap_buffers, sizeof(remap_buffers));
+    commands[0].push = push;
+    commands[0].groups_x = groups;
 
     vkmesh_vk_buffer vertex_buffers[4];
     vertex_buffers[0] = dm->vertices;
-    vertex_buffers[1] = vertex_map;
-    vertex_buffers[2] = out_vertices;
-    vertex_buffers[3] = counter;
+    vertex_buffers[1] = *vertex_map;
+    vertex_buffers[2] = *out_vertices;
+    vertex_buffers[3] = *counter;
     memset(&push, 0, sizeof(push));
     push.n = dm->n_vertices;
     groups = (push.n + 127u) / 128u;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_VERTICES, vertex_buffers, &push, groups)) goto cleanup;
+    commands[1].pipeline_kind = VKMESH_PIPE_COMPACT_VERTICES;
+    memcpy(commands[1].buffers, vertex_buffers, sizeof(vertex_buffers));
+    commands[1].push = push;
+    commands[1].groups_x = groups;
+    if (!vkmesh_dispatch_batch(vk, commands, 2u)) goto cleanup;
 
-    vk_buffer_destroy(vk, &dm->faces);
-    vk_buffer_destroy(vk, &dm->vertices);
-    dm->faces = out_faces;
-    dm->vertices = out_vertices;
-    memset(&out_faces, 0, sizeof(out_faces));
-    memset(&out_vertices, 0, sizeof(out_vertices));
+    if (reusable_out_faces != NULL) {
+        vkmesh_vk_buffer previous_faces = dm->faces;
+        dm->faces = *out_faces;
+        *out_faces = previous_faces;
+    } else {
+        vk_buffer_destroy(vk, &dm->faces);
+        dm->faces = *out_faces;
+        memset(out_faces, 0, sizeof(*out_faces));
+    }
+    if (reusable_out_vertices != NULL) {
+        vkmesh_vk_buffer previous_vertices = dm->vertices;
+        dm->vertices = *out_vertices;
+        *out_vertices = previous_vertices;
+    } else {
+        vk_buffer_destroy(vk, &dm->vertices);
+        dm->vertices = *out_vertices;
+        memset(out_vertices, 0, sizeof(*out_vertices));
+    }
     dm->n_faces = keep_count;
     dm->n_vertices = vertex_count;
+    if (removed_faces != NULL) *removed_faces = removed_count;
     ok = 1;
 
 cleanup:
-    vk_buffer_destroy(vk, &out_faces);
-    vk_buffer_destroy(vk, &counter);
-    vk_buffer_destroy(vk, &vertex_map);
-    vk_buffer_destroy(vk, &out_vertices);
+    vk_buffer_destroy(vk, &local_out_faces);
+    vk_buffer_destroy(vk, &local_out_vertices);
+    vk_buffer_destroy(vk, &local_vertex_map);
+    vk_buffer_destroy(vk, &local_counter);
     return ok;
+}
+
+static int compact_device_mesh_from_flags(
+    vkmesh_device_mesh * dm,
+    vkmesh_vk_buffer * flags_buffer,
+    uint32_t flags_offset,
+    uint32_t * removed_faces) {
+    return compact_device_mesh_from_flags_reuse(
+        dm, flags_buffer, flags_offset, NULL, NULL, NULL, NULL, removed_faces);
 }
 
 static int compact_mesh_from_device_flags(
@@ -1734,10 +2597,10 @@ static int compact_mesh_from_device_flags(
     const size_t vertex_map_bytes = (size_t) mesh->n_vertices * sizeof(int32_t);
     const size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
     int ok = 0;
-    if (!vk_buffer_create(vk, faces_bytes, &out_faces) ||
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &out_faces) ||
         !vk_buffer_create(vk, sizeof(uint32_t), &counter) ||
-        !vk_buffer_create(vk, vertex_map_bytes, &vertex_map) ||
-        !vk_buffer_create(vk, vertices_bytes, &out_vertices)) {
+        !vk_buffer_create_uninitialized(vk, vertex_map_bytes, &vertex_map) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &out_vertices)) {
         goto cleanup;
     }
     memset(vertex_map.mapped, 0xff, vertex_map_bytes);
@@ -1901,21 +2764,12 @@ static int vkmesh_device_remove_duplicate_faces(vkmesh_device_mesh * dm, uint32_
     memset(&flags, 0, sizeof(flags));
     memset(&dummy, 0, sizeof(dummy));
     int ok = 0;
-    size_t sort_count = next_power_of_two_size((size_t) dm->n_faces);
-    if (sort_count == 0 || sort_count > UINT32_MAX) goto cleanup;
+    size_t sort_count = (size_t) dm->n_faces;
     if (!vk_buffer_create(vk, sort_count * sizeof(vkmesh_face_key), &keys) ||
         !vk_buffer_create(vk, (size_t) dm->n_faces * sizeof(uint32_t), &flags) ||
         !vk_buffer_create(vk, 4u * sizeof(uint32_t), &dummy)) {
         goto cleanup;
     }
-    vkmesh_face_key * mapped = (vkmesh_face_key *) keys.mapped;
-    for (size_t i = (size_t) dm->n_faces; i < sort_count; ++i) {
-        mapped[i].v0 = -1;
-        mapped[i].v1 = -1;
-        mapped[i].v2 = -1;
-        mapped[i].face = -1;
-    }
-
     vkmesh_vk_buffer key_buffers[4];
     key_buffers[0] = dm->faces;
     key_buffers[1] = dummy;
@@ -1926,7 +2780,8 @@ static int vkmesh_device_remove_duplicate_faces(vkmesh_device_mesh * dm, uint32_
     push.n = dm->n_faces;
     uint32_t groups = (dm->n_faces + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_FACE_KEYS, key_buffers, &push, groups)) goto cleanup;
-    if (!vkmesh_sort_records_vulkan(vk, &keys, &dummy, sort_count, VKMESH_PIPE_SORT_FACE_KEYS)) goto cleanup;
+    if (!vkmesh_sort_records_vulkan(
+            vk, &keys, &dummy, sort_count, VKMESH_PIPE_SORT_FACE_KEYS, NULL)) goto cleanup;
 
     vkmesh_vk_buffer mark_buffers[4];
     mark_buffers[0] = keys;
@@ -2023,6 +2878,69 @@ cleanup:
     return ok;
 }
 
+static int vkmesh_mark_components_by_area_host(
+    const vkmesh_vk_buffer * parents,
+    const vkmesh_vk_buffer * face_area_bits,
+    vkmesh_vk_buffer * keep_flags,
+    uint32_t face_count,
+    float min_area) {
+    if (parents == NULL || face_area_bits == NULL || keep_flags == NULL ||
+        parents->mapped == NULL || face_area_bits->mapped == NULL || keep_flags->mapped == NULL ||
+        face_count == 0u ||
+        parents->bytes < (size_t) face_count * sizeof(uint32_t) ||
+        face_area_bits->bytes < (size_t) face_count * sizeof(uint32_t) ||
+        keep_flags->bytes < (size_t) face_count * sizeof(uint32_t)) {
+        return 0;
+    }
+
+    double * component_area = (double *) calloc((size_t) face_count, sizeof(*component_area));
+    uint32_t * host_words =
+        (uint32_t *) malloc((size_t) face_count * 2u * sizeof(*host_words));
+    if (component_area == NULL || host_words == NULL) {
+        free(component_area);
+        free(host_words);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    const size_t words_bytes = (size_t) face_count * sizeof(*host_words);
+    memcpy(host_words, parents->mapped, words_bytes);
+    memcpy(host_words + face_count, face_area_bits->mapped, words_bytes);
+    const uint32_t * parent_data = host_words;
+    const uint32_t * area_data = host_words + face_count;
+    int ok = 1;
+    for (uint32_t face = 0u; face < face_count; ++face) {
+        const uint32_t root = parent_data[face];
+        float face_area = 0.0f;
+        memcpy(&face_area, &area_data[face], sizeof(face_area));
+        if (root >= face_count || !isfinite(face_area) || face_area < 0.0f) {
+            ok = 0;
+            break;
+        }
+        component_area[root] += (double) face_area;
+    }
+    if (ok) {
+        uint32_t * keep_data = host_words + face_count;
+        uint32_t kept_faces = 0u;
+        for (uint32_t face = 0u; face < face_count; ++face) {
+            keep_data[face] = component_area[parent_data[face]] >= (double) min_area ? 1u : 0u;
+            kept_faces += keep_data[face];
+        }
+        if (kept_faces == 0u) {
+            fprintf(stderr,
+                "vkmesh: all connected components are below min_area=%.9g faces=%u\n",
+                min_area,
+                face_count);
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            ok = 0;
+        } else {
+            memcpy(keep_flags->mapped, keep_data, words_bytes);
+        }
+    }
+    free(component_area);
+    free(host_words);
+    return ok;
+}
+
 static int vkmesh_device_remove_small_connected_components(
     vkmesh_device_mesh * dm,
     float min_area,
@@ -2040,25 +2958,25 @@ static int vkmesh_device_remove_small_connected_components(
     vkmesh_vk_buffer parents;
     vkmesh_vk_buffer changed;
     vkmesh_vk_buffer area_bits;
-    vkmesh_vk_buffer keep_flags;
+    vkmesh_vk_buffer parent_readback;
     memset(&edges_buffer, 0, sizeof(edges_buffer));
     memset(&edge_dummy, 0, sizeof(edge_dummy));
     memset(&parents, 0, sizeof(parents));
     memset(&changed, 0, sizeof(changed));
     memset(&area_bits, 0, sizeof(area_bits));
-    memset(&keep_flags, 0, sizeof(keep_flags));
+    memset(&parent_readback, 0, sizeof(parent_readback));
 
     const size_t parents_bytes = (size_t) dm->n_faces * sizeof(uint32_t);
     size_t edge_count = 0;
     size_t edge_sort_count = 0;
     int ok = 0;
-    if (!vk_buffer_create(vk, parents_bytes, &parents) ||
-        !vk_buffer_create(vk, sizeof(uint32_t), &changed) ||
-        !vk_buffer_create(vk, parents_bytes, &area_bits) ||
-        !vk_buffer_create(vk, parents_bytes, &keep_flags)) {
+    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &edge_count, &edge_sort_count)) {
         goto cleanup;
     }
-    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &edge_count, &edge_sort_count)) {
+    if (!vk_buffer_create_uninitialized(vk, parents_bytes, &parents) ||
+        !vk_buffer_create(vk, sizeof(uint32_t), &changed) ||
+        !vk_buffer_create_host_cached(vk, parents_bytes, &area_bits) ||
+        !vk_buffer_create_host_cached(vk, parents_bytes, &parent_readback)) {
         goto cleanup;
     }
 
@@ -2085,7 +3003,7 @@ static int vkmesh_device_remove_small_connected_components(
     compress_buffers[3] = changed;
     uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
     int converged = 0;
-    for (int iter = 0; iter < 32; ++iter) {
+    for (int iter = 0; iter < VKMESH_COMPONENT_MAX_UNION_PASSES; ++iter) {
         ((uint32_t *) changed.mapped)[0] = 0u;
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
@@ -2100,7 +3018,15 @@ static int vkmesh_device_remove_small_connected_components(
     }
     if (!converged) goto cleanup;
 
-    memset(area_bits.mapped, 0, parents_bytes);
+    vkmesh_vk_buffer copy_buffers[4];
+    copy_buffers[0] = parents;
+    copy_buffers[1] = parent_readback;
+    copy_buffers[2] = changed;
+    copy_buffers[3] = changed;
+    memset(&push, 0, sizeof(push));
+    push.n = dm->n_faces;
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, face_groups)) goto cleanup;
+
     vkmesh_vk_buffer area_buffers[4];
     area_buffers[0] = dm->faces;
     area_buffers[1] = dm->vertices;
@@ -2110,16 +3036,15 @@ static int vkmesh_device_remove_small_connected_components(
     push.n = dm->n_faces;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPONENT_AREA, area_buffers, &push, face_groups)) goto cleanup;
 
-    vkmesh_vk_buffer mark_buffers[4];
-    mark_buffers[0] = parents;
-    mark_buffers[1] = area_bits;
-    mark_buffers[2] = keep_flags;
-    mark_buffers[3] = changed;
-    memset(&push, 0, sizeof(push));
-    push.n = dm->n_faces;
-    push.eps = min_area;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_MARK_COMPONENT_KEEP, mark_buffers, &push, face_groups)) goto cleanup;
-    if (!compact_device_mesh_from_flags(dm, &keep_flags, 0u, removed_faces)) goto cleanup;
+    if (!vkmesh_mark_components_by_area_host(
+            &parent_readback, &area_bits, &area_bits, dm->n_faces, min_area)) goto cleanup;
+
+    vk_buffer_destroy(vk, &edges_buffer);
+    vk_buffer_destroy(vk, &edge_dummy);
+    vk_buffer_destroy(vk, &parents);
+    vk_buffer_destroy(vk, &changed);
+    vk_buffer_destroy(vk, &parent_readback);
+    if (!compact_device_mesh_from_flags(dm, &area_bits, 0u, removed_faces)) goto cleanup;
     ok = 1;
 
 cleanup:
@@ -2128,7 +3053,7 @@ cleanup:
     vk_buffer_destroy(vk, &parents);
     vk_buffer_destroy(vk, &changed);
     vk_buffer_destroy(vk, &area_bits);
-    vk_buffer_destroy(vk, &keep_flags);
+    vk_buffer_destroy(vk, &parent_readback);
     return ok;
 }
 
@@ -2434,8 +3359,7 @@ static int compute_duplicate_compacted_mesh_vulkan(
     vkmesh_vk_buffer buffers[4];
     memset(buffers, 0, sizeof(buffers));
     int ok = 0;
-    size_t sort_count = next_power_of_two_size((size_t) mesh->n_faces);
-    if (sort_count == 0 || sort_count > UINT32_MAX) goto cleanup;
+    size_t sort_count = (size_t) mesh->n_faces;
     size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
     size_t vertices_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
     size_t keys_bytes = sort_count * sizeof(vkmesh_face_key);
@@ -2448,20 +3372,13 @@ static int compute_duplicate_compacted_mesh_vulkan(
     }
     memcpy(buffers[0].mapped, mesh->faces, faces_bytes);
     memcpy(buffers[1].mapped, mesh->vertices, vertices_bytes);
-    vkmesh_face_key * mapped = (vkmesh_face_key *) buffers[2].mapped;
-    for (size_t i = (size_t) mesh->n_faces; i < sort_count; ++i) {
-        mapped[i].v0 = -1;
-        mapped[i].v1 = -1;
-        mapped[i].v2 = -1;
-        mapped[i].face = -1;
-    }
-
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) mesh->n_faces;
     uint32_t groups = (uint32_t) ((mesh->n_faces + 127) / 128);
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_FACE_KEYS, buffers, &push, groups)) goto cleanup;
-    if (!vkmesh_sort_records_vulkan(vk, &buffers[2], &buffers[1], sort_count, VKMESH_PIPE_SORT_FACE_KEYS)) goto cleanup;
+    if (!vkmesh_sort_records_vulkan(
+            vk, &buffers[2], &buffers[1], sort_count, VKMESH_PIPE_SORT_FACE_KEYS, NULL)) goto cleanup;
 
     vkmesh_vk_buffer mark_buffers[4];
     mark_buffers[0] = buffers[2];
@@ -2567,6 +3484,45 @@ cleanup:
     return ok;
 }
 
+static int vkmesh_remove_degenerate_faces_cpu(
+    vkmesh_mesh * mesh,
+    float abs_thresh,
+    float rel_thresh,
+    int * removed_faces) {
+    if (removed_faces != NULL) *removed_faces = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_vertices <= 0) return 0;
+    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
+    if (keep == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    int64_t keep_count = 0;
+    for (int64_t face = 0; face < mesh->n_faces; ++face) {
+        const int32_t * f = mesh->faces + (size_t) face * 3u;
+        int valid = f[0] != f[1] && f[1] != f[2] && f[2] != f[0];
+        if (valid) {
+            const double max_edge = fmax(
+                edge_length(mesh, f[0], f[1]),
+                fmax(edge_length(mesh, f[1], f[2]), edge_length(mesh, f[2], f[0])));
+            const double threshold = fmax(
+                (double) abs_thresh,
+                (double) rel_thresh * max_edge * max_edge);
+            valid = face_area(mesh, face) >= threshold;
+        }
+        keep[face] = valid ? 1u : 0u;
+        keep_count += valid;
+    }
+    if (keep_count == 0) {
+        fprintf(stderr, "vkmesh: degenerate cleanup rejected every face\n");
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        free(keep);
+        return 0;
+    }
+    const int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
+    free(keep);
+    return ok;
+}
+
 static int vkmesh_remove_degenerate_faces(vkmesh_mesh * mesh, float abs_thresh, float rel_thresh, int * removed_faces) {
     *removed_faces = 0;
     float * new_vertices = NULL;
@@ -2589,6 +3545,51 @@ static int vkmesh_remove_degenerate_faces(vkmesh_mesh * mesh, float abs_thresh, 
     mesh->vertex_capacity = new_vertex_count;
     mesh->face_capacity = keep_count;
     mesh->has_uvs = 0;
+    return 1;
+}
+
+static int compare_vkmesh_edges(const void * lhs_ptr, const void * rhs_ptr) {
+    const vkmesh_edge * lhs = (const vkmesh_edge *) lhs_ptr;
+    const vkmesh_edge * rhs = (const vkmesh_edge *) rhs_ptr;
+    if (lhs->min_v != rhs->min_v) return lhs->min_v < rhs->min_v ? -1 : 1;
+    if (lhs->max_v != rhs->max_v) return lhs->max_v < rhs->max_v ? -1 : 1;
+    if (lhs->payload != rhs->payload) return lhs->payload < rhs->payload ? -1 : 1;
+    return 0;
+}
+
+static int get_sorted_edges_cpu(
+    const vkmesh_mesh * mesh,
+    vkmesh_edge ** edges_out,
+    int64_t * edge_count_out) {
+    if (edges_out == NULL || edge_count_out == NULL) return 0;
+    *edges_out = NULL;
+    *edge_count_out = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_faces > INT32_MAX) return 0;
+    const size_t edge_count = (size_t) mesh->n_faces * 3u;
+    if (edge_count > SIZE_MAX / sizeof(vkmesh_edge)) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    vkmesh_edge * edges = (vkmesh_edge *) malloc(edge_count * sizeof(*edges));
+    if (edges == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    for (int64_t face = 0; face < mesh->n_faces; ++face) {
+        const int32_t * f = mesh->faces + (size_t) face * 3u;
+        const uint32_t vertices[3] = { (uint32_t) f[0], (uint32_t) f[1], (uint32_t) f[2] };
+        for (uint32_t edge = 0u; edge < 3u; ++edge) {
+            vkmesh_edge * dst = edges + (size_t) face * 3u + edge;
+            const uint32_t a = vertices[edge];
+            const uint32_t b = vertices[(edge + 1u) % 3u];
+            dst->min_v = a < b ? a : b;
+            dst->max_v = a > b ? a : b;
+            dst->payload = vkmesh_edge_make_payload((uint32_t) face, a, b);
+        }
+    }
+    qsort(edges, edge_count, sizeof(*edges), compare_vkmesh_edges);
+    *edges_out = edges;
+    *edge_count_out = (int64_t) edge_count;
     return 1;
 }
 
@@ -2764,8 +3765,8 @@ static int get_boundary_edges_fallback(
             boundary = next;
             boundary_capacity = next_cap;
         }
-        boundary[boundary_count].a = (int32_t) edges[i].a;
-        boundary[boundary_count].b = (int32_t) edges[i].b;
+        boundary[boundary_count].a = (int32_t) vkmesh_edge_start(&edges[i]);
+        boundary[boundary_count].b = (int32_t) vkmesh_edge_end(&edges[i]);
         boundary[boundary_count].min_v = edges[i].min_v;
         boundary[boundary_count].max_v = edges[i].max_v;
         ++boundary_count;
@@ -2783,6 +3784,7 @@ static int get_boundary_edges(
     vkmesh_boundary_edge ** boundary_out,
     int64_t * boundary_count_out) {
     if (get_boundary_edges_vulkan(mesh, boundary_out, boundary_count_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("boundary-edge Vulkan path")) return 0;
     return get_boundary_edges_fallback(mesh, boundary_out, boundary_count_out);
 }
 
@@ -2887,7 +3889,7 @@ static int get_manifold_face_pairs_cpu(
     *pair_count_out = 0;
     vkmesh_edge * edges = NULL;
     int64_t edge_count = 0;
-    if (!get_sorted_edges(mesh, &edges, &edge_count)) return 0;
+    if (!get_sorted_edges_cpu(mesh, &edges, &edge_count)) return 0;
     vkmesh_face_pair * pairs = NULL;
     int64_t count = 0;
     int64_t capacity = 0;
@@ -2901,13 +3903,14 @@ static int get_manifold_face_pairs_cpu(
                 if (next == NULL) {
                     free(edges);
                     free(pairs);
+                    vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
                     return 0;
                 }
                 pairs = next;
                 capacity = next_cap;
             }
-            pairs[count].f0 = (int32_t) edges[i].face;
-            pairs[count].f1 = (int32_t) edges[i + 1].face;
+            pairs[count].f0 = (int32_t) vkmesh_edge_face(&edges[i]);
+            pairs[count].f1 = (int32_t) vkmesh_edge_face(&edges[i + 1]);
             pairs[count].v0 = edges[i].min_v;
             pairs[count].v1 = edges[i].max_v;
             ++count;
@@ -2925,6 +3928,7 @@ static int get_manifold_face_pairs(
     vkmesh_face_pair ** pairs_out,
     int64_t * pair_count_out) {
     if (get_manifold_face_pairs_vulkan(mesh, pairs_out, pair_count_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("manifold-pair Vulkan path")) return 0;
     return get_manifold_face_pairs_cpu(mesh, pairs_out, pair_count_out);
 }
 
@@ -3200,7 +4204,58 @@ static int vkmesh_repair_non_manifold_edges_cpu(vkmesh_mesh * mesh, int * old_ve
 
 static int vkmesh_repair_non_manifold_edges(vkmesh_mesh * mesh, int * old_vertices, int * new_vertices) {
     if (vkmesh_repair_non_manifold_edges_vulkan(mesh, old_vertices, new_vertices)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("non-manifold repair Vulkan path")) return 0;
     return vkmesh_repair_non_manifold_edges_cpu(mesh, old_vertices, new_vertices);
+}
+
+static int vkmesh_remove_small_connected_components_cpu(
+    vkmesh_mesh * mesh,
+    float min_area,
+    int * removed_faces) {
+    if (removed_faces != NULL) *removed_faces = 0;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_faces > INT32_MAX) return 0;
+    vkmesh_face_pair * pairs = NULL;
+    int64_t pair_count = 0;
+    if (!get_manifold_face_pairs_cpu(mesh, &pairs, &pair_count)) return 0;
+    int * parent = (int *) malloc((size_t) mesh->n_faces * sizeof(int));
+    double * comp_area = (double *) calloc((size_t) mesh->n_faces, sizeof(double));
+    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
+    if (parent == NULL || comp_area == NULL || keep == NULL) {
+        free(pairs);
+        free(parent);
+        free(comp_area);
+        free(keep);
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    for (int64_t i = 0; i < mesh->n_faces; ++i) parent[i] = (int) i;
+    for (int64_t i = 0; i < pair_count; ++i) uf_union(parent, pairs[i].f0, pairs[i].f1);
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        comp_area[uf_find(parent, (int) i)] += face_area(mesh, i);
+    }
+    int64_t keep_count = 0;
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        keep[i] = comp_area[uf_find(parent, (int) i)] >= (double) min_area ? 1u : 0u;
+        keep_count += keep[i] != 0u;
+    }
+    if (keep_count == 0) {
+        fprintf(stderr,
+            "vkmesh: all connected components are below min_area=%.9g faces=%" PRId64 "\n",
+            min_area,
+            mesh->n_faces);
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        free(pairs);
+        free(parent);
+        free(comp_area);
+        free(keep);
+        return 0;
+    }
+    const int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
+    free(pairs);
+    free(parent);
+    free(comp_area);
+    free(keep);
+    return ok;
 }
 
 static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float min_area, int * removed_faces) {
@@ -3224,9 +4279,11 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
             vkmesh_device_mesh_destroy(&dm);
             if (owns_vk) vkmesh_vk_destroy(vk);
             if (ok) return 1;
+            if (vkmesh_fatal_error_blocks_fallback("device connected-components path")) return 0;
             fprintf(stderr, "vkmesh: device connected-components pass failed, falling back\n");
         }
     }
+    if (vkmesh_fatal_error_blocks_fallback("device connected-components initialization")) return 0;
     if (mesh->n_vertices > 0 && mesh->n_vertices <= INT32_MAX) {
         vkmesh_vk local_vk;
         vkmesh_vk * vk = NULL;
@@ -3288,7 +4345,7 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
                         uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
                         uint32_t face_groups = (uint32_t) ((mesh->n_faces + 127) / 128);
                         int converged = 0;
-                        for (int iter = 0; iter < 32; ++iter) {
+                        for (int iter = 0; iter < VKMESH_COMPONENT_MAX_UNION_PASSES; ++iter) {
                             ((uint32_t *) changed.mapped)[0] = 0u;
                             memset(&push, 0, sizeof(push));
                             push.n = (uint32_t) edge_count;
@@ -3312,15 +4369,12 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
                             memset(&push, 0, sizeof(push));
                             push.n = (uint32_t) mesh->n_faces;
                             if (vkmesh_dispatch(vk, VKMESH_PIPE_COMPONENT_AREA, area_buffers, &push, face_groups)) {
-                                vkmesh_vk_buffer mark_buffers[4];
-                                mark_buffers[0] = parents;
-                                mark_buffers[1] = area_bits;
-                                mark_buffers[2] = keep_flags;
-                                mark_buffers[3] = changed;
-                                memset(&push, 0, sizeof(push));
-                                push.n = (uint32_t) mesh->n_faces;
-                                push.eps = min_area;
-                                if (vkmesh_dispatch(vk, VKMESH_PIPE_MARK_COMPONENT_KEEP, mark_buffers, &push, face_groups)) {
+                                if (vkmesh_mark_components_by_area_host(
+                                        &parents,
+                                        &area_bits,
+                                        &keep_flags,
+                                        (uint32_t) mesh->n_faces,
+                                        min_area)) {
                                     float * new_vertices = NULL;
                                     int64_t new_vertex_count = 0;
                                     int32_t * new_faces = NULL;
@@ -3366,30 +4420,13 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
             vk_buffer_destroy(vk, &keep_flags);
             if (owns_vk) vkmesh_vk_destroy(vk);
             if (ok) return 1;
+            if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan connected-components path")) return 0;
             fprintf(stderr, "vkmesh: Vulkan connected-components pass failed, falling back to CPU\n");
         }
     }
+    if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan connected-components initialization")) return 0;
 
-    vkmesh_face_pair * pairs = NULL;
-    int64_t pair_count = 0;
-    if (!get_manifold_face_pairs(mesh, &pairs, &pair_count)) return 0;
-    int * parent = (int *) malloc((size_t) mesh->n_faces * sizeof(int));
-    double * comp_area = (double *) calloc((size_t) mesh->n_faces, sizeof(double));
-    uint8_t * keep = (uint8_t *) malloc((size_t) mesh->n_faces);
-    if (parent == NULL || comp_area == NULL || keep == NULL) {
-        free(pairs); free(parent); free(comp_area); free(keep);
-        return 0;
-    }
-    for (int64_t i = 0; i < mesh->n_faces; ++i) parent[i] = (int) i;
-    for (int64_t i = 0; i < pair_count; ++i) uf_union(parent, pairs[i].f0, pairs[i].f1);
-    for (int64_t i = 0; i < mesh->n_faces; ++i) comp_area[uf_find(parent, (int) i)] += face_area(mesh, i);
-    for (int64_t i = 0; i < mesh->n_faces; ++i) keep[i] = comp_area[uf_find(parent, (int) i)] >= (double) min_area ? 1u : 0u;
-    int ok = mesh_remove_faces_by_mask(mesh, keep, removed_faces);
-    free(pairs);
-    free(parent);
-    free(comp_area);
-    free(keep);
-    return ok;
+    return vkmesh_remove_small_connected_components_cpu(mesh, min_area, removed_faces);
 }
 
 static int shared_edge_needs_flip(const vkmesh_mesh * mesh, const vkmesh_face_pair * pair) {
@@ -3616,6 +4653,7 @@ static int vkmesh_unify_face_orientations_cpu(vkmesh_mesh * mesh, int * flipped_
 
 static int vkmesh_unify_face_orientations(vkmesh_mesh * mesh, int * flipped_faces) {
     if (vkmesh_unify_face_orientations_vulkan(mesh, flipped_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("orientation Vulkan path")) return 0;
     return vkmesh_unify_face_orientations_cpu(mesh, flipped_faces);
 }
 
@@ -3685,22 +4723,9 @@ static int build_vertex_face_adjacency_vulkan(const vkmesh_mesh * mesh, int ** o
     uint32_t offset_groups = (offset_count + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
 
-    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = dummy_buffer;
-        scan_buffers[3] = dummy_buffer;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    if (!vkmesh_scan_u32_inclusive(
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &dummy_buffer)) goto cleanup;
+    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
 
     int * offset = (int *) calloc((size_t) mesh->n_vertices + 1u, sizeof(*offset));
     if (offset == NULL) goto cleanup;
@@ -3803,6 +4828,7 @@ static int build_vertex_face_adjacency_cpu(const vkmesh_mesh * mesh, int ** offs
 
 static int build_vertex_face_adjacency(const vkmesh_mesh * mesh, int ** offset_out, int ** adj_out) {
     if (build_vertex_face_adjacency_vulkan(mesh, offset_out, adj_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("vertex-face adjacency Vulkan path")) return 0;
     return build_vertex_face_adjacency_cpu(mesh, offset_out, adj_out);
 }
 
@@ -3829,14 +4855,12 @@ static int get_unique_simplify_edges_vulkan(
     vkmesh_vk_buffer faces_buffer;
     vkmesh_vk_buffer vertices_buffer;
     vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer dummy_buffer;
     vkmesh_vk_buffer unique_buffer;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
     memset(&faces_buffer, 0, sizeof(faces_buffer));
     memset(&vertices_buffer, 0, sizeof(vertices_buffer));
     memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&dummy_buffer, 0, sizeof(dummy_buffer));
     memset(&unique_buffer, 0, sizeof(unique_buffer));
     memset(&boundary_flags, 0, sizeof(boundary_flags));
     memset(&counter, 0, sizeof(counter));
@@ -3846,10 +4870,9 @@ static int get_unique_simplify_edges_vulkan(
     const size_t boundary_bytes = (size_t) mesh->n_vertices * sizeof(uint32_t);
     int ok = 0;
     size_t raw_count = 0;
-    size_t raw_sort_count = 0;
 
-    if (!vk_buffer_create(vk, faces_bytes, &faces_buffer) ||
-        !vk_buffer_create(vk, vertices_bytes, &vertices_buffer) ||
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &faces_buffer) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &vertices_buffer) ||
         !vk_buffer_create(vk, boundary_bytes, &boundary_flags) ||
         !vk_buffer_create(vk, sizeof(uint32_t), &counter)) {
         goto cleanup;
@@ -3857,18 +4880,19 @@ static int get_unique_simplify_edges_vulkan(
     memcpy(faces_buffer.mapped, mesh->faces, faces_bytes);
     memcpy(vertices_buffer.mapped, mesh->vertices, vertices_bytes);
 
-    if (!expand_edges_device(
+    if (!expand_simplify_edge_keys_device(
             vk,
             mesh,
             &faces_buffer,
             &vertices_buffer,
             &edges_buffer,
-            &dummy_buffer,
-            &raw_count,
-            &raw_sort_count)) {
+            NULL,
+            NULL,
+            &raw_count)) {
         goto cleanup;
     }
-    if (!vk_buffer_create(vk, raw_count * 2u * sizeof(uint32_t), &unique_buffer)) goto cleanup;
+    if (!vk_buffer_create_uninitialized(
+            vk, raw_count * 2u * sizeof(uint32_t), &unique_buffer)) goto cleanup;
 
     vkmesh_vk_buffer buffers[4];
     buffers[0] = edges_buffer;
@@ -3880,7 +4904,12 @@ static int get_unique_simplify_edges_vulkan(
     push.n = (uint32_t) raw_count;
     push.aux0 = (uint32_t) mesh->n_vertices;
     uint32_t groups = (uint32_t) ((raw_count + 127u) / 128u);
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES, buffers, &push, groups)) goto cleanup;
+    if (!vkmesh_dispatch(
+            vk,
+            VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES,
+            buffers,
+            &push,
+            groups)) goto cleanup;
 
     uint32_t unique_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_count > raw_count) goto cleanup;
@@ -3912,7 +4941,6 @@ cleanup:
     vk_buffer_destroy(vk, &faces_buffer);
     vk_buffer_destroy(vk, &vertices_buffer);
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &dummy_buffer);
     vk_buffer_destroy(vk, &unique_buffer);
     vk_buffer_destroy(vk, &boundary_flags);
     vk_buffer_destroy(vk, &counter);
@@ -3941,6 +4969,10 @@ static int get_unique_simplify_edges_cpu(
     for (int64_t i = 0; i < raw_count;) {
         int64_t j = i + 1;
         while (j < raw_count && raw[j].min_v == raw[i].min_v && raw[j].max_v == raw[i].max_v) ++j;
+        if (raw[i].min_v == raw[i].max_v) {
+            i = j;
+            continue;
+        }
         edges[count].v0 = (int32_t) raw[i].min_v;
         edges[count].v1 = (int32_t) raw[i].max_v;
         edges[count].cost = INFINITY;
@@ -3967,6 +4999,7 @@ static int get_unique_simplify_edges(
     int64_t * edge_count_out,
     uint8_t ** vertex_boundary_out) {
     if (get_unique_simplify_edges_vulkan(mesh, edges_out, edge_count_out, vertex_boundary_out)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("simplify edge-key Vulkan path")) return 0;
     return get_unique_simplify_edges_cpu(mesh, edges_out, edge_count_out, vertex_boundary_out);
 }
 
@@ -4095,6 +5128,157 @@ static int face_contains_vertex(const int32_t * f, int32_t v) {
     return f[0] == v || f[1] == v || f[2] == v;
 }
 
+enum { VKMESH_SIMPLIFY_MAX_STAR_FACES = 64 };
+
+static int simplify_topology_face_is_valid(const vkmesh_mesh * mesh, const int32_t * f) {
+    return f[0] >= 0 && f[1] >= 0 && f[2] >= 0 &&
+           f[0] < mesh->n_vertices && f[1] < mesh->n_vertices && f[2] < mesh->n_vertices &&
+           f[0] != f[1] && f[1] != f[2] && f[2] != f[0];
+}
+
+static int32_t simplify_opposite_vertex(const int32_t * f, int32_t v0, int32_t v1) {
+    if (!face_contains_vertex(f, v0) || !face_contains_vertex(f, v1)) return -1;
+    if (f[0] != v0 && f[0] != v1) return f[0];
+    if (f[1] != v0 && f[1] != v1) return f[1];
+    if (f[2] != v0 && f[2] != v1) return f[2];
+    return -1;
+}
+
+static int simplify_directed_edge_sign(const int32_t * f, int32_t v0, int32_t v1) {
+    if ((f[0] == v0 && f[1] == v1) ||
+        (f[1] == v0 && f[2] == v1) ||
+        (f[2] == v0 && f[0] == v1)) {
+        return 1;
+    }
+    if ((f[0] == v1 && f[1] == v0) ||
+        (f[1] == v1 && f[2] == v0) ||
+        (f[2] == v1 && f[0] == v0)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int simplify_vertices_are_neighbors(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    int32_t vertex,
+    int32_t candidate) {
+    int begin = v2f_offset[vertex];
+    int end = v2f_offset[vertex + 1];
+    if (begin < 0 || begin > end) return 0;
+    for (int item = begin; item < end; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) ||
+            !face_contains_vertex(f, vertex)) {
+            return 0;
+        }
+        if (face_contains_vertex(f, candidate)) return 1;
+    }
+    return 0;
+}
+
+static int simplify_face_exists(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    int32_t v0,
+    int32_t v1,
+    int32_t v2) {
+    int begin = v2f_offset[v0];
+    int end = v2f_offset[v0 + 1];
+    if (begin < 0 || begin > end) return 0;
+    for (int item = begin; item < end; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v0)) return 0;
+        if (face_contains_vertex(f, v1) && face_contains_vertex(f, v2)) return 1;
+    }
+    return 0;
+}
+
+static int simplify_collapse_link_ok(
+    const vkmesh_mesh * mesh,
+    const int * v2f_offset,
+    const int * v2f,
+    const uint8_t * boundary,
+    int32_t v0,
+    int32_t v1) {
+    int begin0 = v2f_offset[v0];
+    int end0 = v2f_offset[v0 + 1];
+    int begin1 = v2f_offset[v1];
+    int end1 = v2f_offset[v1 + 1];
+    if (begin0 < 0 || begin1 < 0 || begin0 > end0 || begin1 > end1) return 0;
+    int degree0 = end0 - begin0;
+    int degree1 = end1 - begin1;
+    if (degree0 <= 0 || degree1 <= 0 ||
+        degree0 > VKMESH_SIMPLIFY_MAX_STAR_FACES ||
+        degree1 > VKMESH_SIMPLIFY_MAX_STAR_FACES) {
+        return 0;
+    }
+
+    int incidence0 = 0;
+    int32_t opposites[2] = { -1, -1 };
+    int signs[2] = { 0, 0 };
+    for (int item = begin0; item < end0; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v0)) return 0;
+        if (!face_contains_vertex(f, v1)) continue;
+        if (incidence0 >= 2) return 0;
+        opposites[incidence0] = simplify_opposite_vertex(f, v0, v1);
+        signs[incidence0] = simplify_directed_edge_sign(f, v0, v1);
+        if (opposites[incidence0] < 0 || signs[incidence0] == 0) return 0;
+        ++incidence0;
+    }
+
+    int incidence1 = 0;
+    for (int item = begin1; item < end1; ++item) {
+        int face_id = v2f[item];
+        if (face_id < 0 || face_id >= mesh->n_faces) return 0;
+        const int32_t * f = mesh->faces + (size_t) face_id * 3u;
+        if (!simplify_topology_face_is_valid(mesh, f) || !face_contains_vertex(f, v1)) return 0;
+        if (face_contains_vertex(f, v0)) ++incidence1;
+    }
+    if (incidence0 != incidence1) return 0;
+
+    if (incidence0 == 1) {
+        if (!boundary[v0] || !boundary[v1]) return 0;
+    } else if (incidence0 == 2) {
+        if (boundary[v0] || boundary[v1] || opposites[0] == opposites[1] ||
+            signs[0] == signs[1]) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+
+    for (int item = begin0; item < end0; ++item) {
+        const int32_t * f = mesh->faces + (size_t) v2f[item] * 3u;
+        for (int corner = 0; corner < 3; ++corner) {
+            int32_t candidate = f[corner];
+            if (candidate == v0 || candidate == v1 || candidate == opposites[0] ||
+                (incidence0 == 2 && candidate == opposites[1])) {
+                continue;
+            }
+            if (simplify_vertices_are_neighbors(mesh, v2f_offset, v2f, v1, candidate)) return 0;
+        }
+    }
+
+    // Vertex-only link tests permit a tetrahedron edge even though its two
+    // retained faces become duplicates after contraction.
+    if (incidence0 == 2 &&
+        simplify_face_exists(mesh, v2f_offset, v2f, v0, opposites[0], opposites[1]) &&
+        simplify_face_exists(mesh, v2f_offset, v2f, v1, opposites[0], opposites[1])) {
+        return 0;
+    }
+    return 1;
+}
+
 static int process_incident_for_simplify(
     const vkmesh_mesh * mesh,
     int32_t face_id,
@@ -4108,6 +5292,13 @@ static int process_incident_for_simplify(
     const float * p0 = mesh->vertices + (size_t) f[0] * 3u;
     const float * p1 = mesh->vertices + (size_t) f[1] * 3u;
     const float * p2 = mesh->vertices + (size_t) f[2] * 3u;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(p0[axis]) || !isfinite(p1[axis]) || !isfinite(p2[axis]) ||
+            !isfinite(new_pos[axis])) {
+            return 0;
+        }
+    }
+    double old_e0[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
     double old_e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
     double old_e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
     double old_n[3] = {
@@ -4136,16 +5327,37 @@ static int process_incident_for_simplify(
         new_e1[0] * new_e2[1] - new_e1[1] * new_e2[0],
     };
     double dot_n = old_n[0] * new_n[0] + old_n[1] * new_n[1] + old_n[2] * new_n[2];
-    if (dot_n < 0.0) return 0;
+    double old_len0 = old_e0[0] * old_e0[0] + old_e0[1] * old_e0[1] + old_e0[2] * old_e0[2];
+    double old_len1 = old_e1[0] * old_e1[0] + old_e1[1] * old_e1[1] + old_e1[2] * old_e1[2];
+    double old_len2 = old_e2[0] * old_e2[0] + old_e2[1] * old_e2[1] + old_e2[2] * old_e2[2];
+    double old_cross_sq = old_n[0] * old_n[0] + old_n[1] * old_n[1] + old_n[2] * old_n[2];
+    double old_max_edge_sq = fmax(old_len0, fmax(old_len1, old_len2));
+    double old_min_cross_sq = 4e-12 * old_max_edge_sq * old_max_edge_sq;
+    if (!isfinite(old_n[0]) || !isfinite(old_n[1]) || !isfinite(old_n[2]) ||
+        !isfinite(new_n[0]) || !isfinite(new_n[1]) || !isfinite(new_n[2]) ||
+        !isfinite(dot_n) || !isfinite(old_len0) || !isfinite(old_len1) ||
+        !isfinite(old_len2) || !isfinite(old_cross_sq) || !isfinite(old_max_edge_sq) ||
+        !isfinite(old_min_cross_sq) ||
+        (old_cross_sq > old_min_cross_sq && dot_n <= 0.0)) {
+        return 0;
+    }
 
     double e0[3] = { np[2][0] - np[1][0], np[2][1] - np[1][1], np[2][2] - np[1][2] };
-    double area2 = sqrt(new_n[0] * new_n[0] + new_n[1] * new_n[1] + new_n[2] * new_n[2]);
+    double cross_sq = new_n[0] * new_n[0] + new_n[1] * new_n[1] + new_n[2] * new_n[2];
     double len0 = e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2];
     double len1 = new_e1[0] * new_e1[0] + new_e1[1] * new_e1[1] + new_e1[2] * new_e1[2];
     double len2 = new_e2[0] * new_e2[0] + new_e2[1] * new_e2[1] + new_e2[2] * new_e2[2];
+    double max_edge_sq = fmax(len0, fmax(len1, len2));
+    double min_cross_sq = 4e-12 * max_edge_sq * max_edge_sq;
+    if (!isfinite(cross_sq) || !isfinite(len0) || !isfinite(len1) || !isfinite(len2) ||
+        !isfinite(max_edge_sq) || !isfinite(min_cross_sq) || cross_sq <= min_cross_sq) {
+        return 0;
+    }
+    double area2 = sqrt(cross_sq);
     double denom = len0 + len1 + len2;
-    if (denom < 1e-24) denom = 1e-24;
+    if (!isfinite(area2) || !isfinite(denom) || denom <= 0.0) return 0;
     double shape = 2.0 * sqrt(3.0) * area2 / denom;
+    if (!isfinite(shape)) return 0;
     if (shape < 0.0) shape = 0.0;
     if (shape > 1.0) shape = 1.0;
     *skinny_cost += 1.0 - shape;
@@ -4162,6 +5374,14 @@ static double simplify_edge_cost(
     float lambda_edge_length,
     float lambda_skinny,
     vkmesh_simplify_edge * edge) {
+    if (edge->v0 < 0 || edge->v1 < 0 || edge->v0 >= mesh->n_vertices ||
+        edge->v1 >= mesh->n_vertices || edge->v0 == edge->v1) {
+        return INFINITY;
+    }
+    if (!simplify_collapse_link_ok(
+            mesh, v2f_offset, v2f, boundary, edge->v0, edge->v1)) {
+        return INFINITY;
+    }
     const float * v0 = mesh->vertices + (size_t) edge->v0 * 3u;
     const float * v1 = mesh->vertices + (size_t) edge->v1 * 3u;
     float w0 = 0.5f;
@@ -4170,6 +5390,11 @@ static double simplify_edge_cost(
     edge->pos[0] = v0[0] * w0 + v1[0] * (1.0f - w0);
     edge->pos[1] = v0[1] * w0 + v1[1] * (1.0f - w0);
     edge->pos[2] = v0[2] * w0 + v1[2] * (1.0f - w0);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(v0[axis]) || !isfinite(v1[axis]) || !isfinite(edge->pos[axis])) {
+            return INFINITY;
+        }
+    }
 
     vkmesh_qem q = qems[edge->v0];
     for (int i = 0; i < 10; ++i) q.m[i] += qems[edge->v1].m[i];
@@ -4190,7 +5415,7 @@ static double simplify_edge_cost(
     }
     if (num_tri > 0) skinny /= (double) num_tri;
     cost += (double) lambda_skinny * skinny * len2;
-    return cost;
+    return isfinite(cost) && cost >= 0.0 ? cost : INFINITY;
 }
 
 static int propagate_edge_cost_to_faces(
@@ -4256,7 +5481,6 @@ static int vkmesh_simplify_step_vulkan(
     vkmesh_vk_buffer offset_b_buffer;
     vkmesh_vk_buffer adjacency_buffer;
     vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer edge_dummy;
     vkmesh_vk_buffer unique_edges;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
@@ -4268,7 +5492,6 @@ static int vkmesh_simplify_step_vulkan(
     memset(&offset_b_buffer, 0, sizeof(offset_b_buffer));
     memset(&adjacency_buffer, 0, sizeof(adjacency_buffer));
     memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&edge_dummy, 0, sizeof(edge_dummy));
     memset(&unique_edges, 0, sizeof(unique_edges));
     memset(&boundary_flags, 0, sizeof(boundary_flags));
     memset(&counter, 0, sizeof(counter));
@@ -4283,12 +5506,12 @@ static int vkmesh_simplify_step_vulkan(
     const size_t offset_bytes = (size_t) offset_count * sizeof(uint32_t);
     int ok = 0;
 
-    if (!vk_buffer_create(vk, faces_bytes, &faces_buffer) ||
-        !vk_buffer_create(vk, vertices_bytes, &vertices_buffer) ||
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &faces_buffer) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &vertices_buffer) ||
         !vk_buffer_create(vk, degree_bytes, &degree_buffer) ||
-        !vk_buffer_create(vk, offset_bytes, &offset_a_buffer) ||
-        !vk_buffer_create(vk, offset_bytes, &offset_b_buffer) ||
-        !vk_buffer_create(vk, 4u * sizeof(uint32_t), &counter)) {
+        !vk_buffer_create_uninitialized(vk, offset_bytes, &offset_a_buffer) ||
+        !vk_buffer_create_uninitialized(vk, offset_bytes, &offset_b_buffer) ||
+        !vk_buffer_create_uninitialized(vk, 4u * sizeof(uint32_t), &counter)) {
         goto cleanup;
     }
     memcpy(faces_buffer.mapped, mesh->faces, faces_bytes);
@@ -4306,7 +5529,7 @@ static int vkmesh_simplify_step_vulkan(
     degree_buffers[3] = counter;
     push.n = face_count;
     push.aux0 = vertex_count;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_DEGREE, degree_buffers, &push, face_groups)) goto cleanup;
+    vkmesh_push degree_push = push;
 
     vkmesh_vk_buffer seed_buffers[4];
     seed_buffers[0] = degree_buffer;
@@ -4316,28 +5539,26 @@ static int vkmesh_simplify_step_vulkan(
     memset(&push, 0, sizeof(push));
     push.n = offset_count;
     uint32_t offset_groups = (offset_count + 127u) / 128u;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
+    if (!vkmesh_dispatch_pair(
+            vk,
+            VKMESH_PIPE_VERTEX_FACE_DEGREE,
+            degree_buffers,
+            &degree_push,
+            face_groups,
+            VKMESH_PIPE_SEED_VERTEX_OFFSETS,
+            seed_buffers,
+            offset_count,
+            offset_groups)) goto cleanup;
 
-    vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = counter;
-        scan_buffers[3] = counter;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    if (!vkmesh_scan_u32_inclusive(
+            vk, &offset_a_buffer, &offset_b_buffer, offset_count, &counter)) goto cleanup;
+    vkmesh_vk_buffer * scan_in = &offset_b_buffer;
+    vkmesh_vk_buffer * scan_out = &offset_a_buffer;
 
     const uint32_t total_adj = ((const uint32_t *) scan_in->mapped)[vertex_count];
     if (total_adj != face_count * 3u) goto cleanup;
-    if (!vk_buffer_create(vk, (size_t) total_adj * sizeof(uint32_t), &adjacency_buffer)) goto cleanup;
+    if (!vk_buffer_create_uninitialized(
+            vk, (size_t) total_adj * sizeof(uint32_t), &adjacency_buffer)) goto cleanup;
 
     vkmesh_vk_buffer cursor_copy_buffers[4];
     cursor_copy_buffers[0] = *scan_in;
@@ -4360,17 +5581,24 @@ static int vkmesh_simplify_step_vulkan(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_ADJACENCY, adj_buffers, &push, face_groups)) goto cleanup;
 
     size_t raw_edge_count = 0;
-    size_t raw_edge_sort_count = 0;
-    if (!expand_edges_device(vk, mesh, &faces_buffer, &vertices_buffer, &edges_buffer, &edge_dummy, &raw_edge_count, &raw_edge_sort_count)) {
+    if (!expand_simplify_edge_keys_device(
+            vk,
+            mesh,
+            &faces_buffer,
+            &vertices_buffer,
+            &edges_buffer,
+            &unique_edges,
+            NULL,
+            &raw_edge_count)) {
         goto cleanup;
     }
     if (raw_edge_count > UINT32_MAX) goto cleanup;
-    if (!vk_buffer_create(vk, raw_edge_count * 2u * sizeof(uint32_t), &unique_edges) ||
+    if (!vk_buffer_ensure_capacity(
+            vk, raw_edge_count * 2u * sizeof(uint32_t), &unique_edges) ||
         !vk_buffer_create(vk, (size_t) vertex_count * sizeof(uint32_t), &boundary_flags)) {
         goto cleanup;
     }
     ((uint32_t *) counter.mapped)[0] = 0u;
-
     vkmesh_vk_buffer unique_buffers[4];
     unique_buffers[0] = edges_buffer;
     unique_buffers[1] = unique_edges;
@@ -4379,11 +5607,20 @@ static int vkmesh_simplify_step_vulkan(
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) raw_edge_count;
     push.aux0 = vertex_count;
-    push.aux1 = 0u;
     uint32_t edge_groups = (uint32_t) ((raw_edge_count + 127u) / 128u);
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES, unique_buffers, &push, edge_groups)) goto cleanup;
+    if (!vkmesh_dispatch(
+            vk,
+            VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES,
+            unique_buffers,
+            &push,
+            edge_groups)) goto cleanup;
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
     if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
+
+    /* The sorted 3F edge keys are only needed to construct the compact
+       unique-edge array. Releasing them before the packed simplify scratch is
+       allocated keeps the two largest transient phases from overlapping. */
+    vk_buffer_destroy(vk, &edges_buffer);
 
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
@@ -4394,10 +5631,16 @@ static int vkmesh_simplify_step_vulkan(
     const uint64_t best_edge_base = best_cost_base + (uint64_t) face_count;
     const uint64_t face_keep_base = best_edge_base + (uint64_t) face_count;
     const uint64_t counter_base = face_keep_base + (uint64_t) face_count;
-    const uint64_t scratch_count = counter_base + 1ull;
+    const uint64_t threshold_base = counter_base + 1ull;
+    const uint64_t scratch_count = threshold_base + 1ull;
     (void) qem_base;
     if (scratch_count > UINT32_MAX) goto cleanup;
-    if (!vk_buffer_create(vk, (size_t) scratch_count * sizeof(uint32_t), &scratch)) goto cleanup;
+    if (!vk_buffer_create_uninitialized(
+            vk, (size_t) scratch_count * sizeof(uint32_t), &scratch)) goto cleanup;
+    memcpy(
+        (uint32_t *) scratch.mapped + (size_t) threshold_base,
+        &threshold,
+        sizeof(threshold));
 
     vkmesh_vk_buffer copy_buffers[4];
     copy_buffers[0] = *scan_in;
@@ -4545,7 +5788,6 @@ cleanup:
     vk_buffer_destroy(vk, &offset_b_buffer);
     vk_buffer_destroy(vk, &adjacency_buffer);
     vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
     vk_buffer_destroy(vk, &unique_edges);
     vk_buffer_destroy(vk, &boundary_flags);
     vk_buffer_destroy(vk, &counter);
@@ -4554,16 +5796,44 @@ cleanup:
     return ok;
 }
 
+typedef struct vkmesh_simplify_workspace {
+    vkmesh_vk_buffer edge_data;
+    vkmesh_vk_buffer edge_aux;
+    vkmesh_vk_buffer offsets;
+    vkmesh_vk_buffer adjacency_faces;
+    vkmesh_vk_buffer vertex_aux;
+    vkmesh_vk_buffer control;
+    vkmesh_vk_buffer next_vertices;
+    vkmesh_vk_buffer scan_sums[VKMESH_SCAN_MAX_LEVELS];
+} vkmesh_simplify_workspace;
+
+static void vkmesh_simplify_workspace_destroy(
+    vkmesh_vk * vk,
+    vkmesh_simplify_workspace * workspace) {
+    if (vk == NULL || workspace == NULL) return;
+    vk_buffer_destroy(vk, &workspace->edge_data);
+    vk_buffer_destroy(vk, &workspace->edge_aux);
+    vk_buffer_destroy(vk, &workspace->offsets);
+    vk_buffer_destroy(vk, &workspace->adjacency_faces);
+    vk_buffer_destroy(vk, &workspace->vertex_aux);
+    vk_buffer_destroy(vk, &workspace->control);
+    vk_buffer_destroy(vk, &workspace->next_vertices);
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &workspace->scan_sums[i]);
+    }
+}
+
 static int vkmesh_device_simplify_step(
     vkmesh_device_mesh * dm,
     float lambda_edge_length,
     float lambda_skinny,
     float threshold,
+    vkmesh_simplify_workspace * workspace,
     uint32_t * collapsed_edges,
     uint32_t * removed_faces) {
     if (collapsed_edges != NULL) *collapsed_edges = 0u;
     if (removed_faces != NULL) *removed_faces = 0u;
-    if (dm == NULL || dm->vk == NULL) return 0;
+    if (dm == NULL || dm->vk == NULL || workspace == NULL) return 0;
     if (dm->n_faces == 0u) return 1;
     if (dm->n_vertices == 0u || dm->n_faces > UINT32_MAX / 3u) return 0;
 
@@ -4573,40 +5843,41 @@ static int vkmesh_device_simplify_step(
     view.n_vertices = dm->n_vertices;
     view.n_faces = dm->n_faces;
 
-    vkmesh_vk_buffer degree_buffer;
     vkmesh_vk_buffer offset_a_buffer;
-    vkmesh_vk_buffer offset_b_buffer;
     vkmesh_vk_buffer adjacency_buffer;
-    vkmesh_vk_buffer edges_buffer;
-    vkmesh_vk_buffer edge_dummy;
     vkmesh_vk_buffer unique_edges;
     vkmesh_vk_buffer boundary_flags;
     vkmesh_vk_buffer counter;
-    vkmesh_vk_buffer scratch;
-    memset(&degree_buffer, 0, sizeof(degree_buffer));
-    memset(&offset_a_buffer, 0, sizeof(offset_a_buffer));
-    memset(&offset_b_buffer, 0, sizeof(offset_b_buffer));
-    memset(&adjacency_buffer, 0, sizeof(adjacency_buffer));
-    memset(&edges_buffer, 0, sizeof(edges_buffer));
-    memset(&edge_dummy, 0, sizeof(edge_dummy));
-    memset(&unique_edges, 0, sizeof(unique_edges));
-    memset(&boundary_flags, 0, sizeof(boundary_flags));
-    memset(&counter, 0, sizeof(counter));
-    memset(&scratch, 0, sizeof(scratch));
+    vkmesh_vk_buffer next_vertices;
+    vkmesh_vk_buffer edge_data = workspace->edge_data;
+    vkmesh_vk_buffer * edge_scratch_buffer = &edge_data;
+    offset_a_buffer = workspace->offsets;
+    adjacency_buffer = workspace->adjacency_faces;
+    unique_edges = workspace->edge_aux;
+    boundary_flags = workspace->vertex_aux;
+    counter = workspace->control;
+    next_vertices = workspace->next_vertices;
+    memset(&workspace->edge_data, 0, sizeof(workspace->edge_data));
+    memset(&workspace->edge_aux, 0, sizeof(workspace->edge_aux));
+    memset(&workspace->offsets, 0, sizeof(workspace->offsets));
+    memset(&workspace->adjacency_faces, 0, sizeof(workspace->adjacency_faces));
+    memset(&workspace->vertex_aux, 0, sizeof(workspace->vertex_aux));
+    memset(&workspace->control, 0, sizeof(workspace->control));
+    memset(&workspace->next_vertices, 0, sizeof(workspace->next_vertices));
 
     const uint32_t vertex_count = dm->n_vertices;
     const uint32_t face_count = dm->n_faces;
     const uint32_t offset_count = vertex_count + 1u;
-    const size_t degree_bytes = (size_t) vertex_count * sizeof(uint32_t);
     const size_t offset_bytes = (size_t) offset_count * sizeof(uint32_t);
     int ok = 0;
 
-    if (!vk_buffer_create(vk, degree_bytes, &degree_buffer) ||
-        !vk_buffer_create(vk, offset_bytes, &offset_a_buffer) ||
-        !vk_buffer_create(vk, offset_bytes, &offset_b_buffer) ||
-        !vk_buffer_create(vk, 4u * sizeof(uint32_t), &counter)) {
+    if (!vk_buffer_ensure_capacity(vk, offset_bytes, &offset_a_buffer) ||
+        !vk_buffer_ensure_capacity(vk, offset_bytes, &boundary_flags) ||
+        !vk_buffer_ensure_capacity(vk, 4u * sizeof(uint32_t), &counter)) {
         goto cleanup;
     }
+    memset(boundary_flags.mapped, 0, offset_bytes);
+    ((uint32_t *) counter.mapped)[1] = 0u;
 
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
@@ -4615,43 +5886,21 @@ static int vkmesh_device_simplify_step(
 
     vkmesh_vk_buffer degree_buffers[4];
     degree_buffers[0] = dm->faces;
-    degree_buffers[1] = degree_buffer;
+    degree_buffers[1] = boundary_flags;
     degree_buffers[2] = counter;
     degree_buffers[3] = counter;
     push.n = face_count;
     push.aux0 = vertex_count;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_DEGREE, degree_buffers, &push, face_groups)) goto cleanup;
+    push.aux1 = 1u;
+    vkmesh_push degree_push = push;
 
-    vkmesh_vk_buffer seed_buffers[4];
-    seed_buffers[0] = degree_buffer;
-    seed_buffers[1] = offset_a_buffer;
-    seed_buffers[2] = counter;
-    seed_buffers[3] = counter;
-    memset(&push, 0, sizeof(push));
-    push.n = offset_count;
     uint32_t offset_groups = (offset_count + 127u) / 128u;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, offset_groups)) goto cleanup;
-
     vkmesh_vk_buffer * scan_in = &offset_a_buffer;
-    vkmesh_vk_buffer * scan_out = &offset_b_buffer;
-    for (uint64_t stride = 1u; stride < (uint64_t) offset_count; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = counter;
-        scan_buffers[3] = counter;
-        memset(&push, 0, sizeof(push));
-        push.n = offset_count;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, offset_groups)) goto cleanup;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
+    vkmesh_vk_buffer * scan_out = &boundary_flags;
 
-    const uint32_t total_adj = ((const uint32_t *) scan_in->mapped)[vertex_count];
-    if (total_adj != face_count * 3u) goto cleanup;
-    if (!vk_buffer_create(vk, (size_t) total_adj * sizeof(uint32_t), &adjacency_buffer)) goto cleanup;
+    const uint32_t total_adj = face_count * 3u;
+    if (!vk_buffer_ensure_capacity(
+            vk, (size_t) total_adj * sizeof(uint32_t), &adjacency_buffer)) goto cleanup;
 
     vkmesh_vk_buffer cursor_copy_buffers[4];
     cursor_copy_buffers[0] = *scan_in;
@@ -4660,7 +5909,7 @@ static int vkmesh_device_simplify_step(
     cursor_copy_buffers[3] = counter;
     memset(&push, 0, sizeof(push));
     push.n = offset_count;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, cursor_copy_buffers, &push, offset_groups)) goto cleanup;
+    vkmesh_push cursor_copy_push = push;
 
     vkmesh_vk_buffer adj_buffers[4];
     adj_buffers[0] = dm->faces;
@@ -4671,33 +5920,84 @@ static int vkmesh_device_simplify_step(
     push.n = face_count;
     push.aux0 = vertex_count;
     push.aux1 = total_adj;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_FACE_ADJACENCY, adj_buffers, &push, face_groups)) goto cleanup;
+    vkmesh_dispatch_command adjacency_commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(adjacency_commands, 0, sizeof(adjacency_commands));
+    uint32_t adjacency_command_count = 0u;
+
+    vkmesh_dispatch_command * command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_VERTEX_FACE_DEGREE;
+    memcpy(command->buffers, degree_buffers, sizeof(degree_buffers));
+    command->push = degree_push;
+    command->groups_x = face_groups;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &boundary_flags,
+            &offset_a_buffer,
+            offset_count,
+            0u,
+            0u,
+            &counter,
+            workspace->scan_sums,
+            adjacency_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &adjacency_command_count)) goto cleanup;
+
+    command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_COPY_U32;
+    memcpy(command->buffers, cursor_copy_buffers, sizeof(cursor_copy_buffers));
+    command->push = cursor_copy_push;
+    command->groups_x = offset_groups;
+
+    command = &adjacency_commands[adjacency_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_VERTEX_FACE_ADJACENCY;
+    memcpy(command->buffers, adj_buffers, sizeof(adj_buffers));
+    command->push = push;
+    command->groups_x = face_groups;
+    if (!vkmesh_dispatch_batch(vk, adjacency_commands, adjacency_command_count)) goto cleanup;
 
     size_t raw_edge_count = 0;
-    size_t raw_edge_sort_count = 0;
-    if (!expand_edges_device(vk, &view, &dm->faces, &dm->vertices, &edges_buffer, &edge_dummy, &raw_edge_count, &raw_edge_sort_count)) {
+    if (!expand_simplify_edge_keys_device(
+            vk,
+            &view,
+            &dm->faces,
+            &dm->vertices,
+            edge_scratch_buffer,
+            &unique_edges,
+            &boundary_flags,
+            &raw_edge_count)) {
         goto cleanup;
     }
     if (raw_edge_count > UINT32_MAX) goto cleanup;
-    if (!vk_buffer_create(vk, raw_edge_count * 2u * sizeof(uint32_t), &unique_edges) ||
-        !vk_buffer_create(vk, (size_t) vertex_count * sizeof(uint32_t), &boundary_flags)) {
+    const size_t boundary_bytes = (size_t) vertex_count * sizeof(uint32_t);
+    const size_t vertices_bytes = (size_t) vertex_count * 3u * sizeof(float);
+    if (!vk_buffer_ensure_capacity(
+            vk, raw_edge_count * 2u * sizeof(uint32_t), &unique_edges) ||
+        !vk_buffer_ensure_capacity(vk, boundary_bytes, &boundary_flags)) {
         goto cleanup;
     }
+    memset(boundary_flags.mapped, 0, (size_t) vertex_count * sizeof(uint32_t));
     ((uint32_t *) counter.mapped)[0] = 0u;
-
     vkmesh_vk_buffer unique_buffers[4];
-    unique_buffers[0] = edges_buffer;
+    unique_buffers[0] = *edge_scratch_buffer;
     unique_buffers[1] = unique_edges;
     unique_buffers[2] = boundary_flags;
     unique_buffers[3] = counter;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) raw_edge_count;
     push.aux0 = vertex_count;
-    push.aux1 = 0u;
     uint32_t edge_groups = (uint32_t) ((raw_edge_count + 127u) / 128u);
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES, unique_buffers, &push, edge_groups)) goto cleanup;
+    if (!vkmesh_dispatch(
+            vk,
+            VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES,
+            unique_buffers,
+            &push,
+            edge_groups)) goto cleanup;
     const uint32_t unique_edge_count = ((const uint32_t *) counter.mapped)[0];
-    if ((size_t) unique_edge_count > raw_edge_count) goto cleanup;
+    if ((size_t) unique_edge_count > raw_edge_count ||
+        ((const uint32_t *) counter.mapped)[1] != 0u) goto cleanup;
+    /* Edge keys are dead here. Repurpose their allocation as packed scratch;
+       no edge-key access is valid below this point. */
 
     const uint64_t qem_base = 0u;
     const uint64_t offset_base = (uint64_t) vertex_count * 10ull;
@@ -4708,37 +6008,58 @@ static int vkmesh_device_simplify_step(
     const uint64_t best_edge_base = best_cost_base + (uint64_t) face_count;
     const uint64_t face_keep_base = best_edge_base + (uint64_t) face_count;
     const uint64_t counter_base = face_keep_base + (uint64_t) face_count;
-    const uint64_t scratch_count = counter_base + 1ull;
+    const uint64_t threshold_base = counter_base + 1ull;
+    const uint64_t scratch_count = threshold_base + 1ull;
     (void) qem_base;
     if (scratch_count > UINT32_MAX) goto cleanup;
-    if (!vk_buffer_create(vk, (size_t) scratch_count * sizeof(uint32_t), &scratch)) goto cleanup;
+    if (!vk_buffer_ensure_capacity(
+            vk, (size_t) scratch_count * sizeof(uint32_t), edge_scratch_buffer) ||
+        !vk_buffer_ensure_capacity(
+            vk,
+            vertices_bytes,
+            &next_vertices)) goto cleanup;
+    memcpy(
+        (uint32_t *) edge_scratch_buffer->mapped + (size_t) threshold_base,
+        &threshold,
+        sizeof(threshold));
 
+    vkmesh_dispatch_command simplify_commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(simplify_commands, 0, sizeof(simplify_commands));
     vkmesh_vk_buffer copy_buffers[4];
     copy_buffers[0] = *scan_in;
-    copy_buffers[1] = scratch;
+    copy_buffers[1] = *edge_scratch_buffer;
     copy_buffers[2] = counter;
     copy_buffers[3] = counter;
     memset(&push, 0, sizeof(push));
     push.n = offset_count;
     push.aux1 = (uint32_t) offset_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, offset_groups)) goto cleanup;
+    simplify_commands[0].pipeline_kind = VKMESH_PIPE_COPY_U32;
+    memcpy(simplify_commands[0].buffers, copy_buffers, sizeof(copy_buffers));
+    simplify_commands[0].push = push;
+    simplify_commands[0].groups_x = offset_groups;
 
     copy_buffers[0] = adjacency_buffer;
-    copy_buffers[1] = scratch;
+    copy_buffers[1] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = total_adj;
     push.aux1 = (uint32_t) adjacency_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, (total_adj + 127u) / 128u)) goto cleanup;
+    simplify_commands[1].pipeline_kind = VKMESH_PIPE_COPY_U32;
+    memcpy(simplify_commands[1].buffers, copy_buffers, sizeof(copy_buffers));
+    simplify_commands[1].push = push;
+    simplify_commands[1].groups_x = (total_adj + 127u) / 128u;
 
     copy_buffers[0] = boundary_flags;
-    copy_buffers[1] = scratch;
+    copy_buffers[1] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = vertex_count;
     push.aux1 = (uint32_t) boundary_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COPY_U32, copy_buffers, &push, vertex_groups)) goto cleanup;
+    simplify_commands[2].pipeline_kind = VKMESH_PIPE_COPY_U32;
+    memcpy(simplify_commands[2].buffers, copy_buffers, sizeof(copy_buffers));
+    simplify_commands[2].push = push;
+    simplify_commands[2].groups_x = vertex_groups;
 
     vkmesh_vk_buffer fill_buffers[4];
-    fill_buffers[0] = scratch;
+    fill_buffers[0] = *edge_scratch_buffer;
     fill_buffers[1] = counter;
     fill_buffers[2] = counter;
     fill_buffers[3] = counter;
@@ -4746,40 +6067,55 @@ static int vkmesh_device_simplify_step(
     push.n = face_count;
     push.aux0 = 0x7f800000u;
     push.aux1 = (uint32_t) best_cost_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_FILL_U32, fill_buffers, &push, face_groups)) goto cleanup;
+    simplify_commands[3].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_commands[3].buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_commands[3].push = push;
+    simplify_commands[3].groups_x = face_groups;
     memset(&push, 0, sizeof(push));
     push.n = face_count;
     push.aux0 = UINT32_MAX;
     push.aux1 = (uint32_t) best_edge_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_FILL_U32, fill_buffers, &push, face_groups)) goto cleanup;
+    simplify_commands[4].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_commands[4].buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_commands[4].push = push;
+    simplify_commands[4].groups_x = face_groups;
     memset(&push, 0, sizeof(push));
     push.n = face_count;
     push.aux0 = 1u;
     push.aux1 = (uint32_t) face_keep_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_FILL_U32, fill_buffers, &push, face_groups)) goto cleanup;
+    simplify_commands[5].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_commands[5].buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_commands[5].push = push;
+    simplify_commands[5].groups_x = face_groups;
     memset(&push, 0, sizeof(push));
     push.n = 1u;
     push.aux0 = 0u;
     push.aux1 = (uint32_t) counter_base;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_FILL_U32, fill_buffers, &push, 1u)) goto cleanup;
+    simplify_commands[6].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_commands[6].buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_commands[6].push = push;
+    simplify_commands[6].groups_x = 1u;
 
     vkmesh_vk_buffer qem_buffers[4];
     qem_buffers[0] = dm->faces;
     qem_buffers[1] = dm->vertices;
-    qem_buffers[2] = scratch;
-    qem_buffers[3] = scratch;
+    qem_buffers[2] = *edge_scratch_buffer;
+    qem_buffers[3] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = vertex_count;
     push.aux0 = vertex_count;
     push.aux1 = face_count;
     push.aux2 = total_adj;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_VERTEX_QEM, qem_buffers, &push, vertex_groups)) goto cleanup;
+    simplify_commands[7].pipeline_kind = VKMESH_PIPE_VERTEX_QEM;
+    memcpy(simplify_commands[7].buffers, qem_buffers, sizeof(qem_buffers));
+    simplify_commands[7].push = push;
+    simplify_commands[7].groups_x = vertex_groups;
 
     vkmesh_vk_buffer cost_buffers[4];
     cost_buffers[0] = unique_edges;
     cost_buffers[1] = dm->vertices;
     cost_buffers[2] = dm->faces;
-    cost_buffers[3] = scratch;
+    cost_buffers[3] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = unique_edge_count;
     push.aux0 = vertex_count;
@@ -4788,53 +6124,232 @@ static int vkmesh_device_simplify_step(
     push.eps = lambda_edge_length;
     push.rel_eps = lambda_skinny;
     uint32_t unique_groups = (unique_edge_count + 127u) / 128u;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SIMPLIFY_EDGE_COST, cost_buffers, &push, unique_groups)) goto cleanup;
+    simplify_commands[8].pipeline_kind = VKMESH_PIPE_SIMPLIFY_EDGE_COST;
+    memcpy(simplify_commands[8].buffers, cost_buffers, sizeof(cost_buffers));
+    simplify_commands[8].push = push;
+    simplify_commands[8].groups_x = unique_groups;
 
     vkmesh_vk_buffer propagate_buffers[4];
     propagate_buffers[0] = unique_edges;
     propagate_buffers[1] = counter;
     propagate_buffers[2] = counter;
-    propagate_buffers[3] = scratch;
+    propagate_buffers[3] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = unique_edge_count;
     push.aux0 = vertex_count;
     push.aux1 = face_count;
     push.aux2 = total_adj;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST, propagate_buffers, &push, unique_groups)) goto cleanup;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SIMPLIFY_BEST_EDGE, propagate_buffers, &push, unique_groups)) goto cleanup;
+    simplify_commands[9].pipeline_kind = VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST;
+    memcpy(simplify_commands[9].buffers, propagate_buffers, sizeof(propagate_buffers));
+    simplify_commands[9].push = push;
+    simplify_commands[9].groups_x = unique_groups;
+    simplify_commands[10] = simplify_commands[9];
+    simplify_commands[10].pipeline_kind = VKMESH_PIPE_SIMPLIFY_BEST_EDGE;
 
     vkmesh_vk_buffer collapse_buffers[4];
     collapse_buffers[0] = unique_edges;
     collapse_buffers[1] = dm->vertices;
     collapse_buffers[2] = dm->faces;
-    collapse_buffers[3] = scratch;
+    collapse_buffers[3] = *edge_scratch_buffer;
     memset(&push, 0, sizeof(push));
     push.n = unique_edge_count;
     push.aux0 = vertex_count;
     push.aux1 = face_count;
     push.aux2 = total_adj;
     push.eps = threshold;
-    if (!vkmesh_dispatch(vk, VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES, collapse_buffers, &push, unique_groups)) goto cleanup;
+    simplify_commands[11].pipeline_kind = VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES;
+    memcpy(simplify_commands[11].buffers, collapse_buffers, sizeof(collapse_buffers));
+    simplify_commands[11].push = push;
+    simplify_commands[11].groups_x = unique_groups;
+    uint32_t simplify_command_count = 12u;
 
-    uint32_t collapsed_u32 = ((const uint32_t *) scratch.mapped)[counter_base];
+    vkmesh_dispatch_command * simplify_command =
+        &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = vertex_count;
+    push.aux1 = (uint32_t) qem_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    memcpy(simplify_command->buffers, fill_buffers, sizeof(fill_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = vertex_groups;
+
+    vkmesh_vk_buffer mark_vertex_buffers[4];
+    mark_vertex_buffers[0] = dm->faces;
+    mark_vertex_buffers[1] = *edge_scratch_buffer;
+    mark_vertex_buffers[2] = counter;
+    mark_vertex_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = face_count;
+    push.aux0 = vertex_count;
+    push.aux1 = (uint32_t) face_keep_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_MARK_KEPT_FACE_VERTICES;
+    memcpy(simplify_command->buffers, mark_vertex_buffers, sizeof(mark_vertex_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = face_groups;
+
+    uint32_t compact_scan_counts[2] = { face_count, vertex_count };
+    uint32_t compact_scan_offsets[2] = { (uint32_t) face_keep_base, (uint32_t) qem_base };
+    if (vertex_count > face_count) {
+        compact_scan_counts[0] = vertex_count;
+        compact_scan_counts[1] = face_count;
+        compact_scan_offsets[0] = (uint32_t) qem_base;
+        compact_scan_offsets[1] = (uint32_t) face_keep_base;
+    }
+    for (uint32_t i = 0u; i < 2u; ++i) {
+        if (!vkmesh_append_scan_u32_inclusive(
+                vk,
+                edge_scratch_buffer,
+                edge_scratch_buffer,
+                compact_scan_counts[i],
+                compact_scan_offsets[i],
+                compact_scan_offsets[i],
+                &counter,
+                workspace->scan_sums,
+                simplify_commands,
+                VKMESH_DISPATCH_BATCH_MAX,
+                &simplify_command_count)) goto cleanup;
+    }
+    if (simplify_command_count > VKMESH_DISPATCH_BATCH_MAX - 2u) goto cleanup;
+
+    vkmesh_vk_buffer scatter_face_buffers[4];
+    scatter_face_buffers[0] = dm->faces;
+    scatter_face_buffers[1] = *edge_scratch_buffer;
+    scatter_face_buffers[2] = adjacency_buffer;
+    scatter_face_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = face_count;
+    push.aux0 = (uint32_t) face_keep_base;
+    push.aux1 = (uint32_t) qem_base;
+    push.aux2 = vertex_count;
+    simplify_command->pipeline_kind = VKMESH_PIPE_SCATTER_SIMPLIFIED_FACES;
+    memcpy(simplify_command->buffers, scatter_face_buffers, sizeof(scatter_face_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = face_groups;
+
+    vkmesh_vk_buffer scatter_vertex_buffers[4];
+    scatter_vertex_buffers[0] = dm->vertices;
+    scatter_vertex_buffers[1] = *edge_scratch_buffer;
+    scatter_vertex_buffers[2] = next_vertices;
+    scatter_vertex_buffers[3] = counter;
+    simplify_command = &simplify_commands[simplify_command_count++];
+    memset(&push, 0, sizeof(push));
+    push.n = vertex_count;
+    push.aux0 = (uint32_t) qem_base;
+    simplify_command->pipeline_kind = VKMESH_PIPE_SCATTER_SIMPLIFIED_VERTICES;
+    memcpy(simplify_command->buffers, scatter_vertex_buffers, sizeof(scatter_vertex_buffers));
+    simplify_command->push = push;
+    simplify_command->groups_x = vertex_groups;
+
+    if (!vkmesh_dispatch_batch(vk, simplify_commands, simplify_command_count)) goto cleanup;
+
+    const uint32_t * scratch_words = (const uint32_t *) edge_scratch_buffer->mapped;
+    const uint32_t collapsed_u32 = scratch_words[counter_base];
     uint32_t removed_u32 = 0u;
-    if (!compact_device_mesh_from_flags(dm, &scratch, (uint32_t) face_keep_base, &removed_u32)) goto cleanup;
+    if (collapsed_u32 > 0u) {
+        const uint32_t keep_count = scratch_words[face_keep_base + face_count - 1u];
+        const uint32_t compact_vertex_count = scratch_words[qem_base + vertex_count - 1u];
+        if (keep_count == 0u || keep_count > face_count ||
+            compact_vertex_count == 0u || compact_vertex_count > vertex_count) goto cleanup;
+        removed_u32 = face_count - keep_count;
+
+        vkmesh_vk_buffer previous_faces = dm->faces;
+        dm->faces = adjacency_buffer;
+        adjacency_buffer = previous_faces;
+        vkmesh_vk_buffer previous_vertices = dm->vertices;
+        dm->vertices = next_vertices;
+        next_vertices = previous_vertices;
+        dm->n_faces = keep_count;
+        dm->n_vertices = compact_vertex_count;
+    }
     if (collapsed_edges != NULL) *collapsed_edges = collapsed_u32;
     if (removed_faces != NULL) *removed_faces = removed_u32;
     ok = 1;
 
 cleanup:
-    vk_buffer_destroy(vk, &degree_buffer);
-    vk_buffer_destroy(vk, &offset_a_buffer);
-    vk_buffer_destroy(vk, &offset_b_buffer);
-    vk_buffer_destroy(vk, &adjacency_buffer);
-    vk_buffer_destroy(vk, &edges_buffer);
-    vk_buffer_destroy(vk, &edge_dummy);
-    vk_buffer_destroy(vk, &unique_edges);
-    vk_buffer_destroy(vk, &boundary_flags);
-    vk_buffer_destroy(vk, &counter);
-    vk_buffer_destroy(vk, &scratch);
+    workspace->edge_data = edge_data;
+    workspace->edge_aux = unique_edges;
+    workspace->offsets = offset_a_buffer;
+    workspace->adjacency_faces = adjacency_buffer;
+    workspace->vertex_aux = boundary_flags;
+    workspace->control = counter;
+    workspace->next_vertices = next_vertices;
     return ok;
+}
+
+typedef enum vkmesh_simplify_stop_reason {
+    VKMESH_SIMPLIFY_TARGET_REACHED = 0,
+    VKMESH_SIMPLIFY_MAX_STEPS,
+    VKMESH_SIMPLIFY_NO_PROGRESS,
+    VKMESH_SIMPLIFY_THRESHOLD_EXHAUSTED,
+} vkmesh_simplify_stop_reason;
+
+typedef struct vkmesh_simplify_result {
+    int64_t initial_faces;
+    int64_t final_faces;
+    int target_faces;
+    int steps;
+    int threshold_escalations;
+    uint64_t total_collapsed;
+    uint64_t total_removed;
+    float final_threshold;
+    int target_reached;
+    vkmesh_simplify_stop_reason stop_reason;
+} vkmesh_simplify_result;
+
+static const char * vkmesh_simplify_stop_reason_name(vkmesh_simplify_stop_reason reason) {
+    switch (reason) {
+        case VKMESH_SIMPLIFY_TARGET_REACHED: return "target_reached";
+        case VKMESH_SIMPLIFY_MAX_STEPS: return "max_steps";
+        case VKMESH_SIMPLIFY_NO_PROGRESS: return "no_progress";
+        case VKMESH_SIMPLIFY_THRESHOLD_EXHAUSTED: return "threshold_exhausted";
+        default: return "unknown";
+    }
+}
+
+static void vkmesh_store_simplify_result(
+    vkmesh_simplify_result * result,
+    int64_t initial_faces,
+    int64_t final_faces,
+    int target_faces,
+    int steps,
+    int threshold_escalations,
+    uint64_t total_collapsed,
+    uint64_t total_removed,
+    float final_threshold,
+    vkmesh_simplify_stop_reason stop_reason) {
+    if (result == NULL) return;
+    result->initial_faces = initial_faces;
+    result->final_faces = final_faces;
+    result->target_faces = target_faces;
+    result->steps = steps;
+    result->threshold_escalations = threshold_escalations;
+    result->total_collapsed = total_collapsed;
+    result->total_removed = total_removed;
+    result->final_threshold = final_threshold;
+    result->target_reached = final_faces <= (int64_t) target_faces;
+    result->stop_reason = result->target_reached ? VKMESH_SIMPLIFY_TARGET_REACHED : stop_reason;
+}
+
+static void vkmesh_log_simplify_target_warning(
+    const char * label,
+    const vkmesh_simplify_result * result) {
+    if (result == NULL || result->target_reached) return;
+    fprintf(stderr,
+        "vkmesh: WARNING simplify target_not_reached label=%s reason=%s initial=%" PRId64
+        " target=%d final=%" PRId64 " steps=%d threshold_escalations=%d final_threshold=%.9g"
+        " collapsed=%" PRIu64 " removed_faces=%" PRIu64 "\n",
+        label != NULL ? label : "simplify",
+        vkmesh_simplify_stop_reason_name(result->stop_reason),
+        result->initial_faces,
+        result->target_faces,
+        result->final_faces,
+        result->steps,
+        result->threshold_escalations,
+        result->final_threshold,
+        result->total_collapsed,
+        result->total_removed);
 }
 
 static int vkmesh_device_simplify(
@@ -4844,17 +6359,25 @@ static int vkmesh_device_simplify(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed) {
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
+    vkmesh_simplify_result * result) {
     if (dm == NULL || dm->vk == NULL || dm->n_vertices == 0u || dm->n_faces == 0u) {
         return 0;
     }
     if (target_faces <= 0) target_faces = 1;
 
-    uint32_t total_collapsed_u32 = 0u;
-    uint32_t total_removed_u32 = 0u;
+    const uint32_t initial_faces = dm->n_faces;
+    uint64_t total_collapsed_u64 = 0u;
+    uint64_t total_removed_u64 = 0u;
+    vkmesh_simplify_workspace workspace;
+    memset(&workspace, 0, sizeof(workspace));
+    int ok = 0;
 
     int step = 0;
+    int consecutive_no_progress = 0;
+    int threshold_escalations = 0;
+    vkmesh_simplify_stop_reason stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
     while (dm->n_faces > (uint32_t) target_faces && (max_steps <= 0 || step < max_steps)) {
         uint32_t before = dm->n_faces;
         uint32_t collapsed = 0u;
@@ -4866,10 +6389,21 @@ static int vkmesh_device_simplify(
             target_faces,
             threshold);
         fflush(stderr);
-        if (!vkmesh_device_simplify_step(dm, lambda_edge_length, lambda_skinny, threshold, &collapsed, &removed)) return 0;
-        if (total_collapsed_u32 > UINT32_MAX - collapsed || total_removed_u32 > UINT32_MAX - removed) return 0;
-        total_collapsed_u32 += collapsed;
-        total_removed_u32 += removed;
+        if (!vkmesh_device_simplify_step(
+                dm,
+                lambda_edge_length,
+                lambda_skinny,
+                threshold,
+                &workspace,
+                &collapsed,
+                &removed)) goto cleanup;
+        if (total_collapsed_u64 > UINT64_MAX - (uint64_t) collapsed ||
+            total_removed_u64 > UINT64_MAX - (uint64_t) removed) {
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            goto cleanup;
+        }
+        total_collapsed_u64 += (uint64_t) collapsed;
+        total_removed_u64 += (uint64_t) removed;
         ++step;
         fprintf(stderr,
             "vkmesh: simplify step=%d end collapsed=%u removed_faces=%u faces=%u\n",
@@ -4879,13 +6413,52 @@ static int vkmesh_device_simplify(
             dm->n_faces);
         fflush(stderr);
         if (dm->n_faces <= (uint32_t) target_faces) break;
-        if (collapsed == 0u || removed == 0u || removed * 100u < before) threshold *= 10.0f;
+        if (collapsed == 0u || removed == 0u) {
+            ++consecutive_no_progress;
+        } else {
+            consecutive_no_progress = 0;
+        }
+        if (consecutive_no_progress >= 16) {
+            fprintf(stderr,
+                "vkmesh: simplify stopped after %d consecutive no-progress rounds at %u faces\n",
+                consecutive_no_progress,
+                dm->n_faces);
+            stop_reason = VKMESH_SIMPLIFY_NO_PROGRESS;
+            break;
+        }
+        if (max_steps > 0 && step >= max_steps) {
+            stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
+            break;
+        }
+        if (collapsed == 0u || removed == 0u || (uint64_t) removed * 100ull < (uint64_t) before) {
+            if (!isfinite(threshold) || threshold > FLT_MAX / 10.0f) {
+                fprintf(stderr, "vkmesh: simplify stopped because threshold can no longer increase\n");
+                stop_reason = VKMESH_SIMPLIFY_THRESHOLD_EXHAUSTED;
+                break;
+            }
+            threshold *= 10.0f;
+            ++threshold_escalations;
+        }
     }
 
-    if (total_collapsed_u32 > (uint32_t) INT_MAX || total_removed_u32 > (uint32_t) INT_MAX) return 0;
-    *total_collapsed = (int) total_collapsed_u32;
-    *total_removed = (int) total_removed_u32;
-    return 1;
+    *total_collapsed = total_collapsed_u64;
+    *total_removed = total_removed_u64;
+    vkmesh_store_simplify_result(
+        result,
+        initial_faces,
+        dm->n_faces,
+        target_faces,
+        step,
+        threshold_escalations,
+        *total_collapsed,
+        *total_removed,
+        threshold,
+        stop_reason);
+    ok = 1;
+
+cleanup:
+    vkmesh_simplify_workspace_destroy(dm->vk, &workspace);
+    return ok;
 }
 
 static int vkmesh_simplify_device_vulkan(
@@ -4895,8 +6468,9 @@ static int vkmesh_simplify_device_vulkan(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed) {
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
+    vkmesh_simplify_result * result) {
     if (mesh == NULL || mesh->n_vertices <= 0 || mesh->n_vertices > UINT32_MAX ||
         mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX) {
         return 0;
@@ -4921,7 +6495,8 @@ static int vkmesh_simplify_device_vulkan(
             threshold,
             max_steps,
             total_collapsed,
-            total_removed)) {
+            total_removed,
+            result)) {
         goto cleanup;
     }
     if (!vkmesh_device_mesh_download(&dm, mesh)) goto cleanup;
@@ -4971,6 +6546,7 @@ static int vkmesh_simplify_step_cpu(
     for (int64_t e = 0; e < edge_count; ++e) {
         if (edges[e].cost > (double) threshold) continue;
         int32_t verts[2] = { edges[e].v0, edges[e].v1 };
+        if (verts[0] == verts[1]) continue;
         int can_collapse = !selected_vertex[verts[0]] && !selected_vertex[verts[1]];
         for (int side = 0; side < 2 && can_collapse; ++side) {
             int32_t v = verts[side];
@@ -4992,6 +6568,7 @@ static int vkmesh_simplify_step_cpu(
         if (!selected_edge[e]) continue;
         int32_t v0 = edges[e].v0;
         int32_t v1 = edges[e].v1;
+        if (v0 == v1) continue;
         memcpy(mesh->vertices + (size_t) v0 * 3u, edges[e].pos, 3u * sizeof(float));
         for (int i = v2f_offset[v0]; i < v2f_offset[v0 + 1]; ++i) {
             int face_id = v2f[i];
@@ -5006,9 +6583,11 @@ static int vkmesh_simplify_step_cpu(
             if (f[2] == v1) f[2] = v0;
         }
     }
-    if (!mesh_remove_faces_by_mask_vulkan(mesh, keep_face, removed_faces) &&
-        !mesh_remove_faces_by_mask(mesh, keep_face, removed_faces)) {
-        goto cleanup;
+    if (!mesh_remove_faces_by_mask_vulkan(mesh, keep_face, removed_faces)) {
+        if (vkmesh_fatal_error_blocks_fallback("simplify face compaction Vulkan path") ||
+            !mesh_remove_faces_by_mask(mesh, keep_face, removed_faces)) {
+            goto cleanup;
+        }
     }
     ok = 1;
 
@@ -5035,6 +6614,7 @@ static int vkmesh_simplify_step(
     if (vkmesh_simplify_step_vulkan(mesh, lambda_edge_length, lambda_skinny, threshold, collapsed_edges, removed_faces)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("per-step Vulkan simplify")) return 0;
     return vkmesh_simplify_step_cpu(mesh, lambda_edge_length, lambda_skinny, threshold, collapsed_edges, removed_faces);
 }
 
@@ -5045,8 +6625,9 @@ static int vkmesh_simplify(
     float lambda_skinny,
     float threshold,
     int max_steps,
-    int * total_collapsed,
-    int * total_removed) {
+    uint64_t * total_collapsed,
+    uint64_t * total_removed,
+    vkmesh_simplify_result * result) {
     *total_collapsed = 0;
     *total_removed = 0;
     if (target_faces <= 0) target_faces = 1;
@@ -5058,13 +6639,25 @@ static int vkmesh_simplify(
             threshold,
             max_steps,
             total_collapsed,
-            total_removed)) {
+            total_removed,
+            result)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("device Vulkan simplify")) return 0;
 
+    /* The device attempt never committed its mesh. Do not carry its counters
+       or diagnostic result into the host fallback. */
+    *total_collapsed = 0u;
+    *total_removed = 0u;
+    if (result != NULL) memset(result, 0, sizeof(*result));
+
+    const int64_t initial_faces = mesh->n_faces;
     int step = 0;
+    int consecutive_no_progress = 0;
+    int threshold_escalations = 0;
+    vkmesh_simplify_stop_reason stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
     while (mesh->n_faces > target_faces && (max_steps <= 0 || step < max_steps)) {
-        int before = (int) mesh->n_faces;
+        int64_t before = mesh->n_faces;
         int collapsed = 0;
         int removed = 0;
         fprintf(stderr,
@@ -5075,8 +6668,14 @@ static int vkmesh_simplify(
             threshold);
         fflush(stderr);
         if (!vkmesh_simplify_step(mesh, lambda_edge_length, lambda_skinny, threshold, &collapsed, &removed)) return 0;
-        *total_collapsed += collapsed;
-        *total_removed += removed;
+        if (collapsed < 0 || removed < 0 ||
+            *total_collapsed > UINT64_MAX - (uint64_t) collapsed ||
+            *total_removed > UINT64_MAX - (uint64_t) removed) {
+            vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+            return 0;
+        }
+        *total_collapsed += (uint64_t) collapsed;
+        *total_removed += (uint64_t) removed;
         ++step;
         fprintf(stderr,
             "vkmesh: simplify step=%d end collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
@@ -5086,8 +6685,44 @@ static int vkmesh_simplify(
             mesh->n_faces);
         fflush(stderr);
         if (mesh->n_faces <= target_faces) break;
-        if (collapsed == 0 || removed == 0 || removed * 100 < before) threshold *= 10.0f;
+        if (collapsed == 0 || removed == 0) {
+            ++consecutive_no_progress;
+        } else {
+            consecutive_no_progress = 0;
+        }
+        if (consecutive_no_progress >= 16) {
+            fprintf(stderr,
+                "vkmesh: simplify stopped after %d consecutive no-progress rounds at %" PRId64 " faces\n",
+                consecutive_no_progress,
+                mesh->n_faces);
+            stop_reason = VKMESH_SIMPLIFY_NO_PROGRESS;
+            break;
+        }
+        if (max_steps > 0 && step >= max_steps) {
+            stop_reason = VKMESH_SIMPLIFY_MAX_STEPS;
+            break;
+        }
+        if (collapsed == 0 || removed == 0 || (int64_t) removed * 100ll < before) {
+            if (!isfinite(threshold) || threshold > FLT_MAX / 10.0f) {
+                fprintf(stderr, "vkmesh: simplify stopped because threshold can no longer increase\n");
+                stop_reason = VKMESH_SIMPLIFY_THRESHOLD_EXHAUSTED;
+                break;
+            }
+            threshold *= 10.0f;
+            ++threshold_escalations;
+        }
     }
+    vkmesh_store_simplify_result(
+        result,
+        initial_faces,
+        mesh->n_faces,
+        target_faces,
+        step,
+        threshold_escalations,
+        *total_collapsed,
+        *total_removed,
+        threshold,
+        stop_reason);
     return 1;
 }
 
@@ -5196,10 +6831,10 @@ static uint32_t bvh_build_recursive(
     uint32_t node_id = (*node_count)++;
     vkmesh_bvh_node * node = &nodes[node_id];
     bvh_bounds_init(node->bmin, node->bmax);
-    for (int i = start; i < start + count; ++i) {
-        bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
-    }
     if (count <= 4) {
+        for (int i = start; i < start + count; ++i) {
+            bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
+        }
         node->left = (uint32_t) start;
         node->meta = 0x80000000u | (uint32_t) count;
         return node_id;
@@ -5209,6 +6844,7 @@ static uint32_t bvh_build_recursive(
     float cmax[3];
     bvh_bounds_init(cmin, cmax);
     for (int i = start; i < start + count; ++i) {
+        bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
         bvh_bounds_add(cmin, cmax, tris[i].centroid, tris[i].centroid);
     }
     float ex[3] = { cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2] };
@@ -5226,7 +6862,14 @@ static uint32_t bvh_build_recursive(
         }
     }
     int left_count = mid - start;
-    if (left_count <= 0 || left_count >= count) left_count = count / 2;
+    /* The GPU traversal uses a fixed 64-entry stack. Midpoint partitioning can
+       isolate one triangle at a time on exponentially spaced input, so keep
+       both children large enough to bound the tree depth. The fallback only
+       changes grouping; child bounds are rebuilt from their actual triangles. */
+    if ((int64_t) left_count * 3 < count ||
+        (int64_t) (count - left_count) * 3 < count) {
+        left_count = count / 2;
+    }
     uint32_t left = bvh_build_recursive(tris, start, left_count, nodes, node_count);
     uint32_t right = bvh_build_recursive(tris, start + left_count, count - left_count, nodes, node_count);
     node->left = left;
@@ -5425,9 +7068,9 @@ static int vkmesh_distance_query_init(
         return 0;
     }
 
-    if (!vk_buffer_create(vk, faces_bytes, &query->buffers[0]) ||
-        !vk_buffer_create(vk, vertices_bytes, &query->buffers[1]) ||
-        !vk_buffer_create(vk, aux_bytes, &query->buffers[3])) {
+    if (!vk_buffer_create_uninitialized(vk, faces_bytes, &query->buffers[0]) ||
+        !vk_buffer_create_uninitialized(vk, vertices_bytes, &query->buffers[1]) ||
+        !vk_buffer_create_uninitialized(vk, aux_bytes, &query->buffers[3])) {
         goto fail;
     }
     memcpy(query->buffers[0].mapped, mesh->faces, faces_bytes);
@@ -5468,7 +7111,8 @@ static int vkmesh_distance_query_init(
     }
 
     while (capacity > 0) {
-        if (vk_buffer_create(vk, capacity * 5u * sizeof(uint32_t), &query->buffers[2])) break;
+        /* The CPU rewrites and scans this batch around every dispatch. */
+        if (vk_buffer_create_host_cached(vk, capacity * 5u * sizeof(uint32_t), &query->buffers[2])) break;
         if (capacity <= 128u) goto fail;
         capacity = (capacity / 2u) & ~(size_t) 127u;
     }
@@ -5702,8 +7346,6 @@ static void vkmesh_hash_destroy(vkmesh_u64_u32_hash * map) {
     memset(map, 0, sizeof(*map));
 }
 
-static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key);
-
 static int vkmesh_hash_insert_no_grow(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
     size_t mask = map->capacity - 1u;
     size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
@@ -5752,13 +7394,37 @@ static int vkmesh_hash_grow(vkmesh_u64_u32_hash * map) {
     return 1;
 }
 
-static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
-    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
-    if (vkmesh_hash_lookup(map, key) != UINT32_MAX) {
-        return vkmesh_hash_insert_no_grow(map, key, value);
+static inline int vkmesh_hash_insert_if_absent(
+    vkmesh_u64_u32_hash * map,
+    uint64_t key,
+    uint32_t value,
+    int * inserted_out) {
+    if (map == NULL || map->keys == NULL || map->capacity == 0 ||
+        key == UINT64_MAX || inserted_out == NULL) {
+        return 0;
     }
-    if (map->count + 1u > map->capacity - map->capacity / 4u && !vkmesh_hash_grow(map)) return 0;
-    return vkmesh_hash_insert_no_grow(map, key, value);
+    for (;;) {
+        const size_t mask = map->capacity - 1u;
+        size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
+        for (size_t i = 0; i < map->capacity; ++i) {
+            const uint64_t previous = map->keys[slot];
+            if (previous == key) {
+                *inserted_out = 0;
+                return 1;
+            }
+            if (previous == UINT64_MAX) {
+                if (value == UINT32_MAX) return 0;
+                if (map->count + 1u > map->capacity - map->capacity / 4u) break;
+                map->keys[slot] = key;
+                map->vals[slot] = value;
+                map->count += 1u;
+                *inserted_out = 1;
+                return 1;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (!vkmesh_hash_grow(map)) return 0;
+    }
 }
 
 static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key) {
@@ -6016,11 +7682,593 @@ static int vkmesh_remesh_build_active_hash(
     vkmesh_u64_u32_hash * hash_out) {
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     if (!vkmesh_hash_init(hash_out, (size_t) coord_count)) return 0;
+    /* hash_init reserves more than twice the requested entries, so this fixed
+       batch cannot reach the grow threshold. */
     for (int64_t i = 0; i < coord_count; ++i) {
         uint64_t key = vkmesh_remesh_coord_key(coords[i].x, coords[i].y, coords[i].z, resolution);
-        if (!vkmesh_hash_insert(hash_out, key, (uint32_t) i)) return 0;
+        if (key == UINT64_MAX || !vkmesh_hash_insert_no_grow(hash_out, key, (uint32_t) i)) {
+            vkmesh_hash_destroy(hash_out);
+            return 0;
+        }
     }
     return 1;
+}
+
+#define VKMESH_REMESH_GPU_CORNER_MIN_CELLS (1u << 18u)
+
+/* Build the exact active-cell corner union, sample its UDF, run simple Dual
+   Contouring, and emit the compact triangle mesh without materializing the
+   sparse topology on the CPU. */
+static int vkmesh_remesh_build_mesh_gpu(
+    vkmesh_vk * vk,
+    vkmesh_distance_query * query,
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    int resolution,
+    const float center[3],
+    float scale,
+    float eps,
+    int release_query,
+    int64_t * grid_count_out,
+    vkmesh_mesh * mesh_out) {
+    if (grid_count_out == NULL || mesh_out == NULL) return 0;
+    *grid_count_out = 0;
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    if (vk == NULL || query == NULL || query->vk != vk || query->point_capacity == 0u ||
+        coords == NULL || center == NULL || resolution <= 0 || !(scale > 0.0f) ||
+        coord_count < (int64_t) VKMESH_REMESH_GPU_CORNER_MIN_CELLS ||
+        coord_count > (int64_t) (UINT32_MAX / 8u)) {
+        return 0;
+    }
+
+    const uint32_t cell_count = (uint32_t) coord_count;
+    const uint64_t resolution_u64 = (uint64_t) (uint32_t) resolution;
+    const uint64_t grid_dimension_u64 = resolution_u64 + 1u;
+    if (grid_dimension_u64 * grid_dimension_u64 > UINT32_MAX ||
+        grid_dimension_u64 * grid_dimension_u64 * grid_dimension_u64 > UINT32_MAX) {
+        return 0;
+    }
+    for (int64_t i = 0; i < coord_count; ++i) {
+        if (coords[i].x < 0 || coords[i].y < 0 || coords[i].z < 0 ||
+            coords[i].x >= resolution || coords[i].y >= resolution ||
+            coords[i].z >= resolution) {
+            return 0;
+        }
+    }
+
+    const uint64_t hash_need_u64 = ((uint64_t) cell_count * 10u + 6u) / 7u;
+    if (hash_need_u64 > SIZE_MAX) return 0;
+    size_t hash_capacity_size = 0u;
+    if (!vkmesh_next_pow2_size((size_t) hash_need_u64, &hash_capacity_size) ||
+        hash_capacity_size > UINT32_MAX) {
+        return 0;
+    }
+    const uint32_t hash_capacity = (uint32_t) hash_capacity_size;
+
+    const uint64_t max_grid_count_u64 = 2u * (uint64_t) cell_count;
+    const uint64_t vertex_hash_need_u64 = (max_grid_count_u64 * 10u + 6u) / 7u;
+    if (vertex_hash_need_u64 > SIZE_MAX) return 0;
+    size_t max_vertex_hash_capacity_size = 0u;
+    if (!vkmesh_next_pow2_size(
+            (size_t) vertex_hash_need_u64, &max_vertex_hash_capacity_size) ||
+        max_vertex_hash_capacity_size > UINT32_MAX ||
+        max_vertex_hash_capacity_size > SIZE_MAX / (2u * sizeof(uint32_t))) {
+        return 0;
+    }
+    if ((size_t) cell_count > SIZE_MAX / (6u * sizeof(uint32_t))) return 0;
+    const uint64_t max_dc_words_u64 =
+        2u * (uint64_t) max_vertex_hash_capacity_size + 6u * (uint64_t) cell_count;
+    if (max_dc_words_u64 > SIZE_MAX / sizeof(uint32_t)) return 0;
+    const size_t max_dc_bytes = (size_t) max_dc_words_u64 * sizeof(uint32_t);
+
+    /* Packed words:
+       [3*N coords][N+1 counts][N masks][N+1 offsets][6*N reusable tail].
+       The tail first stores [hash keys][hash values], then the emit pass
+       overwrites it with capacity for at most 2*N unique corners. */
+    const uint64_t counts_base_u64 = 3u * (uint64_t) cell_count;
+    const uint64_t offsets_base_u64 = 5u * (uint64_t) cell_count + 1u;
+    const uint64_t tail_base_u64 = 6u * (uint64_t) cell_count + 2u;
+    const uint64_t workspace_words_u64 = 12u * (uint64_t) cell_count + 2u;
+    if (2u * (uint64_t) hash_capacity > 6u * (uint64_t) cell_count ||
+        workspace_words_u64 > SIZE_MAX / sizeof(uint32_t) ||
+        workspace_words_u64 > UINT32_MAX ||
+        tail_base_u64 > UINT32_MAX || offsets_base_u64 > UINT32_MAX ||
+        counts_base_u64 > UINT32_MAX) {
+        return 0;
+    }
+    const uint32_t counts_base = (uint32_t) counts_base_u64;
+    const uint32_t offsets_base = (uint32_t) offsets_base_u64;
+    const uint32_t tail_base = (uint32_t) tail_base_u64;
+    const size_t workspace_bytes = (size_t) workspace_words_u64 * sizeof(uint32_t);
+
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(vk->physical_device, &properties);
+    const VkDeviceSize max_range = properties.limits.maxStorageBufferRange;
+    const uint64_t cell_groups = ((uint64_t) cell_count + 127u) / 128u;
+    const uint64_t scan_groups = ((uint64_t) cell_count + 256u) / 256u;
+    const uint64_t max_vertex_groups = (max_grid_count_u64 + 127u) / 128u;
+    const uint64_t max_hash_fill_groups =
+        ((uint64_t) max_vertex_hash_capacity_size + 127u) / 128u;
+    if ((VkDeviceSize) workspace_bytes > max_range ||
+        (VkDeviceSize) max_dc_bytes > max_range ||
+        cell_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        scan_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        max_vertex_groups > properties.limits.maxComputeWorkGroupCount[0] ||
+        max_hash_fill_groups > properties.limits.maxComputeWorkGroupCount[0]) {
+        return 0;
+    }
+
+    size_t scan_reserve = 0u;
+    uint64_t scan_count = (uint64_t) cell_count + 1u;
+    while (scan_count > VKMESH_SCAN_BLOCK_SIZE) {
+        scan_count = (scan_count + VKMESH_SCAN_BLOCK_SIZE - 1u) / VKMESH_SCAN_BLOCK_SIZE;
+        const uint64_t bytes_u64 = scan_count * sizeof(uint32_t) + 64u * 1024u;
+        if (bytes_u64 > SIZE_MAX || scan_reserve > SIZE_MAX - (size_t) bytes_u64) return 0;
+        scan_reserve += (size_t) bytes_u64;
+    }
+    const size_t phase_scratch_bytes = max_dc_bytes > query->buffers[2].bytes ?
+        max_dc_bytes : query->buffers[2].bytes;
+    const size_t phase_sizes[] = {
+        workspace_bytes,
+        phase_scratch_bytes,
+        scan_reserve,
+        6u * 64u * 1024u,
+    };
+    size_t phase_required = 0u;
+    for (size_t i = 0u; i < sizeof(phase_sizes) / sizeof(phase_sizes[0]); ++i) {
+        if (phase_required > SIZE_MAX - phase_sizes[i]) return 0;
+        phase_required += phase_sizes[i];
+    }
+    if (vk->workspace_budget_bytes > 0u) {
+        const size_t available = vk->workspace_budget_bytes > vk->workspace_current_bytes ?
+            vk->workspace_budget_bytes - vk->workspace_current_bytes : 0u;
+        if (phase_required > available) return 0;
+    }
+
+    vkmesh_vk_buffer workspace;
+    vkmesh_vk_buffer dc_buffer;
+    vkmesh_vk_buffer grid_query_buffer;
+    vkmesh_vk_buffer output_buffer;
+    vkmesh_vk_buffer status_buffer;
+    vkmesh_vk_buffer dummy_buffer;
+    vkmesh_vk_buffer scan_sums[VKMESH_SCAN_MAX_LEVELS];
+    memset(&workspace, 0, sizeof(workspace));
+    memset(&dc_buffer, 0, sizeof(dc_buffer));
+    memset(&grid_query_buffer, 0, sizeof(grid_query_buffer));
+    memset(&output_buffer, 0, sizeof(output_buffer));
+    memset(&status_buffer, 0, sizeof(status_buffer));
+    memset(&dummy_buffer, 0, sizeof(dummy_buffer));
+    memset(scan_sums, 0, sizeof(scan_sums));
+    vkmesh_mesh gpu_mesh;
+    memset(&gpu_mesh, 0, sizeof(gpu_mesh));
+    int ok = 0;
+
+    if (!vk_buffer_create_uninitialized(vk, workspace_bytes, &workspace) ||
+        !vk_buffer_create(vk, 6u * sizeof(uint32_t), &status_buffer) ||
+        !vk_buffer_create(vk, sizeof(uint32_t), &dummy_buffer)) {
+        goto cleanup;
+    }
+    uint32_t * workspace_words = (uint32_t *) workspace.mapped;
+    memcpy(workspace_words, coords, (size_t) cell_count * sizeof(vkmesh_remesh_coord));
+
+    vkmesh_dispatch_command commands[VKMESH_SCAN_COMMAND_MAX + 3u];
+    memset(commands, 0, sizeof(commands));
+    uint32_t command_count = 0u;
+    vkmesh_dispatch_command * command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = hash_capacity;
+    command->push.aux1 = tail_base;
+    command->groups_x = (hash_capacity + 127u) / 128u;
+
+    command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_ACTIVE_HASH;
+    command->buffers[0] = workspace;
+    command->buffers[1] = workspace;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &commands[command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_CORNER_OWNERS;
+    command->buffers[0] = workspace;
+    command->buffers[1] = workspace;
+    command->buffers[2] = workspace;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count + 1u,
+            counts_base,
+            offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            commands,
+            VKMESH_SCAN_COMMAND_MAX + 3u,
+            &command_count) ||
+        !vkmesh_dispatch_batch(vk, commands, command_count)) {
+        if (g_vkmesh_last_error == VKMESH_ERROR_NONE) vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        goto cleanup;
+    }
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        fprintf(stderr, "vkmesh: remesh GPU active hash saturated; using CPU corner path\n");
+        goto cleanup;
+    }
+
+    const uint32_t grid_count = workspace_words[offsets_base + cell_count];
+    if (grid_count == 0u || grid_count > cell_count * 2u ||
+        (size_t) grid_count > SIZE_MAX / sizeof(vkmesh_remesh_coord)) {
+        fprintf(stderr,
+            "vkmesh: remesh GPU corner tail exceeded cells=%u corners=%u; using CPU corner path\n",
+            cell_count,
+            grid_count);
+        goto cleanup;
+    }
+    vkmesh_vk_buffer emit_buffers[4] = {
+        workspace, workspace, workspace, workspace,
+    };
+    vkmesh_push emit_push;
+    memset(&emit_push, 0, sizeof(emit_push));
+    emit_push.n = cell_count;
+    if (!vkmesh_dispatch(
+            vk,
+            VKMESH_PIPE_REMESH_EMIT_CORNERS,
+            emit_buffers,
+            &emit_push,
+            (cell_count + 127u) / 128u)) {
+        goto cleanup;
+    }
+
+    float * transform = (float *) status_buffer.mapped;
+    transform[0] = center[0];
+    transform[1] = center[1];
+    transform[2] = center[2];
+    transform[3] = scale;
+    transform[4] = 1.0f / (float) resolution;
+    /* The general distance-query IO is host-cached for CPU callers. Remesh
+       produces and consumes these batches entirely on the GPU, so use the
+       device-preferred memory type and avoid writing millions of points over
+       PCIe on devices without a cached local mapping. */
+    if (!vk_buffer_create_uninitialized(
+            vk, query->buffers[2].bytes, &grid_query_buffer)) {
+        goto cleanup;
+    }
+    uint32_t grid_offset = 0u;
+    while (grid_offset < grid_count) {
+        uint32_t batch = query->point_capacity;
+        if (batch > grid_count - grid_offset) batch = grid_count - grid_offset;
+        vkmesh_dispatch_command query_commands[3];
+        memset(query_commands, 0, sizeof(query_commands));
+
+        query_commands[0].pipeline_kind = VKMESH_PIPE_REMESH_LOAD_GRID_POINTS;
+        query_commands[0].buffers[0] = workspace;
+        query_commands[0].buffers[1] = grid_query_buffer;
+        query_commands[0].buffers[2] = status_buffer;
+        query_commands[0].buffers[3] = dummy_buffer;
+        query_commands[0].push.n = batch;
+        query_commands[0].push.aux0 = grid_offset;
+        query_commands[0].push.aux1 = (uint32_t) resolution;
+        query_commands[0].push.aux2 = tail_base;
+        query_commands[0].groups_x = (batch + 127u) / 128u;
+
+        query_commands[1].pipeline_kind = VKMESH_PIPE_UNSIGNED_DISTANCE;
+        for (uint32_t binding = 0u; binding < 4u; ++binding) {
+            query_commands[1].buffers[binding] = query->buffers[binding];
+        }
+        query_commands[1].buffers[2] = grid_query_buffer;
+        query_commands[1].push.n = batch;
+        query_commands[1].push.aux0 = query->face_count;
+        query_commands[1].push.aux1 = query->node_count;
+        query_commands[1].push.aux2 = query->output_word_offset;
+        query_commands[1].groups_x = (batch + 127u) / 128u;
+
+        query_commands[2].pipeline_kind = VKMESH_PIPE_REMESH_STORE_GRID_VALUES;
+        query_commands[2].buffers[0] = grid_query_buffer;
+        query_commands[2].buffers[1] = workspace;
+        query_commands[2].buffers[2] = dummy_buffer;
+        query_commands[2].buffers[3] = dummy_buffer;
+        query_commands[2].push.n = batch;
+        query_commands[2].push.aux0 = query->output_word_offset;
+        query_commands[2].push.aux1 = counts_base + grid_offset;
+        query_commands[2].push.eps = eps;
+        query_commands[2].groups_x = (batch + 127u) / 128u;
+
+        if (!vkmesh_dispatch_batch(vk, query_commands, 3u)) goto cleanup;
+        ++query->batch_count;
+        grid_offset += batch;
+    }
+    vk_buffer_destroy(vk, &grid_query_buffer);
+
+    const uint64_t vertex_hash_need = ((uint64_t) grid_count * 10u + 6u) / 7u;
+    size_t vertex_hash_capacity_size = 0u;
+    if (vertex_hash_need > SIZE_MAX ||
+        !vkmesh_next_pow2_size((size_t) vertex_hash_need, &vertex_hash_capacity_size) ||
+        vertex_hash_capacity_size > UINT32_MAX ||
+        vertex_hash_capacity_size > SIZE_MAX / (2u * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+    const uint32_t vertex_hash_capacity = (uint32_t) vertex_hash_capacity_size;
+    if (vertex_hash_capacity < hash_capacity) goto cleanup;
+    const uint64_t dc_base_u64 = 2u * (uint64_t) vertex_hash_capacity;
+    const uint64_t dc_words_u64 = dc_base_u64 + 6u * (uint64_t) cell_count;
+    if (dc_base_u64 > UINT32_MAX || dc_words_u64 > UINT32_MAX ||
+        dc_words_u64 > SIZE_MAX / sizeof(uint32_t)) {
+        goto cleanup;
+    }
+    const uint32_t dc_base = (uint32_t) dc_base_u64;
+    const size_t dc_bytes = (size_t) dc_words_u64 * sizeof(uint32_t);
+    if ((VkDeviceSize) dc_bytes > max_range ||
+        !vk_buffer_create_uninitialized(vk, dc_bytes, &dc_buffer)) {
+        goto cleanup;
+    }
+    ((uint32_t *) status_buffer.mapped)[0] = 0u;
+    vkmesh_dispatch_command dc_commands[3];
+    memset(dc_commands, 0, sizeof(dc_commands));
+
+    dc_commands[0].pipeline_kind = VKMESH_PIPE_FILL_U32;
+    dc_commands[0].buffers[0] = dc_buffer;
+    dc_commands[0].buffers[1] = dummy_buffer;
+    dc_commands[0].buffers[2] = dummy_buffer;
+    dc_commands[0].buffers[3] = dummy_buffer;
+    dc_commands[0].push.n = vertex_hash_capacity;
+    dc_commands[0].push.aux0 = 0u;
+    dc_commands[0].push.aux1 = 0u;
+    dc_commands[0].groups_x = (vertex_hash_capacity + 127u) / 128u;
+
+    dc_commands[1].pipeline_kind = VKMESH_PIPE_REMESH_VERTEX_HASH;
+    dc_commands[1].buffers[0] = workspace;
+    dc_commands[1].buffers[1] = dc_buffer;
+    dc_commands[1].buffers[2] = status_buffer;
+    dc_commands[1].buffers[3] = dummy_buffer;
+    dc_commands[1].push.n = grid_count;
+    dc_commands[1].push.aux0 = tail_base;
+    dc_commands[1].push.aux1 = vertex_hash_capacity;
+    dc_commands[1].push.aux2 = (uint32_t) resolution + 1u;
+    dc_commands[1].groups_x = (grid_count + 127u) / 128u;
+
+    dc_commands[2].pipeline_kind = VKMESH_PIPE_REMESH_SIMPLE_DC;
+    dc_commands[2].buffers[0] = workspace;
+    dc_commands[2].buffers[1] = dc_buffer;
+    dc_commands[2].buffers[2] = dc_buffer;
+    dc_commands[2].buffers[3] = status_buffer;
+    dc_commands[2].push.n = cell_count;
+    dc_commands[2].push.aux0 = (uint32_t) resolution + 1u;
+    dc_commands[2].push.aux1 = vertex_hash_capacity;
+    dc_commands[2].push.aux2 = counts_base;
+    dc_commands[2].groups_x = (cell_count + 127u) / 128u;
+    if (!vkmesh_dispatch_batch(vk, dc_commands, 3u)) goto cleanup;
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        fprintf(stderr,
+            "vkmesh: remesh GPU Dual Contouring lookup failed status=%u\n",
+            ((const uint32_t *) status_buffer.mapped)[0]);
+        goto cleanup;
+    }
+
+    /* The corner hash is no longer needed. Reuse the front of the DC buffer
+       for the active-cell hash, and the old count/offset ranges for topology
+       flags and the two compacting scans. */
+    ((uint32_t *) status_buffer.mapped)[0] = 0u;
+    const uint32_t referenced_base = 5u * cell_count + 1u;
+    const uint32_t quad_offsets_base = 6u * cell_count + 1u;
+    const uint32_t vertex_offsets_base = 7u * cell_count + 2u;
+    vkmesh_dispatch_command topology_commands[VKMESH_DISPATCH_BATCH_MAX];
+    memset(topology_commands, 0, sizeof(topology_commands));
+    uint32_t topology_command_count = 0u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = dc_buffer;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = hash_capacity;
+    command->groups_x = (hash_capacity + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_VERTEX_HASH;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dc_buffer;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = 0u;
+    command->push.aux1 = hash_capacity;
+    command->push.aux2 = (uint32_t) resolution;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_FILL_U32;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dummy_buffer;
+    command->buffers[2] = dummy_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux1 = referenced_base;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    command = &topology_commands[topology_command_count++];
+    command->pipeline_kind = VKMESH_PIPE_REMESH_TOPOLOGY_COUNT;
+    command->buffers[0] = workspace;
+    command->buffers[1] = dc_buffer;
+    command->buffers[2] = status_buffer;
+    command->buffers[3] = dummy_buffer;
+    command->push.n = cell_count;
+    command->push.aux0 = (uint32_t) resolution;
+    command->push.aux1 = hash_capacity;
+    command->push.aux2 = dc_base;
+    command->groups_x = (cell_count + 127u) / 128u;
+
+    if (!vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count + 1u,
+            counts_base,
+            quad_offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            topology_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &topology_command_count) ||
+        !vkmesh_append_scan_u32_inclusive(
+            vk,
+            &workspace,
+            &workspace,
+            cell_count,
+            referenced_base,
+            vertex_offsets_base,
+            &dummy_buffer,
+            scan_sums,
+            topology_commands,
+            VKMESH_DISPATCH_BATCH_MAX,
+            &topology_command_count) ||
+        !vkmesh_dispatch_batch(vk, topology_commands, topology_command_count)) {
+        if (g_vkmesh_last_error == VKMESH_ERROR_NONE) vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        goto cleanup;
+    }
+    if (((const uint32_t *) status_buffer.mapped)[0] != 0u) {
+        fprintf(stderr, "vkmesh: remesh GPU topology hash saturated; using CPU path\n");
+        goto cleanup;
+    }
+
+    const uint32_t quad_count = workspace_words[quad_offsets_base + cell_count];
+    const uint32_t vertex_count = workspace_words[vertex_offsets_base + cell_count - 1u];
+    if (quad_count == 0u || vertex_count == 0u ||
+        (uint64_t) quad_count > 3u * (uint64_t) cell_count || vertex_count > cell_count) {
+        goto cleanup;
+    }
+    const uint64_t output_words_u64 =
+        3u * (uint64_t) vertex_count + 6u * (uint64_t) quad_count;
+    if (output_words_u64 > UINT32_MAX ||
+        output_words_u64 > SIZE_MAX / sizeof(uint32_t)) {
+        goto cleanup;
+    }
+    const size_t output_bytes = (size_t) output_words_u64 * sizeof(uint32_t);
+    if ((VkDeviceSize) output_bytes > max_range) goto cleanup;
+
+    /* Check the budget before releasing a query needed by the CPU fallback.
+       The 64 KiB reserve covers ordinary Vulkan allocation granularity. */
+    size_t current_after_release = vk->workspace_current_bytes;
+    if (release_query) {
+        for (uint32_t i = 0u; i < 4u; ++i) {
+            const size_t bytes = query->buffers[i].allocation_bytes;
+            current_after_release = current_after_release > bytes ?
+                current_after_release - bytes : 0u;
+        }
+    }
+    if (vk->workspace_budget_bytes > 0u) {
+        const size_t available = vk->workspace_budget_bytes > current_after_release ?
+            vk->workspace_budget_bytes - current_after_release : 0u;
+        if (output_bytes > SIZE_MAX - 64u * 1024u ||
+            output_bytes + 64u * 1024u > available) {
+            goto cleanup;
+        }
+    }
+    if (release_query) {
+        if (query->batch_count > 0u) {
+            fprintf(stderr, "vkmesh: remesh distance batches=%u\n", query->batch_count);
+        }
+        vkmesh_distance_query_destroy(query);
+    }
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &scan_sums[i]);
+    }
+    if (!vk_buffer_create_host_cached(vk, output_bytes, &output_buffer)) goto cleanup;
+
+    transform = (float *) status_buffer.mapped;
+    transform[0] = center[0];
+    transform[1] = center[1];
+    transform[2] = center[2];
+    transform[3] = scale;
+    transform[4] = 1.0f / (float) resolution;
+    ((uint32_t *) status_buffer.mapped)[5] = 0u;
+    vkmesh_dispatch_command output_commands[2];
+    memset(output_commands, 0, sizeof(output_commands));
+    output_commands[0].pipeline_kind = VKMESH_PIPE_REMESH_EMIT_VERTICES;
+    output_commands[0].buffers[0] = workspace;
+    output_commands[0].buffers[1] = dc_buffer;
+    output_commands[0].buffers[2] = output_buffer;
+    output_commands[0].buffers[3] = status_buffer;
+    output_commands[0].push.n = cell_count;
+    output_commands[0].push.aux0 = dc_base;
+    output_commands[0].groups_x = (cell_count + 127u) / 128u;
+
+    output_commands[1].pipeline_kind = VKMESH_PIPE_REMESH_EMIT_FACES;
+    output_commands[1].buffers[0] = workspace;
+    output_commands[1].buffers[1] = dc_buffer;
+    output_commands[1].buffers[2] = output_buffer;
+    output_commands[1].buffers[3] = status_buffer;
+    output_commands[1].push.n = cell_count;
+    output_commands[1].push.aux0 = (uint32_t) resolution;
+    output_commands[1].push.aux1 = hash_capacity;
+    output_commands[1].push.aux2 = dc_base;
+    output_commands[1].groups_x = (cell_count + 127u) / 128u;
+    if (!vkmesh_dispatch_batch(vk, output_commands, 2u)) goto cleanup;
+    if (((const uint32_t *) status_buffer.mapped)[5] != 0u) {
+        vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+        fprintf(stderr, "vkmesh: remesh GPU face lookup failed\n");
+        goto cleanup;
+    }
+
+    if ((size_t) vertex_count > SIZE_MAX / (3u * sizeof(float)) ||
+        (size_t) quad_count > SIZE_MAX / (6u * sizeof(int32_t))) {
+        goto cleanup;
+    }
+    gpu_mesh.vertices = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
+    gpu_mesh.faces = (int32_t *) malloc((size_t) quad_count * 6u * sizeof(int32_t));
+    if (gpu_mesh.vertices == NULL || gpu_mesh.faces == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        goto cleanup;
+    }
+    memcpy(
+        gpu_mesh.vertices,
+        output_buffer.mapped,
+        (size_t) vertex_count * 3u * sizeof(float));
+    memcpy(
+        gpu_mesh.faces,
+        (const uint32_t *) output_buffer.mapped + 3u * (size_t) vertex_count,
+        (size_t) quad_count * 6u * sizeof(int32_t));
+    gpu_mesh.n_vertices = (int64_t) vertex_count;
+    gpu_mesh.vertex_capacity = (int64_t) vertex_count;
+    gpu_mesh.n_faces = 2 * (int64_t) quad_count;
+    gpu_mesh.face_capacity = gpu_mesh.n_faces;
+
+    *grid_count_out = (int64_t) grid_count;
+    *mesh_out = gpu_mesh;
+    memset(&gpu_mesh, 0, sizeof(gpu_mesh));
+    fprintf(stderr,
+        "vkmesh: remesh GPU corners/DC/topology cells=%u corners=%u vertices=%u faces=%" PRIu64 "\n",
+        cell_count,
+        grid_count,
+        vertex_count,
+        2u * (uint64_t) quad_count);
+    ok = 1;
+
+cleanup:
+    mesh_free(&gpu_mesh);
+    vk_buffer_destroy(vk, &output_buffer);
+    vk_buffer_destroy(vk, &grid_query_buffer);
+    vk_buffer_destroy(vk, &dc_buffer);
+    vk_buffer_destroy(vk, &dummy_buffer);
+    vk_buffer_destroy(vk, &status_buffer);
+    vk_buffer_destroy(vk, &workspace);
+    for (uint32_t i = 0u; i < VKMESH_SCAN_MAX_LEVELS; ++i) {
+        vk_buffer_destroy(vk, &scan_sums[i]);
+    }
+    return ok;
 }
 
 static int vkmesh_remesh_collect_grid_vertices(
@@ -6034,6 +8282,11 @@ static int vkmesh_remesh_collect_grid_vertices(
     *grid_count_out = 0;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
     if ((uint64_t) coord_count > (uint64_t) SIZE_MAX) return 0;
+    if (resolution <= 0) return 0;
+    const uint64_t grid_dim = (uint64_t) resolution + 1u;
+    if (grid_dim > UINT64_MAX / grid_dim) return 0;
+    const uint64_t plane_stride = grid_dim * grid_dim;
+    if (grid_dim > UINT64_MAX / plane_stride) return 0;
     /* Start near the observed unique-corner count and grow only for unusually sparse cells. */
     if (!vkmesh_hash_init(vert_hash_out, (size_t) coord_count)) return 0;
 
@@ -6041,18 +8294,37 @@ static int vkmesh_remesh_collect_grid_vertices(
     int64_t grid_count = 0;
     int64_t grid_capacity = 0;
     int ok = 0;
+    if (!vkmesh_remesh_coords_reserve(&grid, &grid_capacity, coord_count)) goto cleanup;
     for (int64_t i = 0; i < coord_count; ++i) {
-        for (int dx = 0; dx <= 1; ++dx) {
+        const int32_t vx = coords[i].x;
+        const int32_t vy = coords[i].y;
+        const int32_t vz = coords[i].z;
+        if (vx < 0 || vy < 0 || vz < 0 ||
+            vx >= resolution || vy >= resolution || vz >= resolution) {
+            goto cleanup;
+        }
+        const uint64_t base_key =
+            ((uint64_t) vx * grid_dim + (uint64_t) vy) * grid_dim + (uint64_t) vz;
+        int first_dx = 0;
+        if (i > 0 && vx > 0 &&
+            coords[i - 1].x == vx - 1 && coords[i - 1].y == vy && coords[i - 1].z == vz) {
+            /* These four corners are the previous +x cell face and were just visited. */
+            first_dx = 1;
+        }
+        for (int dx = first_dx; dx <= 1; ++dx) {
             for (int dy = 0; dy <= 1; ++dy) {
                 for (int dz = 0; dz <= 1; ++dz) {
-                    int32_t x = coords[i].x + dx;
-                    int32_t y = coords[i].y + dy;
-                    int32_t z = coords[i].z + dz;
-                    uint64_t key = vkmesh_remesh_coord_key(x, y, z, resolution + 1);
-                    if (vkmesh_hash_lookup(vert_hash_out, key) != UINT32_MAX) continue;
-                    if (grid_count >= UINT32_MAX) goto cleanup;
-                    if (!vkmesh_remesh_coords_append(&grid, &grid_count, &grid_capacity, x, y, z) ||
-                        !vkmesh_hash_insert(vert_hash_out, key, (uint32_t) (grid_count - 1))) {
+                    const uint64_t key = base_key +
+                        (uint64_t) dx * plane_stride + (uint64_t) dy * grid_dim + (uint64_t) dz;
+                    int inserted = 0;
+                    if (!vkmesh_hash_insert_if_absent(
+                            vert_hash_out, key, (uint32_t) grid_count, &inserted)) {
+                        goto cleanup;
+                    }
+                    if (!inserted) continue;
+                    /* A failed append discards both containers, so no per-key rollback is needed. */
+                    if (!vkmesh_remesh_coords_append(
+                            &grid, &grid_count, &grid_capacity, vx + dx, vy + dy, vz + dz)) {
                         goto cleanup;
                     }
                 }
@@ -6076,12 +8348,9 @@ cleanup:
 static float vkmesh_remesh_grid_value(
     const vkmesh_u64_u32_hash * vert_hash,
     const float * values,
-    int resolution,
-    int32_t x,
-    int32_t y,
-    int32_t z,
+    uint64_t key,
     int * ok) {
-    uint32_t idx = vkmesh_hash_lookup(vert_hash, vkmesh_remesh_coord_key(x, y, z, resolution + 1));
+    uint32_t idx = vkmesh_hash_lookup(vert_hash, key);
     if (idx == UINT32_MAX) {
         *ok = 0;
         return 0.0f;
@@ -6100,27 +8369,62 @@ static int vkmesh_remesh_simple_dual_contour(
     *dual_out = NULL;
     *intersected_out = NULL;
     if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if ((uint64_t) coord_count > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        (uint64_t) coord_count > (uint64_t) SIZE_MAX / (3u * sizeof(int8_t))) {
+        return 0;
+    }
+    if (resolution <= 0) return 0;
+    const uint64_t grid_dim = (uint64_t) resolution + 1u;
+    if (grid_dim > UINT64_MAX / grid_dim) return 0;
+    const uint64_t plane_stride = grid_dim * grid_dim;
+    if (grid_dim > UINT64_MAX / plane_stride) return 0;
     float * dual = (float *) malloc((size_t) coord_count * 3u * sizeof(float));
-    int8_t * intersected = (int8_t *) calloc((size_t) coord_count * 3u, sizeof(int8_t));
+    int8_t * intersected = (int8_t *) malloc((size_t) coord_count * 3u * sizeof(int8_t));
     if (dual == NULL || intersected == NULL) {
         free(dual);
         free(intersected);
         return 0;
     }
 
-    int ok = 1;
-    for (int64_t i = 0; i < coord_count; ++i) {
+    int missing_corner = 0;
+    int64_t i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(coord_count >= 65536) reduction(|:missing_corner)
+#endif
+    for (i = 0; i < coord_count; ++i) {
         int32_t vx = coords[i].x;
         int32_t vy = coords[i].y;
         int32_t vz = coords[i].z;
+        float corner[2][2][2];
+        int cell_ok = 1;
+        if (vx < 0 || vy < 0 || vz < 0 ||
+            vx >= resolution || vy >= resolution || vz >= resolution) {
+            missing_corner = 1;
+            continue;
+        }
+        const uint64_t base_key =
+            ((uint64_t) vx * grid_dim + (uint64_t) vy) * grid_dim + (uint64_t) vz;
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dz = 0; dz <= 1; ++dz) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    const uint64_t key = base_key +
+                        (uint64_t) dx * plane_stride + (uint64_t) dy * grid_dim + (uint64_t) dz;
+                    corner[dx][dy][dz] = vkmesh_remesh_grid_value(
+                        vert_hash, grid_values, key, &cell_ok);
+                }
+            }
+        }
+        if (!cell_ok) {
+            missing_corner = 1;
+            continue;
+        }
         float sum[3] = { 0.0f, 0.0f, 0.0f };
         int count = 0;
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx, vy + u, vz + v, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + 1, vy + u, vz + v, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[0][u][v];
+                float val2 = corner[1][u][v];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) vx + t;
@@ -6137,9 +8441,8 @@ static int vkmesh_remesh_simple_dual_contour(
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy, vz + v, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + 1, vz + v, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[u][0][v];
+                float val2 = corner[u][1][v];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) (vx + u);
@@ -6156,9 +8459,8 @@ static int vkmesh_remesh_simple_dual_contour(
 
         for (int u = 0; u <= 1; ++u) {
             for (int v = 0; v <= 1; ++v) {
-                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz, &ok);
-                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz + 1, &ok);
-                if (!ok) goto fail;
+                float val1 = corner[u][v][0];
+                float val2 = corner[u][v][1];
                 if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
                     float t = -val1 / (val2 - val1);
                     sum[0] += (float) (vx + u);
@@ -6183,6 +8485,7 @@ static int vkmesh_remesh_simple_dual_contour(
             dual[(size_t) i * 3u + 2u] = (float) vz + 0.5f;
         }
     }
+    if (missing_corner) goto fail;
 
     *dual_out = dual;
     *intersected_out = intersected;
@@ -6248,10 +8551,11 @@ static int vkmesh_remesh_append_quad(
     return 1;
 }
 
+/* Consumes and clears active_hash on every return path. */
 static int vkmesh_remesh_build_mesh_from_dc(
     const vkmesh_remesh_coord * coords,
     int64_t coord_count,
-    const vkmesh_u64_u32_hash * active_hash,
+    vkmesh_u64_u32_hash * active_hash,
     const float * dual,
     const int8_t * intersected,
     int resolution,
@@ -6259,7 +8563,11 @@ static int vkmesh_remesh_build_mesh_from_dc(
     float scale,
     vkmesh_mesh * out) {
     memset(out, 0, sizeof(*out));
-    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if (coord_count <= 0 || coord_count > INT32_MAX ||
+        (uint64_t) coord_count > (uint64_t) SIZE_MAX / sizeof(int32_t)) {
+        vkmesh_hash_destroy(active_hash);
+        return 0;
+    }
     static const int32_t neighbor_offsets[3][4][3] = {
         { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 1 }, { 0, 1, 0 } },
         { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 0, 1 }, { 0, 0, 1 } },
@@ -6279,6 +8587,7 @@ static int vkmesh_remesh_build_mesh_from_dc(
     if (referenced == NULL || vertex_map == NULL) {
         free(referenced);
         free(vertex_map);
+        vkmesh_hash_destroy(active_hash);
         return 0;
     }
 
@@ -6287,9 +8596,10 @@ static int vkmesh_remesh_build_mesh_from_dc(
         for (int axis = 0; axis < 3; ++axis) {
             int32_t dir = (int32_t) intersected[(size_t) i * 3u + (size_t) axis];
             if (dir == 0) continue;
-            int32_t q[4];
+            /* The zero offset is this unique active cell, already indexed by i. */
+            int32_t q[4] = { (int32_t) i, 0, 0, 0 };
             int valid = 1;
-            for (int k = 0; k < 4; ++k) {
+            for (int k = 1; k < 4; ++k) {
                 int32_t x = coords[i].x + neighbor_offsets[axis][k][0];
                 int32_t y = coords[i].y + neighbor_offsets[axis][k][1];
                 int32_t z = coords[i].z + neighbor_offsets[axis][k][2];
@@ -6305,6 +8615,8 @@ static int vkmesh_remesh_build_mesh_from_dc(
             for (int k = 0; k < 4; ++k) referenced[q[k]] = 1u;
         }
     }
+    /* Neighbor lookup is the hash's last use; release it before output allocation. */
+    vkmesh_hash_destroy(active_hash);
 
     int64_t vertex_count = 0;
     for (int64_t i = 0; i < coord_count; ++i) {
@@ -6329,31 +8641,43 @@ static int vkmesh_remesh_build_mesh_from_dc(
     out->face_capacity = out->n_faces;
 
     const float inv_res = 1.0f / (float) resolution;
-    for (int64_t i = 0; i < coord_count; ++i) {
-        int32_t dst = vertex_map[i];
+    int64_t cell_i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(coord_count >= 65536)
+#endif
+    for (cell_i = 0; cell_i < coord_count; ++cell_i) {
+        int32_t dst = vertex_map[cell_i];
         if (dst < 0) continue;
-        out->vertices[(size_t) dst * 3u + 0u] = (dual[(size_t) i * 3u + 0u] * inv_res - 0.5f) * scale + center[0];
-        out->vertices[(size_t) dst * 3u + 1u] = (dual[(size_t) i * 3u + 1u] * inv_res - 0.5f) * scale + center[1];
-        out->vertices[(size_t) dst * 3u + 2u] = (dual[(size_t) i * 3u + 2u] * inv_res - 0.5f) * scale + center[2];
+        out->vertices[(size_t) dst * 3u + 0u] =
+            (dual[(size_t) cell_i * 3u + 0u] * inv_res - 0.5f) * scale + center[0];
+        out->vertices[(size_t) dst * 3u + 1u] =
+            (dual[(size_t) cell_i * 3u + 1u] * inv_res - 0.5f) * scale + center[1];
+        out->vertices[(size_t) dst * 3u + 2u] =
+            (dual[(size_t) cell_i * 3u + 2u] * inv_res - 0.5f) * scale + center[2];
     }
 
-    int64_t face_dst = 0;
-    for (int64_t i = 0; i < quad_count; ++i) {
+    int64_t quad_i;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(quad_count >= 65536)
+#endif
+    for (quad_i = 0; quad_i < quad_count; ++quad_i) {
         int32_t q[4];
-        for (int k = 0; k < 4; ++k) q[k] = vertex_map[quads[(size_t) i * 4u + (size_t) k]];
-        const int * split1 = dirs[i] == 1 ? split_1_p : split_1_n;
-        const int * split2 = dirs[i] == 1 ? split_2_p : split_2_n;
+        for (int k = 0; k < 4; ++k) {
+            q[k] = vertex_map[quads[(size_t) quad_i * 4u + (size_t) k]];
+        }
+        const int * split1 = dirs[quad_i] == 1 ? split_1_p : split_1_n;
+        const int * split2 = dirs[quad_i] == 1 ? split_2_p : split_2_n;
         float align0 = vkmesh_remesh_split_align(out->vertices, q, split1);
         float align1 = vkmesh_remesh_split_align(out->vertices, q, split2);
         const int * split = align0 > align1 ? split1 : split2;
         for (int k = 0; k < 6; ++k) {
-            out->faces[(size_t) face_dst * 3u + (size_t) k] = q[split[k]];
+            out->faces[(size_t) quad_i * 6u + (size_t) k] = q[split[k]];
         }
-        face_dst += 2;
     }
     ok = 1;
 
 cleanup:
+    vkmesh_hash_destroy(active_hash);
     free(quads);
     free(dirs);
     free(referenced);
@@ -6531,6 +8855,10 @@ static int vkmesh_remesh_narrow_band_dc_to(
             UINT32_MAX / 5u)) {
         goto cleanup;
     }
+    free(nodes);
+    nodes = NULL;
+    free(tri_indices);
+    tri_indices = NULL;
     if (!vkmesh_remesh_refine_sparse_grid(
             &distance_query,
             resolution,
@@ -6542,37 +8870,72 @@ static int vkmesh_remesh_narrow_band_dc_to(
         goto cleanup;
     }
     fprintf(stderr, "vkmesh: remesh active_voxels=%" PRId64 "\n", coord_count);
-    if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
-    if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
-    fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
-    if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
-    grid_values = (float *) malloc((size_t) grid_vert_count * sizeof(float));
-    if (grid_values == NULL ||
-        !vkmesh_distance_query_coord_values(
-            &distance_query, grid_verts, grid_vert_count, resolution, center, scale, 0, grid_values)) {
-        goto cleanup;
+    if (coord_count > INT32_MAX) goto cleanup;
+    const int gpu_mesh_built = vkmesh_remesh_build_mesh_gpu(
+            vk,
+            &distance_query,
+            coords,
+            coord_count,
+            resolution,
+            center,
+            scale,
+            eps,
+            project_back <= 0.0f,
+            &grid_vert_count,
+            &out);
+    if (!gpu_mesh_built) {
+        if (g_vkmesh_last_error != VKMESH_ERROR_NONE ||
+            !vkmesh_remesh_collect_grid_vertices(
+                coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) {
+            goto cleanup;
+        }
+        if ((uint64_t) grid_vert_count > (uint64_t) SIZE_MAX / sizeof(float)) goto cleanup;
+        grid_values = (float *) malloc((size_t) grid_vert_count * sizeof(float));
+        if (grid_values == NULL ||
+            !vkmesh_distance_query_coord_values(
+                &distance_query,
+                grid_verts,
+                grid_vert_count,
+                resolution,
+                center,
+                scale,
+                0,
+                grid_values)) {
+            goto cleanup;
+        }
+        free(grid_verts);
+        grid_verts = NULL;
+        for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
+        if (!vkmesh_remesh_simple_dual_contour(
+                coords,
+                coord_count,
+                &vert_hash,
+                grid_values,
+                resolution,
+                &dual,
+                &intersected)) {
+            goto cleanup;
+        }
+        vkmesh_hash_destroy(&vert_hash);
+        free(grid_values);
+        grid_values = NULL;
     }
-    for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
+    fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
 
     if (project_back <= 0.0f) {
         if (distance_query.batch_count > 0u) {
             fprintf(stderr, "vkmesh: remesh distance batches=%u\n", distance_query.batch_count);
         }
         vkmesh_distance_query_destroy(&distance_query);
-        free(nodes);
-        nodes = NULL;
-        free(tri_indices);
-        tri_indices = NULL;
     }
-    if (!vkmesh_remesh_simple_dual_contour(
-            coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected)) goto cleanup;
-    vkmesh_hash_destroy(&vert_hash);
-    free(grid_verts);
-    grid_verts = NULL;
-    free(grid_values);
-    grid_values = NULL;
-    if (!vkmesh_remesh_build_mesh_from_dc(
-            coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) goto cleanup;
+    if (!gpu_mesh_built) {
+        /* Keep only one of the two large CPU remesh hash tables alive at a time. */
+        if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
+        if (!vkmesh_remesh_build_mesh_from_dc(
+                coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) {
+            goto cleanup;
+        }
+    }
     fprintf(stderr, "vkmesh: remesh after_dual_contour vertices=%" PRId64 " faces=%" PRId64 "\n", out.n_vertices, out.n_faces);
     free(coords);
     coords = NULL;
@@ -6972,23 +9335,8 @@ static int vkmesh_scan_flags_to_offsets(
     uint32_t groups = (push.n + 127u) / 128u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_SEED_VERTEX_OFFSETS, seed_buffers, &push, groups)) return 0;
 
-    vkmesh_vk_buffer * scan_in = offsets_a;
-    vkmesh_vk_buffer * scan_out = offsets_b;
-    for (uint64_t stride = 1u; stride < (uint64_t) push.n; stride <<= 1u) {
-        vkmesh_vk_buffer scan_buffers[4];
-        scan_buffers[0] = *scan_in;
-        scan_buffers[1] = *scan_out;
-        scan_buffers[2] = *dummy;
-        scan_buffers[3] = *dummy;
-        memset(&push, 0, sizeof(push));
-        push.n = count + 1u;
-        push.aux0 = (uint32_t) stride;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_SCAN_U32_STRIDE, scan_buffers, &push, groups)) return 0;
-        vkmesh_vk_buffer * tmp = scan_in;
-        scan_in = scan_out;
-        scan_out = tmp;
-    }
-    *offsets_out = scan_in;
+    if (!vkmesh_scan_u32_inclusive(vk, offsets_a, offsets_b, count + 1u, dummy)) return 0;
+    *offsets_out = offsets_b;
     return 1;
 }
 
@@ -7349,44 +9697,43 @@ static int vkmesh_device_fill_holes(
         goto cleanup;
     }
 
-    size_t boundary_count_size = 0;
-    const vkmesh_edge * sorted_edges = (const vkmesh_edge *) edges_buffer.mapped;
-    for (size_t begin = 0; begin < edge_count;) {
-        size_t end = begin + 1u;
-        while (end < edge_count &&
-               sorted_edges[end].min_v == sorted_edges[begin].min_v &&
-               sorted_edges[end].max_v == sorted_edges[begin].max_v) {
-            ++end;
-        }
-        if (end == begin + 1u) ++boundary_count_size;
-        begin = end;
-    }
-    if (boundary_count_size == 0u) {
-        ok = 1;
-        goto cleanup;
-    }
-    if (boundary_count_size > UINT32_MAX ||
-        !vk_buffer_create(vk, boundary_count_size * sizeof(vkmesh_boundary_edge), &boundary_buffer)) {
-        goto cleanup;
-    }
-
     vkmesh_vk_buffer compact_buffers[4];
     compact_buffers[0] = edges_buffer;
-    compact_buffers[1] = boundary_buffer;
+    compact_buffers[1] = dummy_buffer;
     compact_buffers[2] = counter_buffer;
     compact_buffers[3] = dummy_buffer;
     vkmesh_push push;
     memset(&push, 0, sizeof(push));
     push.n = (uint32_t) edge_count;
+    push.aux0 = 1u;
     uint32_t edge_groups = (uint32_t) ((edge_count + 127u) / 128u);
+    ((uint32_t *) counter_buffer.mapped)[0] = 0u;
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_BOUNDARY_EDGES, compact_buffers, &push, edge_groups)) goto cleanup;
 
     uint32_t boundary_count = ((const uint32_t *) counter_buffer.mapped)[0];
-    if ((size_t) boundary_count != boundary_count_size) goto cleanup;
+    if (boundary_count == 0u) {
+        ok = 1;
+        goto cleanup;
+    }
+    if ((size_t) boundary_count > edge_count ||
+        (size_t) boundary_count > SIZE_MAX / sizeof(vkmesh_boundary_edge) ||
+        !vk_buffer_create(vk, (size_t) boundary_count * sizeof(vkmesh_boundary_edge), &boundary_buffer)) {
+        goto cleanup;
+    }
+
+    ((uint32_t *) counter_buffer.mapped)[0] = 0u;
+    compact_buffers[1] = boundary_buffer;
+    push.aux0 = 0u;
+    if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPACT_BOUNDARY_EDGES, compact_buffers, &push, edge_groups)) goto cleanup;
+
+    if (((const uint32_t *) counter_buffer.mapped)[0] != boundary_count) goto cleanup;
     vk_buffer_destroy(vk, &edges_buffer);
 
-    size_t hole_words_size = (size_t) boundary_count * 7u + (size_t) vertex_count * 2u;
-    if (hole_words_size > UINT32_MAX) goto cleanup;
+    uint64_t hole_words_u64 =
+        (uint64_t) boundary_count * 7u + (uint64_t) vertex_count * 2u;
+    if (hole_words_u64 > UINT32_MAX ||
+        hole_words_u64 > SIZE_MAX / sizeof(uint32_t)) goto cleanup;
+    size_t hole_words_size = (size_t) hole_words_u64;
     const uint32_t degree_off = boundary_count;
     const uint32_t owner_off = degree_off + vertex_count;
     if (!vk_buffer_create(vk, hole_words_size * sizeof(uint32_t), &hole_data) ||
@@ -7614,7 +9961,9 @@ static int vkmesh_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, int *
     *filled_loops = 0;
     *added_faces = 0;
     if (vkmesh_fill_holes_device_vulkan(mesh, max_hole_perimeter, filled_loops, added_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("device hole-fill path")) return 0;
     if (vkmesh_fill_holes_vulkan(mesh, max_hole_perimeter, filled_loops, added_faces)) return 1;
+    if (vkmesh_fatal_error_blocks_fallback("legacy Vulkan hole-fill path")) return 0;
     vkmesh_boundary_edge * boundary = NULL;
     uint32_t * parents = NULL;
     uint32_t * comp_edges = NULL;
@@ -7631,6 +9980,7 @@ static int vkmesh_fill_holes(vkmesh_mesh * mesh, float max_hole_perimeter, int *
             &comp_perim,
             &comp_mid,
             &boundary_count_i64)) {
+        if (vkmesh_fatal_error_blocks_fallback("Vulkan hole-component path")) return 0;
         return vkmesh_fill_holes_cpu(mesh, max_hole_perimeter, filled_loops, added_faces);
     }
     if (boundary_count_i64 <= 0) {
@@ -8006,6 +10356,86 @@ cleanup:
     return ok;
 }
 
+typedef struct vkmesh_trellis_remesh_finalize_stats {
+    uint32_t small_removed;
+    uint32_t small_faces;
+    uint32_t degenerate_removed;
+    uint32_t degenerate_faces;
+} vkmesh_trellis_remesh_finalize_stats;
+
+/* Keep this finalizer narrow.  The guarded simplifier preserves duplicate,
+   boundary, and orientation invariants, while repairing the DC path's
+   incidence-4 sheets and fan-filling the resulting cuts can damage geometry. */
+static int vkmesh_device_trellis_remesh_finalize(
+    vkmesh_device_mesh * dm,
+    float min_component_area,
+    int run_degenerate_cleanup,
+    float degenerate_abs,
+    float degenerate_rel,
+    vkmesh_trellis_remesh_finalize_stats * stats) {
+    if (dm == NULL || stats == NULL) return 0;
+    memset(stats, 0, sizeof(*stats));
+
+    if (run_degenerate_cleanup) {
+        if (!vkmesh_device_remove_degenerate_faces(
+                dm,
+                degenerate_abs,
+                degenerate_rel,
+                &stats->degenerate_removed)) {
+            return 0;
+        }
+        stats->degenerate_faces = dm->n_faces;
+    }
+
+    if (!vkmesh_device_remove_small_connected_components(
+            dm, min_component_area, &stats->small_removed)) {
+        return 0;
+    }
+    stats->small_faces = dm->n_faces;
+    return 1;
+}
+
+static void vkmesh_log_trellis_remesh_finalize_stats(
+    int run_degenerate_cleanup,
+    const vkmesh_trellis_remesh_finalize_stats * stats) {
+    if (run_degenerate_cleanup) {
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final remove_degenerate_faces removed=%u faces=%u\n",
+            stats->degenerate_removed,
+            stats->degenerate_faces);
+    }
+    fprintf(stderr,
+        "vkmesh: trellis.remesh.final remove_small_connected_components removed=%u faces=%u\n",
+        stats->small_removed,
+        stats->small_faces);
+}
+
+static int vkmesh_host_trellis_remesh_finalize(
+    vkmesh_mesh * mesh,
+    float min_component_area,
+    int run_degenerate_cleanup,
+    float degenerate_abs,
+    float degenerate_rel) {
+    if (mesh == NULL || mesh->n_vertices <= 0 || mesh->n_faces <= 0) return 0;
+    if (run_degenerate_cleanup) {
+        int removed = 0;
+        if (!vkmesh_remove_degenerate_faces_cpu(
+                mesh, degenerate_abs, degenerate_rel, &removed)) return 0;
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final remove_degenerate_faces path=cpu removed=%d faces=%" PRId64 "\n",
+            removed,
+            mesh->n_faces);
+    }
+    int removed = 0;
+    if (!vkmesh_remove_small_connected_components_cpu(
+            mesh, min_component_area, &removed)) return 0;
+    fprintf(stderr,
+        "vkmesh: trellis.remesh.final remove_small_connected_components path=cpu removed=%d faces=%" PRId64 "\n",
+        removed,
+        mesh->n_faces);
+    return mesh->n_vertices > 0 && mesh->n_faces > 0;
+}
+
 static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_mesh * mesh,
     const char * projection_output,
@@ -8078,6 +10508,9 @@ static int vkmesh_trellis_postprocess_device_inner(
     }
 
     if (remesh) {
+        vkmesh_simplify_result remesh_simplify_result;
+        int has_remesh_simplify_result = 0;
+        memset(&remesh_simplify_result, 0, sizeof(remesh_simplify_result));
         if (projection_candidate.vertices != NULL) {
             vkmesh_device_mesh_destroy(&dm);
             if (!vkmesh_remesh_narrow_band_dc_to(
@@ -8092,19 +10525,85 @@ static int vkmesh_trellis_postprocess_device_inner(
             if (!vkmesh_remesh_narrow_band_dc(
                     &remesh_work, remesh_resolution, remesh_band, remesh_project)) goto cleanup;
         }
-        if (remesh_work.n_faces > (int64_t) decimation_target) {
-            if (!vkmesh_log_simplify(
-                    &remesh_work,
+        if (!vkmesh_device_mesh_upload(vk, &remesh_work, &dm)) goto cleanup;
+        mesh_free(&remesh_work);
+
+        if (dm.n_faces > (uint32_t) decimation_target) {
+            uint64_t collapsed = 0u;
+            uint64_t removed = 0u;
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify begin target=%d faces=%u\n",
+                decimation_target,
+                dm.n_faces);
+            fflush(stderr);
+            if (!vkmesh_device_simplify(
+                    &dm,
                     decimation_target,
                     lambda_edge_length,
                     lambda_skinny,
                     simplify_threshold,
                     simplify_steps,
-                    "trellis.remesh")) {
+                    &collapsed,
+                    &removed,
+                    &remesh_simplify_result)) {
                 goto cleanup;
             }
+            has_remesh_simplify_result = 1;
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify target=%d collapsed=%" PRIu64
+                " removed_faces=%" PRIu64 " faces=%u\n",
+                decimation_target,
+                collapsed,
+                removed,
+                dm.n_faces);
         } else {
-            fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", remesh_work.n_faces, decimation_target);
+            fprintf(stderr,
+                "vkmesh: trellis.remesh simplify skipped faces=%u target=%d\n",
+                dm.n_faces,
+                decimation_target);
+        }
+
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final begin vertices=%u faces=%u min_component_area=%.9g run_degenerate_cleanup=%d\n",
+            dm.n_vertices,
+            dm.n_faces,
+            min_component_area,
+            run_degenerate_cleanup);
+        vkmesh_trellis_remesh_finalize_stats final_stats;
+        int finalized_on_device = vkmesh_device_trellis_remesh_finalize(
+                &dm,
+                min_component_area,
+                run_degenerate_cleanup,
+                degenerate_abs,
+                degenerate_rel,
+                &final_stats);
+        if (finalized_on_device) {
+            vkmesh_log_trellis_remesh_finalize_stats(run_degenerate_cleanup, &final_stats);
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final done path=device vertices=%u faces=%u\n",
+                dm.n_vertices,
+                dm.n_faces);
+            if (!vkmesh_device_mesh_download(&dm, &remesh_work)) goto cleanup;
+        } else {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS remesh device finalizer")) goto cleanup;
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final device path failed; using local host fallback without rerunning remesh\n");
+            if (!vkmesh_device_mesh_download(&dm, &remesh_work)) goto cleanup;
+            if (!vkmesh_host_trellis_remesh_finalize(
+                    &remesh_work,
+                    min_component_area,
+                    run_degenerate_cleanup,
+                    degenerate_abs,
+                    degenerate_rel)) {
+                if (g_vkmesh_last_error == VKMESH_ERROR_NONE) {
+                    vkmesh_set_error(VKMESH_ERROR_ALGORITHM);
+                }
+                goto cleanup;
+            }
+            fprintf(stderr,
+                "vkmesh: trellis.remesh.final done path=host vertices=%" PRId64 " faces=%" PRId64 "\n",
+                remesh_work.n_vertices,
+                remesh_work.n_faces);
         }
         mesh_free(mesh);
         *mesh = remesh_work;
@@ -8113,16 +10612,26 @@ static int vkmesh_trellis_postprocess_device_inner(
             *projection_mesh_out = projection_candidate;
             memset(&projection_candidate, 0, sizeof(projection_candidate));
         }
+        if (has_remesh_simplify_result) {
+            vkmesh_log_simplify_target_warning("trellis.remesh", &remesh_simplify_result);
+        }
         fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
         ok = 1;
         goto cleanup;
     }
 
+    vkmesh_simplify_result pass1_simplify_result;
+    vkmesh_simplify_result pass2_simplify_result;
+    int has_pass1_simplify_result = 0;
+    int has_pass2_simplify_result = 0;
+    memset(&pass1_simplify_result, 0, sizeof(pass1_simplify_result));
+    memset(&pass2_simplify_result, 0, sizeof(pass2_simplify_result));
+
     int64_t first_target = (int64_t) decimation_target * 3;
     if (first_target > INT_MAX) first_target = INT_MAX;
     if (dm.n_faces > (uint32_t) first_target) {
-        int collapsed = 0;
-        int removed = 0;
+        uint64_t collapsed = 0u;
+        uint64_t removed = 0u;
         fprintf(stderr, "vkmesh: trellis.pass1 simplify begin target=%" PRId64 " faces=%u\n", first_target, dm.n_faces);
         fflush(stderr);
         if (!vkmesh_device_simplify(
@@ -8133,11 +10642,14 @@ static int vkmesh_trellis_postprocess_device_inner(
                 simplify_threshold,
                 simplify_steps,
                 &collapsed,
-                &removed)) {
+                &removed,
+                &pass1_simplify_result)) {
             goto cleanup;
         }
+        has_pass1_simplify_result = 1;
         fprintf(stderr,
-            "vkmesh: trellis.pass1 simplify target=%" PRId64 " collapsed=%d removed_faces=%d faces=%u\n",
+            "vkmesh: trellis.pass1 simplify target=%" PRId64 " collapsed=%" PRIu64
+            " removed_faces=%" PRIu64 " faces=%u\n",
             first_target,
             collapsed,
             removed,
@@ -8161,8 +10673,8 @@ static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_log_trellis_cleanup_stats("trellis.pass1", run_degenerate_cleanup, 0, NULL, &pass1_stats);
 
     if (dm.n_faces > (uint32_t) decimation_target) {
-        int collapsed = 0;
-        int removed = 0;
+        uint64_t collapsed = 0u;
+        uint64_t removed = 0u;
         fprintf(stderr, "vkmesh: trellis.pass2 simplify begin target=%d faces=%u\n", decimation_target, dm.n_faces);
         fflush(stderr);
         if (!vkmesh_device_simplify(
@@ -8173,11 +10685,14 @@ static int vkmesh_trellis_postprocess_device_inner(
                 simplify_threshold,
                 simplify_steps,
                 &collapsed,
-                &removed)) {
+                &removed,
+                &pass2_simplify_result)) {
             goto cleanup;
         }
+        has_pass2_simplify_result = 1;
         fprintf(stderr,
-            "vkmesh: trellis.pass2 simplify target=%d collapsed=%d removed_faces=%d faces=%u\n",
+            "vkmesh: trellis.pass2 simplify target=%d collapsed=%" PRIu64
+            " removed_faces=%" PRIu64 " faces=%u\n",
             decimation_target,
             collapsed,
             removed,
@@ -8205,6 +10720,12 @@ static int vkmesh_trellis_postprocess_device_inner(
         *projection_mesh_out = projection_candidate;
         memset(&projection_candidate, 0, sizeof(projection_candidate));
     }
+    if (has_pass1_simplify_result) {
+        vkmesh_log_simplify_target_warning("trellis.pass1", &pass1_simplify_result);
+    }
+    if (has_pass2_simplify_result) {
+        vkmesh_log_simplify_target_warning("trellis.pass2", &pass2_simplify_result);
+    }
     fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
     ok = 1;
 
@@ -8231,8 +10752,10 @@ static int vkmesh_log_simplify(
     float simplify_threshold,
     int simplify_steps,
     const char * label) {
-    int collapsed = 0;
-    int removed = 0;
+    uint64_t collapsed = 0u;
+    uint64_t removed = 0u;
+    vkmesh_simplify_result simplify_result;
+    memset(&simplify_result, 0, sizeof(simplify_result));
     if (target_faces <= 0) target_faces = 1;
     fprintf(stderr,
         "vkmesh: %s simplify begin target=%d faces=%" PRId64 "\n",
@@ -8248,16 +10771,19 @@ static int vkmesh_log_simplify(
             simplify_threshold,
             simplify_steps,
             &collapsed,
-            &removed)) {
+            &removed,
+            &simplify_result)) {
         return 0;
     }
     fprintf(stderr,
-        "vkmesh: %s simplify target=%d collapsed=%d removed_faces=%d faces=%" PRId64 "\n",
+        "vkmesh: %s simplify target=%d collapsed=%" PRIu64
+        " removed_faces=%" PRIu64 " faces=%" PRId64 "\n",
         label,
         target_faces,
         collapsed,
         removed,
         mesh->n_faces);
+    vkmesh_log_simplify_target_warning(label, &simplify_result);
     return 1;
 }
 
@@ -8299,6 +10825,7 @@ static int vkmesh_trellis_postprocess_inner(
             remesh_project)) {
         return 1;
     }
+    if (vkmesh_fatal_error_blocks_fallback("TRELLIS device postprocess")) return 0;
 
     if (decimation_target <= 0) decimation_target = 1000000;
     fprintf(stderr,
@@ -8336,6 +10863,22 @@ static int vkmesh_trellis_postprocess_inner(
         } else {
             fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", mesh->n_faces, decimation_target);
         }
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final begin vertices=%" PRId64 " faces=%" PRId64 " min_component_area=%.9g run_degenerate_cleanup=%d\n",
+            mesh->n_vertices,
+            mesh->n_faces,
+            min_component_area,
+            run_degenerate_cleanup);
+        if (!vkmesh_host_trellis_remesh_finalize(
+                mesh,
+                min_component_area,
+                run_degenerate_cleanup,
+                degenerate_abs,
+                degenerate_rel)) return 0;
+        fprintf(stderr,
+            "vkmesh: trellis.remesh.final done path=host vertices=%" PRId64 " faces=%" PRId64 "\n",
+            mesh->n_vertices,
+            mesh->n_faces);
         fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
         return 1;
     }
@@ -8367,12 +10910,14 @@ static int vkmesh_trellis_postprocess_inner(
             0,
             NULL,
             "trellis.pass1")) {
+        if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass1 device cleanup")) return 0;
         if (!vkmesh_log_duplicate_degenerate_device_cluster(
                 mesh,
                 run_degenerate_cleanup,
                 degenerate_abs,
                 degenerate_rel,
                 "trellis.pass1")) {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass1 duplicate/degenerate cleanup")) return 0;
             if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass1")) return 0;
             if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass1")) return 0;
         }
@@ -8409,12 +10954,14 @@ static int vkmesh_trellis_postprocess_inner(
             "trellis.pass2")) {
         final_orientation_done = 1;
     } else {
+        if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass2 device cleanup")) return 0;
         if (!vkmesh_log_duplicate_degenerate_device_cluster(
                 mesh,
                 run_degenerate_cleanup,
                 degenerate_abs,
                 degenerate_rel,
                 "trellis.pass2")) {
+            if (vkmesh_fatal_error_blocks_fallback("TRELLIS pass2 duplicate/degenerate cleanup")) return 0;
             if (!vkmesh_log_remove_duplicate_faces(mesh, "trellis.pass2")) return 0;
             if (run_degenerate_cleanup && !vkmesh_log_remove_degenerate_faces(mesh, degenerate_abs, degenerate_rel, "trellis.pass2")) return 0;
         }
@@ -8470,6 +11017,7 @@ static int vkmesh_trellis_postprocess(
     vkmesh_vk vk;
     if (!vkmesh_vk_init(&vk)) {
         vkmesh_vk_destroy(&vk);
+        (void) vkmesh_fatal_error_blocks_fallback("TRELLIS Vulkan initialization");
         return 0;
     }
     g_active_vkmesh_vk = &vk;
@@ -8628,7 +11176,7 @@ trellis_status trellis_vkmesh_postprocess(
     const int previous_workspace_budget_mib = g_vkmesh_workspace_budget_mib;
     g_vkmesh_device_index = options != NULL ? options->device : 0;
     g_vkmesh_workspace_budget_mib = options != NULL ? options->gpu_workspace_budget_mib : 0;
-    g_vkmesh_last_error = VKMESH_ERROR_NONE;
+    vkmesh_begin_operation();
 
     if (!vkmesh_trellis_postprocess(
             &work,
@@ -8833,7 +11381,6 @@ static int vkmesh_probe_vulkan_json(void) {
         fputs(",\"reasonCode\":\"loader_api_too_old\",\"devices\":[]}\n", stdout);
         return 0;
     }
-
     VkApplicationInfo application_info;
     memset(&application_info, 0, sizeof(application_info));
     application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -9214,6 +11761,7 @@ int main(int argc, char ** argv) {
     }
     g_vkmesh_device_index = device;
     g_vkmesh_workspace_budget_mib = gpu_workspace_budget_mib;
+    vkmesh_begin_operation();
 
     vkmesh_mesh mesh;
     memset(&mesh, 0, sizeof(mesh));

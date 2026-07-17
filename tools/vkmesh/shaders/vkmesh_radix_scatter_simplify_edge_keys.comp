@@ -1,0 +1,94 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(std430, binding = 0) readonly buffer InEdgeKeys {
+    uvec2 in_edge_keys[];
+};
+
+layout(binding = 1) readonly buffer ScannedHistogram {
+    uint scanned_histogram[];
+};
+
+layout(std430, binding = 2) buffer OutEdgeKeys {
+    uvec2 out_edge_keys[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+const uint ITEMS_PER_GROUP = 1024u;
+const uint LOCAL_INDEX_BITS = 10u;
+const uint LOCAL_INDEX_MASK = ITEMS_PER_GROUP - 1u;
+shared uint sorted_entries[ITEMS_PER_GROUP];
+shared uint digit_start[256];
+
+uint key_digit(uvec2 key) {
+    uint word = p.aux0 < 4u ? key.y : key.x;
+    return (word >> ((p.aux0 & 3u) * 8u)) & 255u;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint block_start = gl_WorkGroupID.x * ITEMS_PER_GROUP;
+    digit_start[lane] = 0xffffffffu;
+    for (uint item = 0u; item < 4u; ++item) {
+        uint local_index = lane + item * 256u;
+        uint index = block_start + local_index;
+        sorted_entries[local_index] = index < p.n ?
+            (key_digit(in_edge_keys[index]) << LOCAL_INDEX_BITS) | local_index : 0xffffffffu;
+    }
+    barrier();
+
+    for (uint size = 2u; size <= ITEMS_PER_GROUP; size <<= 1u) {
+        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint item = 0u; item < 4u; ++item) {
+                uint index = lane + item * 256u;
+                uint partner = index ^ stride;
+                if (partner > index) {
+                    uint a = sorted_entries[index];
+                    uint b = sorted_entries[partner];
+                    bool ascending = (index & size) == 0u;
+                    if (ascending ? a > b : a < b) {
+                        sorted_entries[index] = b;
+                        sorted_entries[partner] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (uint item = 0u; item < 4u; ++item) {
+        uint sorted_index = lane + item * 256u;
+        uint entry = sorted_entries[sorted_index];
+        if (entry != 0xffffffffu) {
+            atomicMin(digit_start[entry >> LOCAL_INDEX_BITS], sorted_index);
+        }
+    }
+    barrier();
+
+    for (uint item = 0u; item < 4u; ++item) {
+        uint sorted_index = lane + item * 256u;
+        uint entry = sorted_entries[sorted_index];
+        if (entry == 0xffffffffu) continue;
+        uint digit = entry >> LOCAL_INDEX_BITS;
+        uint source_index = block_start + (entry & LOCAL_INDEX_MASK);
+        uint histogram_index = digit * p.aux1 + gl_WorkGroupID.x;
+        uint digit_base = scanned_histogram[256u * p.aux1 + digit];
+        uint block_base = digit_base;
+        if (gl_WorkGroupID.x > 0u) block_base += scanned_histogram[histogram_index - 1u];
+        uint destination = block_base + sorted_index - digit_start[digit];
+        out_edge_keys[destination] = in_edge_keys[source_index];
+    }
+}

@@ -1,0 +1,60 @@
+#version 450
+
+// Map each unique grid-corner coordinate to its UDF value index.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Workspace {
+    int workspace[];
+};
+
+layout(binding = 1) buffer HashData {
+    uint hash_data[];
+};
+
+layout(binding = 2) buffer Status {
+    uint status[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+uint hash_u32(uint key) {
+    key ^= key >> 16u;
+    key *= 0x85ebca6bu;
+    key ^= key >> 13u;
+    key *= 0xc2b2ae35u;
+    key ^= key >> 16u;
+    return key;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.n) return;
+    uint source = p.aux0 + 3u * index;
+    uint x = uint(workspace[source + 0u]);
+    uint y = uint(workspace[source + 1u]);
+    uint z = uint(workspace[source + 2u]);
+    uint dimension = p.aux2;
+    uint stored_key = (x * dimension * dimension + y * dimension + z) + 1u;
+    uint capacity = p.aux1;
+    uint slot = hash_u32(stored_key) & (capacity - 1u);
+    for (uint probe = 0u; probe < capacity; ++probe) {
+        uint previous = atomicCompSwap(hash_data[slot], 0u, stored_key);
+        if (previous == 0u || previous == stored_key) {
+            hash_data[capacity + slot] = index;
+            return;
+        }
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    atomicOr(status[0], 1u);
+}

@@ -1,0 +1,38 @@
+#version 450
+
+// Add the inclusive sum of all preceding blocks to each locally scanned block.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Data {
+    uint data[];
+};
+
+layout(binding = 1) readonly buffer ScannedBlockSums {
+    uint scanned_block_sums[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+const uint BLOCK_SIZE = 256u;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.n) return;
+    uint block = index / BLOCK_SIZE;
+    if (block > 0u) data[p.aux0 + index] += scanned_block_sums[block - 1u];
+}

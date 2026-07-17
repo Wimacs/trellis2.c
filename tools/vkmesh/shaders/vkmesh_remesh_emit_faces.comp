@@ -1,0 +1,165 @@
+#version 450
+
+// Recreate CPU quad order and triangulate each quad into the final mesh buffer.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Workspace {
+    uint workspace[];
+};
+
+layout(binding = 1) readonly buffer HashAndDc {
+    uint hash_and_dc[];
+};
+
+layout(binding = 2) buffer MeshOutput {
+    uint mesh_output[];
+};
+
+layout(binding = 3) buffer Status {
+    uint status[];
+};
+
+const uint SPLIT_1_N[6] = uint[6](0u, 1u, 2u, 0u, 2u, 3u);
+const uint SPLIT_1_P[6] = uint[6](0u, 2u, 1u, 0u, 3u, 2u);
+const uint SPLIT_2_N[6] = uint[6](0u, 1u, 3u, 3u, 1u, 2u);
+const uint SPLIT_2_P[6] = uint[6](0u, 3u, 1u, 3u, 2u, 1u);
+
+uint hash_u32(uint key) {
+    key ^= key >> 16u;
+    key *= 0x85ebca6bu;
+    key ^= key >> 13u;
+    key *= 0xc2b2ae35u;
+    key ^= key >> 16u;
+    return key;
+}
+
+uint lookup_index(uint x, uint y, uint z) {
+    uint dimension = p.aux0;
+    if (x >= dimension || y >= dimension || z >= dimension) {
+        atomicOr(status[5], 1u);
+        return 0u;
+    }
+    uint stored_key = (x * dimension * dimension + y * dimension + z) + 1u;
+    uint capacity = p.aux1;
+    uint slot = hash_u32(stored_key) & (capacity - 1u);
+    for (uint probe = 0u; probe < capacity; ++probe) {
+        uint key = hash_and_dc[slot];
+        if (key == 0u) break;
+        if (key == stored_key) return hash_and_dc[capacity + slot];
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    atomicOr(status[5], 1u);
+    return 0u;
+}
+
+uint neighbor_index(uint axis, uint corner, uvec3 cell) {
+    if (corner == 0u) return gl_GlobalInvocationID.x;
+    uvec3 offset;
+    if (axis == 0u) {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(0u, 0u, 1u),
+            uvec3(0u, 1u, 1u), uvec3(0u, 1u, 0u));
+        offset = offsets[corner];
+    } else if (axis == 1u) {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(1u, 0u, 0u),
+            uvec3(1u, 0u, 1u), uvec3(0u, 0u, 1u));
+        offset = offsets[corner];
+    } else {
+        const uvec3 offsets[4] = uvec3[4](
+            uvec3(0u, 0u, 0u), uvec3(0u, 1u, 0u),
+            uvec3(1u, 1u, 0u), uvec3(1u, 0u, 0u));
+        offset = offsets[corner];
+    }
+    return lookup_index(cell.x + offset.x, cell.y + offset.y, cell.z + offset.z);
+}
+
+vec3 dual_position(uint active_cell) {
+    uint source = p.aux2 + 6u * active_cell;
+    precise float inv_resolution = uintBitsToFloat(status[4]);
+    precise float scale = uintBitsToFloat(status[3]);
+    precise vec3 point;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        precise float normalized =
+            uintBitsToFloat(hash_and_dc[source + axis]) * inv_resolution;
+        precise float centered = normalized - 0.5f;
+        precise float scaled = centered * scale;
+        point[axis] = scaled + uintBitsToFloat(status[axis]);
+    }
+    return point;
+}
+
+float split_align(vec3 v0, vec3 v1, vec3 v2, vec3 v3) {
+    precise vec3 a = v1 - v0;
+    precise vec3 b = v2 - v0;
+    precise vec3 c = v2 - v1;
+    precise vec3 d = v3 - v1;
+    // Spell out the scalar order used by vkmesh_cross3/vkmesh_dot3. Near a
+    // degenerate diagonal, vector intrinsics may otherwise choose a different
+    // contraction and flip the strict align0 > align1 tie break.
+    precise float n0x = a.y * b.z - a.z * b.y;
+    precise float n0y = a.z * b.x - a.x * b.z;
+    precise float n0z = a.x * b.y - a.y * b.x;
+    precise float n1x = c.y * d.z - c.z * d.y;
+    precise float n1y = c.z * d.x - c.x * d.z;
+    precise float n1z = c.x * d.y - c.y * d.x;
+    precise float alignment = abs(n0x * n1x + n0y * n1y + n0z * n1z);
+    return alignment;
+}
+
+uint split_index(uint index, bool first_split, bool positive) {
+    return first_split ? (positive ? SPLIT_1_P[index] : SPLIT_1_N[index])
+                       : (positive ? SPLIT_2_P[index] : SPLIT_2_N[index]);
+}
+
+void main() {
+    uint cell_index = gl_GlobalInvocationID.x;
+    if (cell_index >= p.n) return;
+    uint masks_base = 4u * p.n + 1u;
+    uint mask = workspace[masks_base + cell_index];
+    if (mask == 0u) return;
+
+    uint quad_offsets_base = 6u * p.n + 1u;
+    uint vertex_offsets_base = 7u * p.n + 2u;
+    uint vertex_count = workspace[vertex_offsets_base + p.n - 1u];
+    uvec3 cell = uvec3(
+        workspace[3u * cell_index + 0u],
+        workspace[3u * cell_index + 1u],
+        workspace[3u * cell_index + 2u]);
+
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        if ((mask & (1u << axis)) == 0u) continue;
+        uint active_q[4];
+        uint q[4];
+        for (uint corner = 0u; corner < 4u; ++corner) {
+            active_q[corner] = neighbor_index(axis, corner, cell);
+            q[corner] = workspace[vertex_offsets_base + active_q[corner]] - 1u;
+        }
+        precise vec3 v0 = dual_position(active_q[0]);
+        precise vec3 v1 = dual_position(active_q[1]);
+        precise vec3 v2 = dual_position(active_q[2]);
+        precise vec3 v3 = dual_position(active_q[3]);
+        int direction = int(hash_and_dc[p.aux2 + 6u * cell_index + 3u + axis]);
+        bool positive = direction == 1;
+        precise float align0 = positive ?
+            split_align(v0, v2, v1, v0) : split_align(v0, v1, v2, v0);
+        precise float align1 = positive ?
+            split_align(v0, v3, v1, v3) : split_align(v0, v1, v3, v3);
+        bool first_split = align0 > align1;
+        uint rank = bitCount(mask & ((1u << axis) - 1u));
+        uint quad = workspace[quad_offsets_base + cell_index] + rank;
+        uint destination = 3u * vertex_count + 6u * quad;
+        for (uint index = 0u; index < 6u; ++index) {
+            mesh_output[destination + index] = q[split_index(index, first_split, positive)];
+        }
+    }
+}

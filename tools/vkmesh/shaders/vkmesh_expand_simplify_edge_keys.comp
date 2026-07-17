@@ -1,0 +1,49 @@
+#version 450
+
+// Simplification needs only an undirected edge key.  Keeping the three
+// directed endpoints and face id used by the general topology path would make
+// every sort record 20 bytes instead of 8 bytes.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer UnusedVertices {
+    float unused_vertices[];
+};
+
+layout(std430, binding = 2) buffer OutEdgeKeys {
+    uvec2 out_edge_keys[];
+};
+
+layout(binding = 3) buffer UnusedAuxData {
+    uint unused_aux_data[];
+};
+
+uvec2 undirected_edge_key(uint a, uint b) {
+    return uvec2(min(a, b), max(a, b));
+}
+
+void main() {
+    uint face_id = gl_GlobalInvocationID.x;
+    if (face_id >= p.n) return;
+
+    uint face_base = face_id * 3u;
+    uint a = uint(faces[face_base + 0u]);
+    uint b = uint(faces[face_base + 1u]);
+    uint c = uint(faces[face_base + 2u]);
+    uint edge_base = face_id * 3u;
+    out_edge_keys[edge_base + 0u] = undirected_edge_key(a, b);
+    out_edge_keys[edge_base + 1u] = undirected_edge_key(b, c);
+    out_edge_keys[edge_base + 2u] = undirected_edge_key(c, a);
+}

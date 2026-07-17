@@ -102,7 +102,9 @@ void main() {
 
     uint v0 = edges[edge_id * 2u + 0u];
     uint v1 = edges[edge_id * 2u + 1u];
-    if (v0 >= p.aux0 || v1 >= p.aux0) return;
+    // Defense in depth: malformed self-edges are filtered during candidate
+    // construction and scoring, but must never reach the topology write path.
+    if (v0 >= p.aux0 || v1 >= p.aux0 || v0 == v1) return;
     if (!edge_is_best_for_vertex(v0, edge_id, cost_bits) ||
         !edge_is_best_for_vertex(v1, edge_id, cost_bits)) {
         return;

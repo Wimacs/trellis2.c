@@ -30,12 +30,11 @@ layout(binding = 3) buffer AuxData {
 void write_edge(uint dst, uint a, uint b, uint face_id) {
     uint mn = min(a, b);
     uint mx = max(a, b);
-    uint base = dst * 5u;
+    uint direction = a != b && a > b ? 1u : 0u;
+    uint base = dst * 3u;
     out_data[base + 0u] = mn;
     out_data[base + 1u] = mx;
-    out_data[base + 2u] = a;
-    out_data[base + 3u] = b;
-    out_data[base + 4u] = face_id;
+    out_data[base + 2u] = (face_id << 1u) | direction;
 }
 
 void main() {

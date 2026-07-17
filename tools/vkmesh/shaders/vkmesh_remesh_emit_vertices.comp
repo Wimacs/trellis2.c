@@ -1,0 +1,49 @@
+#version 450
+
+// Compact referenced DC vertices directly into the final mesh buffer.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Workspace {
+    uint workspace[];
+};
+
+layout(binding = 1) readonly buffer HashAndDc {
+    uint hash_and_dc[];
+};
+
+layout(binding = 2) buffer MeshOutput {
+    uint mesh_output[];
+};
+
+layout(binding = 3) readonly buffer Transform {
+    float transform[];
+};
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= p.n) return;
+    uint referenced_base = 5u * p.n + 1u;
+    if (workspace[referenced_base + cell] == 0u) return;
+
+    uint vertex_offsets_base = 7u * p.n + 2u;
+    uint destination = workspace[vertex_offsets_base + cell] - 1u;
+    uint source = p.aux0 + 6u * cell;
+    precise float inv_resolution = transform[4];
+    precise float scale = transform[3];
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        precise float normalized = uintBitsToFloat(hash_and_dc[source + axis]) * inv_resolution;
+        precise float centered = normalized - 0.5f;
+        precise float scaled = centered * scale;
+        precise float point = scaled + transform[axis];
+        mesh_output[3u * destination + axis] = floatBitsToUint(point);
+    }
+}

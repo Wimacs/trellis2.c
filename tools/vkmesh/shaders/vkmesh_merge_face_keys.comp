@@ -1,0 +1,141 @@
+#version 450
+
+// Merge two globally sorted runs in independent 256-record merge-path tiles.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint run_width;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+struct FaceKeyRecord {
+    uint v0;
+    uint v1;
+    uint v2;
+    uint face;
+};
+
+layout(std430, binding = 0) buffer Records {
+    FaceKeyRecord records[];
+};
+
+layout(std430, binding = 1) buffer TemporaryRecords {
+    FaceKeyRecord temporary_records[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+const uint TILE_SIZE = 256u;
+shared FaceKeyRecord a_records[TILE_SIZE];
+shared FaceKeyRecord b_records[TILE_SIZE];
+shared uint tile_a_base;
+shared uint tile_b_base;
+shared uint tile_a_count;
+shared uint tile_b_count;
+shared uint tile_output_base;
+shared uint tile_output_count;
+
+bool record_less(FaceKeyRecord lhs, FaceKeyRecord rhs) {
+    if (lhs.v0 != rhs.v0) return lhs.v0 < rhs.v0;
+    if (lhs.v1 != rhs.v1) return lhs.v1 < rhs.v1;
+    if (lhs.v2 != rhs.v2) return lhs.v2 < rhs.v2;
+    return lhs.face < rhs.face;
+}
+
+FaceKeyRecord input_record(uint index) {
+    return p.aux1 != 0u ? temporary_records[index] : records[index];
+}
+
+void output_record(uint index, FaceKeyRecord value) {
+    if (p.aux1 != 0u) records[index] = value;
+    else temporary_records[index] = value;
+}
+
+// Stable co-rank: records from A precede equal records from B.
+uint global_co_rank(uint diagonal, uint a_base, uint a_count, uint b_base, uint b_count) {
+    int low = max(0, int(diagonal) - int(b_count));
+    int high = min(int(diagonal), int(a_count));
+    while (low < high) {
+        int i = (low + high) >> 1;
+        int j = int(diagonal) - i;
+        bool need_more_a =
+            i < int(a_count) && j > 0 &&
+            !record_less(input_record(b_base + uint(j - 1)), input_record(a_base + uint(i)));
+        if (need_more_a) low = i + 1;
+        else high = i;
+    }
+    return uint(low);
+}
+
+uint tile_co_rank(uint diagonal, uint a_count, uint b_count) {
+    int low = max(0, int(diagonal) - int(b_count));
+    int high = min(int(diagonal), int(a_count));
+    while (low < high) {
+        int i = (low + high) >> 1;
+        int j = int(diagonal) - i;
+        bool need_more_a =
+            i < int(a_count) && j > 0 &&
+            !record_less(b_records[uint(j - 1)], a_records[uint(i)]);
+        if (need_more_a) low = i + 1;
+        else high = i;
+    }
+    return uint(low);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint output_base = gl_WorkGroupID.x * TILE_SIZE;
+    if (output_base >= p.n) return;
+
+    if (lane == 0u) {
+        uint pair_span = p.run_width * 2u;
+        uint pair_base = (output_base / pair_span) * pair_span;
+        uint diagonal = output_base - pair_base;
+        uint a_count = min(p.run_width, p.n - pair_base);
+        uint b_base = pair_base + p.run_width;
+        uint b_count = b_base < p.n ? min(p.run_width, p.n - b_base) : 0u;
+        uint pair_count = a_count + b_count;
+        uint output_count = min(TILE_SIZE, pair_count - diagonal);
+
+        uint a_begin = global_co_rank(diagonal, pair_base, a_count, b_base, b_count);
+        uint a_end = global_co_rank(diagonal + output_count, pair_base, a_count, b_base, b_count);
+        uint b_begin = diagonal - a_begin;
+        uint b_end = diagonal + output_count - a_end;
+
+        tile_a_base = pair_base + a_begin;
+        tile_b_base = b_base + b_begin;
+        tile_a_count = a_end - a_begin;
+        tile_b_count = b_end - b_begin;
+        tile_output_base = output_base;
+        tile_output_count = output_count;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    if (lane < tile_a_count) a_records[lane] = input_record(tile_a_base + lane);
+    if (lane < tile_b_count) b_records[lane] = input_record(tile_b_base + lane);
+    memoryBarrierShared();
+    barrier();
+
+    if (lane >= tile_output_count) return;
+    uint a_index = tile_co_rank(lane, tile_a_count, tile_b_count);
+    uint b_index = lane - a_index;
+    FaceKeyRecord value;
+    if (a_index < tile_a_count &&
+        (b_index >= tile_b_count || !record_less(b_records[b_index], a_records[a_index]))) {
+        value = a_records[a_index];
+    } else {
+        value = b_records[b_index];
+    }
+    output_record(tile_output_base + lane, value);
+}

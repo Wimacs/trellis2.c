@@ -1,0 +1,56 @@
+#version 450
+
+// Emit the exact unique corner list using masks produced by the owner pass.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Coordinates {
+    int coordinates[];
+};
+
+layout(binding = 1) readonly buffer Offsets {
+    uint offsets[];
+};
+
+layout(binding = 2) readonly buffer CountsAndMasks {
+    uint counts_and_masks[];
+};
+
+layout(binding = 3) buffer OutputCoordinates {
+    int output_coordinates[];
+};
+
+ivec3 corner_offset(uint index) {
+    return ivec3(int(index >> 2u), int((index >> 1u) & 1u), int(index & 1u));
+}
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= p.n) return;
+
+    ivec3 base = ivec3(
+        coordinates[3u * cell + 0u],
+        coordinates[3u * cell + 1u],
+        coordinates[3u * cell + 2u]);
+    uint masks_base = 4u * p.n + 1u;
+    uint offsets_base = 5u * p.n + 1u;
+    uint output_base = 6u * p.n + 2u;
+    uint owner_mask = counts_and_masks[masks_base + cell];
+    uint destination = offsets[offsets_base + cell];
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        if ((owner_mask & (1u << corner)) == 0u) continue;
+        ivec3 vertex = base + corner_offset(corner);
+        output_coordinates[output_base + 3u * destination + 0u] = vertex.x;
+        output_coordinates[output_base + 3u * destination + 1u] = vertex.y;
+        output_coordinates[output_base + 3u * destination + 2u] = vertex.z;
+        ++destination;
+    }
+}

@@ -212,23 +212,58 @@ static void gltf_chart_input_free(trellis_gltf_chart_input * chart) {
     memset(chart, 0, sizeof(*chart));
 }
 
+static uint32_t gltf_uv_output_padding_for_chart_count(
+    uint32_t chart_count,
+    int texture_size) {
+    const uint64_t output_texels =
+        (uint64_t) (uint32_t) texture_size * (uint32_t) texture_size;
+    uint32_t padding = TRELLIS_GLTF_UV_OUTPUT_PADDING;
+    while (padding > 0u) {
+        const uint64_t footprint_side = (uint64_t) padding * 2u + 3u;
+        const uint64_t minimum_guard_texels =
+            (uint64_t) chart_count * footprint_side * footprint_side;
+        if (minimum_guard_texels <= output_texels / 2u) break;
+        --padding;
+    }
+    return padding;
+}
+
 static trellis_status gltf_xatlas_pack_for_output(
     xatlasAtlas * atlas,
     int texture_size,
+    uint32_t minimum_chart_count,
     uint32_t * atlas_padding_out) {
     if (atlas == NULL || texture_size <= 0 || atlas_padding_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
+    int64_t stage_start_us = trellis_now_us();
     xatlasComputeCharts(atlas, NULL);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_compute_charts ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
 
     /* Probe without padding so fragmented meshes do not spend most texels on guards. */
     xatlasPackOptions probe_options;
     xatlasPackOptionsInit(&probe_options);
     probe_options.resolution = (uint32_t) texture_size;
     probe_options.padding = 0u;
-    probe_options.createImage = false;
+    /* Keep the owner image only when the chart count proves that padding will
+     * be zero. This avoids a duplicate pack for heavily fragmented atlases
+     * without making normal 2K/4K probes build an image that a later padded
+     * pack would immediately discard. */
+    const uint32_t known_chart_count =
+        atlas->chartCount > 0u ? atlas->chartCount : minimum_chart_count;
+    const uint32_t guaranteed_padding = gltf_uv_output_padding_for_chart_count(
+        known_chart_count,
+        texture_size);
+    probe_options.createImage =
+        TRELLIS_HAS_GLTF_VULKAN_BAKE != 0 && guaranteed_padding == 0u;
+    stage_start_us = trellis_now_us();
     xatlasPackCharts(atlas, &probe_options);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_pack_probe ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
     if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
         atlas->chartCount == 0u || atlas->meshes == NULL) {
         TRELLIS_ERROR(
@@ -243,15 +278,9 @@ static trellis_status gltf_xatlas_pack_for_output(
         atlas->width > atlas->height ? atlas->width : atlas->height;
 
     /* Keep at least half of the atlas budget for chart interiors and packing loss. */
-    const uint64_t output_texels = (uint64_t) (uint32_t) texture_size * (uint32_t) texture_size;
-    uint32_t target_output_padding = TRELLIS_GLTF_UV_OUTPUT_PADDING;
-    while (target_output_padding > 0u) {
-        const uint64_t footprint_side = (uint64_t) target_output_padding * 2u + 3u;
-        const uint64_t minimum_guard_texels =
-            (uint64_t) atlas->chartCount * footprint_side * footprint_side;
-        if (minimum_guard_texels <= output_texels / 2u) break;
-        --target_output_padding;
-    }
+    uint32_t target_output_padding = gltf_uv_output_padding_for_chart_count(
+        atlas->chartCount,
+        texture_size);
     if (target_output_padding < TRELLIS_GLTF_UV_OUTPUT_PADDING) {
         TRELLIS_INFO(
             "glTF export: UV islands=%u exceed %upx guard capacity at %d; using target=%upx",
@@ -265,7 +294,30 @@ static trellis_status gltf_xatlas_pack_for_output(
     uint32_t best_max_dimension = probe_max_dimension;
     uint32_t pack_passes = 1u;
     int reached_target = target_output_padding == 0u;
+    if (reached_target &&
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
+        atlas->image != NULL
+#else
+        1
+#endif
+    ) {
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
+        /* The probe owner map is the final chart map. */
+#endif
+        *atlas_padding_out = 0u;
+        TRELLIS_INFO(
+            "glTF export: xatlas padding atlas=0 output=0.00x0.00 px target=0 passes=1");
+        return TRELLIS_STATUS_OK;
+    }
+    const uint64_t initial_padding_numerator =
+        (uint64_t) target_output_padding * probe_max_dimension +
+        (uint32_t) texture_size - 1u;
+    const uint64_t initial_padding =
+        initial_padding_numerator / (uint32_t) texture_size;
     uint32_t atlas_padding = target_output_padding;
+    if (initial_padding >= target_output_padding && initial_padding <= 256u) {
+        atlas_padding = (uint32_t) initial_padding;
+    }
     for (uint32_t pass = 0;
          target_output_padding > 0u && pass < TRELLIS_GLTF_UV_PACK_MAX_PASSES;
          ++pass) {
@@ -273,8 +325,14 @@ static trellis_status gltf_xatlas_pack_for_output(
         xatlasPackOptionsInit(&pack_options);
         pack_options.resolution = (uint32_t) texture_size;
         pack_options.padding = atlas_padding;
-        pack_options.createImage = false;
+        pack_options.createImage = TRELLIS_HAS_GLTF_VULKAN_BAKE != 0;
+        stage_start_us = trellis_now_us();
         xatlasPackCharts(atlas, &pack_options);
+        TRELLIS_INFO(
+            "perf_stage name=gltf_uv_pack_candidate ms=%.3f pass=%u padding=%u",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            pass + 1u,
+            atlas_padding);
         ++pack_passes;
         if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
             atlas->meshes == NULL) {
@@ -287,7 +345,13 @@ static trellis_status gltf_xatlas_pack_for_output(
         }
 
         const uint32_t max_dimension = atlas->width > atlas->height ? atlas->width : atlas->height;
-        if ((uint64_t) max_dimension > (uint64_t) probe_max_dimension * 2u) break;
+        if ((uint64_t) max_dimension > (uint64_t) probe_max_dimension * 2u) {
+            if (atlas_padding > target_output_padding) {
+                atlas_padding = target_output_padding;
+                continue;
+            }
+            break;
+        }
         if ((uint64_t) atlas_padding * best_max_dimension >
             (uint64_t) best_atlas_padding * max_dimension) {
             best_atlas_padding = atlas_padding;
@@ -298,7 +362,22 @@ static trellis_status gltf_xatlas_pack_for_output(
         if ((uint64_t) atlas_padding * (uint32_t) texture_size >=
             (uint64_t) target_output_padding * max_dimension) {
             reached_target = 1;
-            break;
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
+            if (atlas->image == NULL) break;
+#endif
+            const float output_padding_x =
+                (float) atlas_padding * (float) texture_size / (float) atlas->width;
+            const float output_padding_y =
+                (float) atlas_padding * (float) texture_size / (float) atlas->height;
+            *atlas_padding_out = atlas_padding;
+            TRELLIS_INFO(
+                "glTF export: xatlas padding atlas=%u output=%.2fx%.2f px target=%u passes=%u",
+                atlas_padding,
+                output_padding_x,
+                output_padding_y,
+                target_output_padding,
+                pack_passes);
+            return TRELLIS_STATUS_OK;
         }
         const uint64_t required_numerator =
             (uint64_t) target_output_padding * max_dimension +
@@ -309,13 +388,18 @@ static trellis_status gltf_xatlas_pack_for_output(
         atlas_padding = (uint32_t) required;
     }
 
-    /* Repack the best candidate and build the potentially large owner map only once. */
+    /* Fall back to the best candidate if no pass reached the requested output guard. */
     xatlasPackOptions final_options;
     xatlasPackOptionsInit(&final_options);
     final_options.resolution = (uint32_t) texture_size;
     final_options.padding = best_atlas_padding;
     final_options.createImage = TRELLIS_HAS_GLTF_VULKAN_BAKE != 0;
+    stage_start_us = trellis_now_us();
     xatlasPackCharts(atlas, &final_options);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_pack_final ms=%.3f padding=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        best_atlas_padding);
     ++pack_passes;
     if (atlas->atlasCount != 1u || atlas->width == 0u || atlas->height == 0u ||
         atlas->meshes == NULL ||
@@ -435,7 +519,11 @@ static trellis_status unwrap_mesh_xatlas_direct(
         return TRELLIS_STATUS_ERROR;
     }
     uint32_t atlas_padding = 0;
-    trellis_status pack_status = gltf_xatlas_pack_for_output(atlas, texture_size, &atlas_padding);
+    trellis_status pack_status = gltf_xatlas_pack_for_output(
+        atlas,
+        texture_size,
+        1u,
+        &atlas_padding);
     if (pack_status != TRELLIS_STATUS_OK) {
         xatlasDestroy(atlas);
         free(input_normals);
@@ -826,7 +914,39 @@ static uint32_t gltf_vk_find_memory_type(VkPhysicalDevice physical, uint32_t typ
     return UINT32_MAX;
 }
 
-static int gltf_vk_buffer_create(trellis_gltf_vk * vk, size_t bytes, trellis_gltf_vk_buffer * out) {
+static int gltf_vk_buffer_memory_try(
+    trellis_gltf_vk * vk,
+    trellis_gltf_vk_buffer * out,
+    const VkMemoryRequirements * req,
+    uint32_t memory_type) {
+    VkMemoryAllocateInfo alloc_info;
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = req->size;
+    alloc_info.memoryTypeIndex = memory_type;
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void * mapped = NULL;
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &memory) != VK_SUCCESS) return 0;
+    if (vkMapMemory(vk->device, memory, 0, req->size, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(vk->device, memory, NULL);
+        return 0;
+    }
+    if (vkBindBufferMemory(vk->device, out->buffer, memory, 0) != VK_SUCCESS) {
+        vkUnmapMemory(vk->device, memory);
+        vkFreeMemory(vk->device, memory, NULL);
+        return 0;
+    }
+    out->memory = memory;
+    out->mapped = mapped;
+    return 1;
+}
+
+static int gltf_vk_buffer_create_impl(
+    trellis_gltf_vk * vk,
+    size_t bytes,
+    int host_readback,
+    trellis_gltf_vk_buffer * out) {
     memset(out, 0, sizeof(*out));
     if (bytes == 0) bytes = 4;
     out->bytes = bytes;
@@ -844,28 +964,51 @@ static int gltf_vk_buffer_create(trellis_gltf_vk * vk, size_t bytes, trellis_glt
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(vk->device, out->buffer, &req);
-    uint32_t memory_type = gltf_vk_find_memory_type(
-        vk->physical_device,
-        req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (memory_type == UINT32_MAX) {
-        gltf_vk_buffer_destroy(vk, out);
-        return 0;
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &props);
+    const VkMemoryPropertyFlags host_flags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const uint32_t pass_count = host_readback ? 3u : 2u;
+    for (uint32_t pass = 0; pass < pass_count; ++pass) {
+        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags flags = props.memoryTypes[i].propertyFlags;
+            const int device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+            const int host_cached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+            int preferred = 0;
+            if (host_readback) {
+                preferred =
+                    (pass == 0u && !device_local && host_cached) ||
+                    (pass == 1u && !device_local && !host_cached) ||
+                    (pass == 2u && device_local);
+            } else {
+                preferred = (pass == 0u && device_local) || (pass == 1u && !device_local);
+            }
+            if ((req.memoryTypeBits & (1u << i)) == 0 ||
+                (flags & host_flags) != host_flags || !preferred) {
+                continue;
+            }
+            if (gltf_vk_buffer_memory_try(vk, out, &req, i)) {
+                /* Every bake buffer is fully uploaded or overwritten before its first read. */
+                return 1;
+            }
+        }
     }
+    gltf_vk_buffer_destroy(vk, out);
+    return 0;
+}
 
-    VkMemoryAllocateInfo alloc_info;
-    memset(&alloc_info, 0, sizeof(alloc_info));
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = req.size;
-    alloc_info.memoryTypeIndex = memory_type;
-    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &out->memory) != VK_SUCCESS ||
-        vkBindBufferMemory(vk->device, out->buffer, out->memory, 0) != VK_SUCCESS ||
-        vkMapMemory(vk->device, out->memory, 0, req.size, 0, &out->mapped) != VK_SUCCESS) {
-        gltf_vk_buffer_destroy(vk, out);
-        return 0;
-    }
-    memset(out->mapped, 0, bytes);
-    return 1;
+static int gltf_vk_buffer_create(
+    trellis_gltf_vk * vk,
+    size_t bytes,
+    trellis_gltf_vk_buffer * out) {
+    return gltf_vk_buffer_create_impl(vk, bytes, 0, out);
+}
+
+static int gltf_vk_readback_buffer_create(
+    trellis_gltf_vk * vk,
+    size_t bytes,
+    trellis_gltf_vk_buffer * out) {
+    return gltf_vk_buffer_create_impl(vk, bytes, 1, out);
 }
 
 static int gltf_vk_image_create(
@@ -1495,28 +1638,28 @@ static int gltf_vk_texture_postprocess(
 
         /* Unowned atlas space stays empty; global jump-fill can carry color across UV islands. */
         if (recorded) {
-            VkBufferMemoryBarrier host_barriers[2];
-            memset(host_barriers, 0, sizeof(host_barriers));
+            VkBufferMemoryBarrier copy_barriers[2];
+            memset(copy_barriers, 0, sizeof(copy_barriers));
             trellis_gltf_vk_buffer * written[2] = { cur_base, cur_mr };
             for (uint32_t i = 0; i < 2; ++i) {
-                host_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                host_barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                host_barriers[i].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                host_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                host_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                host_barriers[i].buffer = written[i]->buffer;
-                host_barriers[i].offset = 0;
-                host_barriers[i].size = target_image_bytes;
+                copy_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                copy_barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                copy_barriers[i].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                copy_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                copy_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                copy_barriers[i].buffer = written[i]->buffer;
+                copy_barriers[i].offset = 0;
+                copy_barriers[i].size = target_image_bytes;
             }
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0,
                 0,
                 NULL,
                 2,
-                host_barriers,
+                copy_barriers,
                 0,
                 NULL);
         }
@@ -1539,6 +1682,73 @@ static int gltf_vk_texture_postprocess(
     return ok;
 }
 
+static int gltf_vk_copy_texture_readback(
+    trellis_gltf_vk * vk,
+    const trellis_gltf_vk_buffer * base_src,
+    const trellis_gltf_vk_buffer * mr_src,
+    trellis_gltf_vk_buffer * base_dst,
+    trellis_gltf_vk_buffer * mr_dst,
+    size_t bytes) {
+    VkCommandBufferAllocateInfo cmd_alloc;
+    memset(&cmd_alloc, 0, sizeof(cmd_alloc));
+    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool = vk->command_pool;
+    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd) != VK_SUCCESS) return 0;
+
+    VkCommandBufferBeginInfo begin_info;
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    int ok = vkBeginCommandBuffer(cmd, &begin_info) == VK_SUCCESS;
+    if (ok) {
+        VkBufferCopy copy;
+        memset(&copy, 0, sizeof(copy));
+        copy.size = (VkDeviceSize) bytes;
+        vkCmdCopyBuffer(cmd, base_src->buffer, base_dst->buffer, 1, &copy);
+        vkCmdCopyBuffer(cmd, mr_src->buffer, mr_dst->buffer, 1, &copy);
+
+        VkBufferMemoryBarrier barriers[2];
+        memset(barriers, 0, sizeof(barriers));
+        trellis_gltf_vk_buffer * written[2] = { base_dst, mr_dst };
+        for (uint32_t i = 0; i < 2u; ++i) {
+            barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            barriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barriers[i].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].buffer = written[i]->buffer;
+            barriers[i].offset = 0;
+            barriers[i].size = (VkDeviceSize) bytes;
+        }
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0,
+            0,
+            NULL,
+            2,
+            barriers,
+            0,
+            NULL);
+        ok = vkEndCommandBuffer(cmd) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkSubmitInfo submit;
+        memset(&submit, 0, sizeof(submit));
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cmd;
+        ok = vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS &&
+            vkQueueWaitIdle(vk->queue) == VK_SUCCESS;
+    }
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+    return ok;
+}
+
 static uint32_t gltf_uv_chart_target_faces(void) {
     uint32_t value = 8192u;
     const char * env = getenv("TRELLIS_GLTF_UV_CHART_FACES");
@@ -1552,14 +1762,6 @@ static uint32_t gltf_uv_chart_target_faces(void) {
     return value;
 }
 
-static int gltf_chart_record_compare(const void * a, const void * b) {
-    const trellis_gltf_chart_record * ra = (const trellis_gltf_chart_record *) a;
-    const trellis_gltf_chart_record * rb = (const trellis_gltf_chart_record *) b;
-    if (ra->key != rb->key) return ra->key < rb->key ? -1 : 1;
-    if (ra->face != rb->face) return ra->face < rb->face ? -1 : 1;
-    return 0;
-}
-
 static int gltf_edge_record_compare(const void * a, const void * b) {
     const trellis_gltf_edge_record * ea = (const trellis_gltf_edge_record *) a;
     const trellis_gltf_edge_record * eb = (const trellis_gltf_edge_record *) b;
@@ -1567,6 +1769,52 @@ static int gltf_edge_record_compare(const void * a, const void * b) {
     if (ea->face != eb->face) return ea->face < eb->face ? -1 : 1;
     if (ea->local_edge != eb->local_edge) return ea->local_edge < eb->local_edge ? -1 : 1;
     return 0;
+}
+
+static int gltf_group_chart_records(
+    const trellis_gltf_chart_record * records,
+    uint32_t face_count,
+    uint32_t chart_count,
+    trellis_gltf_chart_record ** grouped_out) {
+    *grouped_out = NULL;
+    if (records == NULL || face_count == 0u || chart_count == 0u) return 0;
+
+    trellis_gltf_chart_record * grouped =
+        (trellis_gltf_chart_record *) malloc((size_t) face_count * sizeof(*grouped));
+    uint32_t * offsets =
+        (uint32_t *) calloc((size_t) chart_count + 1u, sizeof(*offsets));
+    uint32_t * cursors =
+        (uint32_t *) malloc((size_t) chart_count * sizeof(*cursors));
+    if (grouped == NULL || offsets == NULL || cursors == NULL) {
+        free(grouped);
+        free(offsets);
+        free(cursors);
+        return 0;
+    }
+
+    for (uint32_t face = 0; face < face_count; ++face) {
+        uint32_t key = records[face].key;
+        if (key >= chart_count) {
+            free(grouped);
+            free(offsets);
+            free(cursors);
+            return 0;
+        }
+        ++offsets[key + 1u];
+    }
+    for (uint32_t chart = 1u; chart <= chart_count; ++chart) {
+        offsets[chart] += offsets[chart - 1u];
+    }
+    memcpy(cursors, offsets, (size_t) chart_count * sizeof(*cursors));
+    for (uint32_t face = 0; face < face_count; ++face) {
+        const trellis_gltf_chart_record record = records[face];
+        grouped[cursors[record.key]++] = record;
+    }
+
+    free(offsets);
+    free(cursors);
+    *grouped_out = grouped;
+    return 1;
 }
 
 static uint64_t gltf_edge_key_u32(uint32_t a, uint32_t b) {
@@ -1681,6 +1929,7 @@ static int gltf_compute_chart_records_connected(
         return 0;
     }
 
+    int64_t stage_start_us = trellis_now_us();
     for (uint32_t i = 0; i < face_count * 3u; ++i) {
         neighbors[i] = -1;
     }
@@ -1709,8 +1958,18 @@ static int gltf_compute_chart_records_connected(
         edges[(size_t) i * 3u + 1u] = (trellis_gltf_edge_record) { gltf_edge_key_u32(v1, v2), i, 1u };
         edges[(size_t) i * 3u + 2u] = (trellis_gltf_edge_record) { gltf_edge_key_u32(v2, v0), i, 2u };
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_adjacency_prepare ms=%.3f faces=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        face_count);
 
+    stage_start_us = trellis_now_us();
     qsort(edges, (size_t) edge_count64, sizeof(*edges), gltf_edge_record_compare);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_edge_sort ms=%.3f edges=%" PRIu64,
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        edge_count64);
+    stage_start_us = trellis_now_us();
     size_t e = 0;
     while (e < (size_t) edge_count64) {
         size_t end = e + 1u;
@@ -1725,7 +1984,11 @@ static int gltf_compute_chart_records_connected(
     }
     free(edges);
     edges = NULL;
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_adjacency_emit ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
 
+    stage_start_us = trellis_now_us();
     const float cone_cos = gltf_uv_chart_cone_cos();
     uint32_t chunk_count = 0;
     uint32_t max_chart_faces = 0;
@@ -1797,6 +2060,11 @@ static int gltf_compute_chart_records_connected(
     free(face_areas);
     free(chart_ids);
     free(queue);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_connected_split ms=%.3f chunks=%u max_chunk_faces=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        chunk_count,
+        max_chart_faces);
     return 1;
 }
 
@@ -1827,23 +2095,29 @@ static trellis_status unwrap_mesh_xatlas_charted(
         free(input_normals);
         return TRELLIS_STATUS_ERROR;
     }
-    qsort(records, (size_t) mesh->n_faces, sizeof(*records), gltf_chart_record_compare);
-
-    uint32_t chart_count = 0;
-    for (int64_t i = 0; i < mesh->n_faces; ++i) {
-        if (i == 0 || records[i].key != records[i - 1].key) ++chart_count;
-    }
-    if (clustered_chart_count != chart_count) {
-        TRELLIS_INFO(
-        "glTF export: connected chart count adjusted records=%u sorted=%u",
-            clustered_chart_count,
-            chart_count);
-    }
+    uint32_t chart_count = clustered_chart_count;
     if (chart_count <= 1u) {
         free(records);
         free(input_normals);
         return TRELLIS_STATUS_NOT_IMPLEMENTED;
     }
+    int64_t stage_start_us = trellis_now_us();
+    trellis_gltf_chart_record * grouped_records = NULL;
+    if (!gltf_group_chart_records(
+            records,
+            (uint32_t) mesh->n_faces,
+            chart_count,
+            &grouped_records)) {
+        free(records);
+        free(input_normals);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    free(records);
+    records = grouped_records;
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_group_faces ms=%.3f chunks=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        chart_count);
 
     trellis_gltf_chart_input * charts =
         (trellis_gltf_chart_input *) calloc((size_t) chart_count, sizeof(trellis_gltf_chart_input));
@@ -1868,6 +2142,7 @@ static trellis_status unwrap_mesh_xatlas_charted(
     }
 
     trellis_status status = TRELLIS_STATUS_OK;
+    stage_start_us = trellis_now_us();
     uint32_t chart_index = 0;
     int64_t start = 0;
     while (start < mesh->n_faces) {
@@ -1940,19 +2215,36 @@ static trellis_status unwrap_mesh_xatlas_charted(
             status = TRELLIS_STATUS_ERROR;
             break;
         }
+        /* xatlas copies MeshDecl data before AddMesh returns. Keep only the
+         * local-to-global vertex map needed to assemble the final mesh. */
+        free(chart->positions);
+        free(chart->normals);
+        free(chart->indices);
+        chart->positions = NULL;
+        chart->normals = NULL;
+        chart->indices = NULL;
         ++chart_index;
         start = end;
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_add_mesh ms=%.3f chunks=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        chart_index);
 
     uint32_t atlas_padding = 0;
     if (status == TRELLIS_STATUS_OK) {
-        status = gltf_xatlas_pack_for_output(atlas, texture_size, &atlas_padding);
+        status = gltf_xatlas_pack_for_output(
+            atlas,
+            texture_size,
+            chart_count,
+            &atlas_padding);
         if (status == TRELLIS_STATUS_OK &&
             (atlas->meshCount != chart_count || atlas->meshes == NULL)) {
             status = TRELLIS_STATUS_ERROR;
         }
     }
 
+    stage_start_us = trellis_now_us();
     uint64_t total_vertices = 0;
     uint64_t total_indices = 0;
     if (status == TRELLIS_STATUS_OK) {
@@ -2030,6 +2322,11 @@ static trellis_status unwrap_mesh_xatlas_charted(
                 atlas->width,
                 atlas->height,
                 atlas_padding);
+            TRELLIS_INFO(
+                "perf_stage name=gltf_uv_output ms=%.3f vertices=%u faces=%u",
+                (double) (trellis_now_us() - stage_start_us) / 1000.0,
+                out->vertex_count,
+                out->index_count / 3u);
         }
     }
 
@@ -2208,15 +2505,12 @@ static trellis_status build_pbr_hash_entries(
     *entries_out = NULL;
     *hash_size_out = 0;
     size_t table_size = 0;
-    if (!next_pow2_export((size_t) voxels->n_coords * 4u, &table_size) || table_size > UINT32_MAX) {
+    if (!next_pow2_export((size_t) voxels->n_coords * 2u, &table_size) || table_size > UINT32_MAX) {
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
     int32_t * entries = (int32_t *) malloc(table_size * 4u * sizeof(int32_t));
     if (entries == NULL) return TRELLIS_STATUS_OUT_OF_MEMORY;
     for (size_t i = 0; i < table_size; ++i) {
-        entries[i * 4u + 0u] = 0;
-        entries[i * 4u + 1u] = 0;
-        entries[i * 4u + 2u] = 0;
         entries[i * 4u + 3u] = -1;
     }
     for (int64_t i = 0; i < voxels->n_coords; ++i) {
@@ -2278,12 +2572,18 @@ static trellis_status bake_textures_vulkan(
 
     int32_t * hash_entries = NULL;
     uint32_t hash_size = 0;
+    int64_t stage_start_us = trellis_now_us();
     trellis_status status = build_pbr_hash_entries(voxels, &hash_entries, &hash_size);
     if (status != TRELLIS_STATUS_OK) {
         free(base);
         free(mr);
         return status;
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_pbr_hash ms=%.3f voxels=%" PRId64 " slots=%u",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        voxels->n_coords,
+        hash_size);
 
     uint32_t * projection_words = NULL;
     size_t projection_word_count = 0;
@@ -2292,6 +2592,7 @@ static trellis_status bake_textures_vulkan(
     uint32_t projection_node_count = 0;
     const int projection_enabled = sample_mesh != NULL;
     if (projection_enabled) {
+        stage_start_us = trellis_now_us();
         status = build_projection_bvh_buffer(
             sample_mesh,
             &projection_words,
@@ -2310,18 +2611,26 @@ static trellis_status bake_textures_vulkan(
             projection_vertex_count,
             projection_face_count,
             projection_node_count);
+        TRELLIS_INFO(
+            "perf_stage name=gltf_bake_projection_bvh ms=%.3f faces=%u nodes=%u",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            projection_face_count,
+            projection_node_count);
     }
 
     trellis_gltf_vk vk;
     trellis_gltf_vk_buffer buffers[10];
+    trellis_gltf_vk_buffer readback[2];
     trellis_gltf_vk_buffer chart_map_buffer;
     trellis_gltf_vk_image base_image;
     trellis_gltf_vk_image mr_image;
     memset(&vk, 0, sizeof(vk));
     memset(buffers, 0, sizeof(buffers));
+    memset(readback, 0, sizeof(readback));
     memset(&chart_map_buffer, 0, sizeof(chart_map_buffer));
     memset(&base_image, 0, sizeof(base_image));
     memset(&mr_image, 0, sizeof(mr_image));
+    stage_start_us = trellis_now_us();
     if (!gltf_vk_init(&vk, device)) {
         free(projection_words);
         free(hash_entries);
@@ -2329,6 +2638,9 @@ static trellis_status bake_textures_vulkan(
         free(mr);
         return TRELLIS_STATUS_ERROR;
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_vk_init ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
 
     VkPhysicalDeviceProperties physical_properties;
     vkGetPhysicalDeviceProperties(vk.physical_device, &physical_properties);
@@ -2364,6 +2676,14 @@ static trellis_status bake_textures_vulkan(
     const size_t hash_bytes = (size_t) hash_size * 4u * sizeof(int32_t);
     const size_t attrs_bytes = (size_t) voxels->n_coords * (size_t) voxels->channels * sizeof(float);
     const size_t projection_bytes = projection_word_count * sizeof(uint32_t);
+    stage_start_us = trellis_now_us();
+    /* Reserve the required device-local attachments before host-visible buffers.
+     * If the shared device heap is tight, later buffers can fall back to host memory. */
+    if (!gltf_vk_image_create(&vk, raster_size, raster_size, &base_image) ||
+        !gltf_vk_image_create(&vk, raster_size, raster_size, &mr_image)) {
+        status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
     int ok =
         gltf_vk_buffer_create(&vk, positions_bytes, &buffers[0]) &&
         gltf_vk_buffer_create(&vk, uvs_bytes, &buffers[1]) &&
@@ -2375,14 +2695,11 @@ static trellis_status bake_textures_vulkan(
         gltf_vk_buffer_create(&vk, raster_image_bytes, &buffers[7]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[8]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[9]) &&
-        gltf_vk_buffer_create(&vk, image_bytes, &chart_map_buffer);
+        gltf_vk_buffer_create(&vk, image_bytes, &chart_map_buffer) &&
+        gltf_vk_readback_buffer_create(&vk, image_bytes, &readback[0]) &&
+        gltf_vk_readback_buffer_create(&vk, image_bytes, &readback[1]);
     if (!ok) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    if (!gltf_vk_image_create(&vk, raster_size, raster_size, &base_image) ||
-        !gltf_vk_image_create(&vk, raster_size, raster_size, &mr_image)) {
-        status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
 
@@ -2395,6 +2712,15 @@ static trellis_status bake_textures_vulkan(
         memcpy(buffers[5].mapped, projection_words, projection_bytes);
     }
     memcpy(chart_map_buffer.mapped, mesh->chart_map, image_bytes);
+    free(hash_entries);
+    hash_entries = NULL;
+    free(projection_words);
+    projection_words = NULL;
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_alloc_upload ms=%.3f hash_mib=%.1f projection_mib=%.1f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        (double) hash_bytes / (1024.0 * 1024.0),
+        (double) projection_bytes / (1024.0 * 1024.0));
 
     trellis_gltf_vk_push push;
     memset(&push, 0, sizeof(push));
@@ -2422,18 +2748,39 @@ static trellis_status bake_textures_vulkan(
 
     trellis_gltf_vk_buffer * desc[10];
     for (int i = 0; i < 10; ++i) desc[i] = &buffers[i];
+    stage_start_us = trellis_now_us();
     if (!gltf_vk_render_bake(&vk, desc, &push, raster_size, &base_image, &mr_image)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_raster ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
 
     trellis_gltf_vk_buffer * cur_base = &buffers[8];
     trellis_gltf_vk_buffer * cur_mr = &buffers[9];
+    stage_start_us = trellis_now_us();
     if (!gltf_vk_texture_postprocess(
             &vk, desc, &chart_map_buffer, &push, supersample_scale, &cur_base, &cur_mr)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_postprocess ms=%.3f",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0);
+
+    stage_start_us = trellis_now_us();
+    if (!gltf_vk_copy_texture_readback(
+            &vk, cur_base, cur_mr, &readback[0], &readback[1], image_bytes)) {
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
+    }
+    memcpy(base, readback[0].mapped, image_bytes);
+    memcpy(mr, readback[1].mapped, image_bytes);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_bake_readback ms=%.3f bytes=%zu",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        image_bytes * 2u);
 
     const char * coverage_stats = getenv("TRELLIS_GLTF_BAKE_STATS");
     if (coverage_stats != NULL && coverage_stats[0] != '\0' && strcmp(coverage_stats, "0") != 0) {
@@ -2441,7 +2788,7 @@ static trellis_status bake_textures_vulkan(
         size_t owned_texels = 0;
         size_t owned_empty_texels = 0;
         size_t valid_outside_chart = 0;
-        const uint32_t * baked_mr = (const uint32_t *) cur_mr->mapped;
+        const uint32_t * baked_mr = (const uint32_t *) mr;
         for (size_t i = 0; i < pixel_count; ++i) {
             const int valid = (baked_mr[i] >> 24u) != 0u;
             const int owned = mesh->chart_map[i] != 0u;
@@ -2458,8 +2805,6 @@ static trellis_status bake_textures_vulkan(
             valid_outside_chart);
     }
 
-    memcpy(base, cur_base->mapped, image_bytes);
-    memcpy(mr, cur_mr->mapped, image_bytes);
     *base_out = base;
     *mr_out = mr;
     base = NULL;
@@ -2469,6 +2814,8 @@ static trellis_status bake_textures_vulkan(
 cleanup:
     gltf_vk_image_destroy(&vk, &mr_image);
     gltf_vk_image_destroy(&vk, &base_image);
+    gltf_vk_buffer_destroy(&vk, &readback[1]);
+    gltf_vk_buffer_destroy(&vk, &readback[0]);
     gltf_vk_buffer_destroy(&vk, &chart_map_buffer);
     for (int i = 0; i < 10; ++i) gltf_vk_buffer_destroy(&vk, &buffers[i]);
     gltf_vk_destroy(&vk);
@@ -3027,6 +3374,7 @@ trellis_status trellis_pipeline_write_gltf_ex(
     if (texture_size < 64 || texture_size > 8192) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    const int64_t export_start_us = trellis_now_us();
     char dir[4096];
     char stem[512];
     if (!split_output_paths(path, dir, sizeof(dir), stem, sizeof(stem)) || !mkdir_p_export(dir)) {
@@ -3057,10 +3405,21 @@ trellis_status trellis_pipeline_write_gltf_ex(
     size_t base_png_size = 0;
     size_t mr_png_size = 0;
     memset(&gltf_mesh, 0, sizeof(gltf_mesh));
+    int64_t stage_start_us = trellis_now_us();
     trellis_status status = unwrap_mesh_xatlas(mesh, texture_size, &gltf_mesh);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_uv_unwrap ms=%.3f faces=%" PRId64 " status=%s",
+        (double) (trellis_now_us() - stage_start_us) / 1000.0,
+        mesh->n_faces,
+        trellis_status_string(status));
     if (status == TRELLIS_STATUS_OK) {
 #if TRELLIS_HAS_GLTF_VULKAN_BAKE
+        stage_start_us = trellis_now_us();
         status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, device, &base, &mr);
+        TRELLIS_INFO(
+            "perf_stage name=gltf_texture_bake ms=%.3f status=%s",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            trellis_status_string(status));
 #else
         (void) sample_mesh;
         TRELLIS_ERROR("glTF export: texture bake requires a Vulkan build");
@@ -3068,6 +3427,7 @@ trellis_status trellis_pipeline_write_gltf_ex(
 #endif
     }
     if (status == TRELLIS_STATUS_OK) {
+        stage_start_us = trellis_now_us();
         if (write_glb) {
             status = encode_png_rgba_memory(base, texture_size, &base_png, &base_png_size);
             if (status == TRELLIS_STATUS_OK) {
@@ -3079,11 +3439,17 @@ trellis_status trellis_pipeline_write_gltf_ex(
                 status = TRELLIS_STATUS_IO_ERROR;
             }
         }
+        TRELLIS_INFO(
+            "perf_stage name=gltf_png_encode ms=%.3f bytes=%zu status=%s",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            write_glb ? base_png_size + mr_png_size : 0u,
+            trellis_status_string(status));
     }
     size_t offsets[6] = {0, 0, 0, 0, 0, 0};
     size_t sizes[6] = {0, 0, 0, 0, 0, 0};
     size_t buffer_size = 0;
     if (status == TRELLIS_STATUS_OK) {
+        stage_start_us = trellis_now_us();
         status = transform_mesh_to_export_axes(&gltf_mesh, coordinate_transform);
         if (status == TRELLIS_STATUS_OK && write_glb) {
             status = build_glb_binary_buffer(
@@ -3099,8 +3465,14 @@ trellis_status trellis_pipeline_write_gltf_ex(
         } else if (status == TRELLIS_STATUS_OK) {
             status = write_binary_buffer(bin_path, &gltf_mesh, offsets, sizes, &buffer_size);
         }
+        TRELLIS_INFO(
+            "perf_stage name=gltf_build_binary ms=%.3f bytes=%zu status=%s",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            buffer_size,
+            trellis_status_string(status));
     }
     if (status == TRELLIS_STATUS_OK) {
+        stage_start_us = trellis_now_us();
         status = write_gltf_json(
             path,
             write_glb ? NULL : bin_uri,
@@ -3113,6 +3485,10 @@ trellis_status trellis_pipeline_write_gltf_ex(
             1,
             write_glb,
             glb_bin);
+        TRELLIS_INFO(
+            "perf_stage name=gltf_write_output ms=%.3f status=%s",
+            (double) (trellis_now_us() - stage_start_us) / 1000.0,
+            trellis_status_string(status));
     }
     if (status == TRELLIS_STATUS_OK) {
         if (write_glb) {
@@ -3132,6 +3508,10 @@ trellis_status trellis_pipeline_write_gltf_ex(
     free(base);
     free(mr);
     gltf_mesh_free(&gltf_mesh);
+    TRELLIS_INFO(
+        "perf_stage name=gltf_export_total ms=%.3f status=%s",
+        (double) (trellis_now_us() - export_start_us) / 1000.0,
+        trellis_status_string(status));
     return status;
 }
 

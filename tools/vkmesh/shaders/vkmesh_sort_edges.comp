@@ -1,22 +1,30 @@
 #version 450
 
+// Sort one 256-record run per workgroup.  Padding lives only in shared memory;
+// the global record array remains exactly p.n elements long.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Push {
     uint n;
-    uint k;
-    uint j;
+    uint aux0;
+    uint aux1;
     uint aux2;
     float eps;
     float rel_eps;
 } p;
 
-layout(binding = 0) buffer Records {
-    uint records[];
+struct EdgeRecord {
+    uint min_v;
+    uint max_v;
+    uint payload;
 };
 
-layout(binding = 1) buffer Unused1 {
-    uint unused1[];
+layout(std430, binding = 0) buffer Records {
+    EdgeRecord records[];
+};
+
+layout(std430, binding = 1) buffer TemporaryRecords {
+    EdgeRecord temporary_records[];
 };
 
 layout(binding = 2) buffer Unused2 {
@@ -27,34 +35,80 @@ layout(binding = 3) buffer Unused3 {
     uint unused3[];
 };
 
-bool edge_less(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
-    if (records[abase + 0u] != records[bbase + 0u]) return records[abase + 0u] < records[bbase + 0u];
-    if (records[abase + 1u] != records[bbase + 1u]) return records[abase + 1u] < records[bbase + 1u];
-    if (records[abase + 4u] != records[bbase + 4u]) return records[abase + 4u] < records[bbase + 4u];
-    if (records[abase + 2u] != records[bbase + 2u]) return records[abase + 2u] < records[bbase + 2u];
-    return records[abase + 3u] < records[bbase + 3u];
+const uint TILE_SIZE = 256u;
+shared EdgeRecord ping_records[TILE_SIZE];
+shared EdgeRecord pong_records[TILE_SIZE];
+
+EdgeRecord sentinel_record() {
+    return EdgeRecord(0xffffffffu, 0xffffffffu, 0xffffffffu);
 }
 
-void swap_edge(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
-    for (uint i = 0u; i < 5u; ++i) {
-        uint tmp = records[abase + i];
-        records[abase + i] = records[bbase + i];
-        records[bbase + i] = tmp;
+bool record_less(EdgeRecord lhs, EdgeRecord rhs) {
+    if (lhs.min_v != rhs.min_v) return lhs.min_v < rhs.min_v;
+    if (lhs.max_v != rhs.max_v) return lhs.max_v < rhs.max_v;
+    return lhs.payload < rhs.payload;
+}
+
+EdgeRecord shared_load(bool ping_is_source, uint index) {
+    return ping_is_source ? ping_records[index] : pong_records[index];
+}
+
+void shared_store(bool ping_is_destination, uint index, EdgeRecord value) {
+    if (ping_is_destination) ping_records[index] = value;
+    else pong_records[index] = value;
+}
+
+void output_record(uint index, EdgeRecord value) {
+    if (p.aux1 != 0u) temporary_records[index] = value;
+    else records[index] = value;
+}
+
+// Stable co-rank: records from A precede equal records from B.
+uint shared_co_rank(uint diagonal, uint a_base, uint a_count, uint b_base, uint b_count, bool ping_is_source) {
+    int low = max(0, int(diagonal) - int(b_count));
+    int high = min(int(diagonal), int(a_count));
+    while (low < high) {
+        int i = (low + high) >> 1;
+        int j = int(diagonal) - i;
+        bool need_more_a =
+            i < int(a_count) && j > 0 &&
+            !record_less(shared_load(ping_is_source, b_base + uint(j - 1)),
+                         shared_load(ping_is_source, a_base + uint(i)));
+        if (need_more_a) low = i + 1;
+        else high = i;
     }
+    return uint(low);
 }
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= p.n) return;
-    uint ixj = i ^ p.j;
-    if (ixj <= i || ixj >= p.n) return;
-    bool ascending = (i & p.k) == 0u;
-    bool other_less = edge_less(ixj, i);
-    if ((ascending && other_less) || (!ascending && !other_less)) {
-        swap_edge(i, ixj);
+    uint lane = gl_LocalInvocationID.x;
+    uint global_index = gl_WorkGroupID.x * TILE_SIZE + lane;
+    ping_records[lane] = global_index < p.n ? records[global_index] : sentinel_record();
+    memoryBarrierShared();
+    barrier();
+
+    bool ping_is_source = true;
+    for (uint width = 1u; width < TILE_SIZE; width <<= 1u) {
+        uint pair_base = (lane / (width * 2u)) * (width * 2u);
+        uint diagonal = lane - pair_base;
+        uint a_index = shared_co_rank(
+            diagonal, pair_base, width, pair_base + width, width, ping_is_source);
+        uint b_index = diagonal - a_index;
+
+        EdgeRecord value;
+        if (a_index < width &&
+            (b_index >= width ||
+             !record_less(shared_load(ping_is_source, pair_base + width + b_index),
+                          shared_load(ping_is_source, pair_base + a_index)))) {
+            value = shared_load(ping_is_source, pair_base + a_index);
+        } else {
+            value = shared_load(ping_is_source, pair_base + width + b_index);
+        }
+        shared_store(!ping_is_source, lane, value);
+        memoryBarrierShared();
+        barrier();
+        ping_is_source = !ping_is_source;
     }
+
+    if (global_index < p.n) output_record(global_index, shared_load(ping_is_source, lane));
 }

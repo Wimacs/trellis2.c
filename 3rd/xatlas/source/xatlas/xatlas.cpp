@@ -9413,6 +9413,7 @@ void ComputeCharts(Atlas *atlas, ChartOptions options)
 		XA_PRINT("      %u planar, %u ortho, %u LSCM, %u piecewise\n", planarChartsCount, orthoChartsCount, lscmChartsCount, piecewiseChartsCount);
 		if (originalUvChartsCount > 0)
 			XA_PRINT("      %u with original UVs\n", originalUvChartsCount);
+		atlas->chartCount = chartCount;
 		uint32_t chartIndex = 0, invalidParamCount = 0;
 		for (uint32_t i = 0; i < meshCount; i++) {
 			for (uint32_t j = 0; j < ctx->paramAtlas.chartGroupCount(i); j++) {
@@ -9536,6 +9537,7 @@ void ComputeCharts(Atlas *atlas, ChartOptions options)
 		const uint32_t meshCount = ctx->uvMeshes.size();
 		for (uint32_t i = 0; i < meshCount; i++)
 			chartCount += ctx->uvMeshes[i]->charts.size();
+		atlas->chartCount = chartCount;
 		XA_PRINT("   %u charts\n", chartCount);
 		XA_PROFILE_PRINT_AND_RESET("   Total (real): ", computeChartsReal)
 		XA_PROFILE_PRINT_AND_RESET("   Total (thread): ", computeChartsThread)

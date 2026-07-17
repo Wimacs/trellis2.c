@@ -28,8 +28,8 @@ layout(binding = 3) buffer AuxData {
 };
 
 bool same_edge(uint a, uint b) {
-    uint abase = a * 5u;
-    uint bbase = b * 5u;
+    uint abase = a * 3u;
+    uint bbase = b * 3u;
     return records[abase + 0u] == records[bbase + 0u] &&
            records[abase + 1u] == records[bbase + 1u];
 }

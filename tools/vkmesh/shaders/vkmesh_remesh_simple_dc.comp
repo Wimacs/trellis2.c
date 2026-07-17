@@ -1,0 +1,143 @@
+#version 450
+
+// Simple Dual Contouring: average all twelve edge intersections and retain
+// the three positive-corner edge directions used by topology generation.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Workspace {
+    uint workspace[];
+};
+
+layout(binding = 1) readonly buffer HashData {
+    uint hash_data[];
+};
+
+layout(binding = 2) buffer OutputData {
+    uint output_data[];
+};
+
+layout(binding = 3) buffer Status {
+    uint status[];
+};
+
+uint hash_u32(uint key) {
+    key ^= key >> 16u;
+    key *= 0x85ebca6bu;
+    key ^= key >> 13u;
+    key *= 0xc2b2ae35u;
+    key ^= key >> 16u;
+    return key;
+}
+
+uint lookup_index(uint x, uint y, uint z) {
+    uint dimension = p.aux0;
+    uint stored_key = (x * dimension * dimension + y * dimension + z) + 1u;
+    uint capacity = p.aux1;
+    uint slot = hash_u32(stored_key) & (capacity - 1u);
+    for (uint probe = 0u; probe < capacity; ++probe) {
+        uint key = hash_data[slot];
+        if (key == 0u) break;
+        if (key == stored_key) return hash_data[capacity + slot];
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    atomicOr(status[0], 2u);
+    return 0u;
+}
+
+float grid_value(uint x, uint y, uint z) {
+    return uintBitsToFloat(workspace[p.aux2 + lookup_index(x, y, z)]);
+}
+
+int crossing_direction(float a, float b) {
+    if (a < 0.0f && b >= 0.0f) return 1;
+    if (a >= 0.0f && b < 0.0f) return -1;
+    return 0;
+}
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= p.n) return;
+    uint vx = workspace[3u * cell + 0u];
+    uint vy = workspace[3u * cell + 1u];
+    uint vz = workspace[3u * cell + 2u];
+    precise float sum_x = 0.0f;
+    precise float sum_y = 0.0f;
+    precise float sum_z = 0.0f;
+    uint intersection_count = 0u;
+    ivec3 directions = ivec3(0);
+
+    for (uint u = 0u; u <= 1u; ++u) {
+        for (uint v = 0u; v <= 1u; ++v) {
+            precise float a = grid_value(vx, vy + u, vz + v);
+            precise float b = grid_value(vx + 1u, vy + u, vz + v);
+            if ((a < 0.0f && b >= 0.0f) || (a >= 0.0f && b < 0.0f)) {
+                precise float t = -a / (b - a);
+                sum_x = sum_x + (float(vx) + t);
+                sum_y = sum_y + float(vy + u);
+                sum_z = sum_z + float(vz + v);
+                ++intersection_count;
+            }
+            if (u == 1u && v == 1u) directions.x = crossing_direction(a, b);
+        }
+    }
+    for (uint u = 0u; u <= 1u; ++u) {
+        for (uint v = 0u; v <= 1u; ++v) {
+            precise float a = grid_value(vx + u, vy, vz + v);
+            precise float b = grid_value(vx + u, vy + 1u, vz + v);
+            if ((a < 0.0f && b >= 0.0f) || (a >= 0.0f && b < 0.0f)) {
+                precise float t = -a / (b - a);
+                sum_x = sum_x + float(vx + u);
+                sum_y = sum_y + (float(vy) + t);
+                sum_z = sum_z + float(vz + v);
+                ++intersection_count;
+            }
+            if (u == 1u && v == 1u) directions.y = crossing_direction(a, b);
+        }
+    }
+    for (uint u = 0u; u <= 1u; ++u) {
+        for (uint v = 0u; v <= 1u; ++v) {
+            precise float a = grid_value(vx + u, vy + v, vz);
+            precise float b = grid_value(vx + u, vy + v, vz + 1u);
+            if ((a < 0.0f && b >= 0.0f) || (a >= 0.0f && b < 0.0f)) {
+                precise float t = -a / (b - a);
+                sum_x = sum_x + float(vx + u);
+                sum_y = sum_y + float(vy + v);
+                sum_z = sum_z + (float(vz) + t);
+                ++intersection_count;
+            }
+            if (u == 1u && v == 1u) directions.z = crossing_direction(a, b);
+        }
+    }
+
+    precise float dual_x;
+    precise float dual_y;
+    precise float dual_z;
+    if (intersection_count > 0u) {
+        precise float divisor = float(intersection_count);
+        dual_x = sum_x / divisor;
+        dual_y = sum_y / divisor;
+        dual_z = sum_z / divisor;
+    } else {
+        dual_x = float(vx) + 0.5f;
+        dual_y = float(vy) + 0.5f;
+        dual_z = float(vz) + 0.5f;
+    }
+    // The grid-corner hash occupies the beginning of this buffer. Keeping the
+    // DC records behind it lets the topology pass reuse the same allocation.
+    uint destination = 2u * p.aux1 + 6u * cell;
+    output_data[destination + 0u] = floatBitsToUint(dual_x);
+    output_data[destination + 1u] = floatBitsToUint(dual_y);
+    output_data[destination + 2u] = floatBitsToUint(dual_z);
+    output_data[destination + 3u] = uint(directions.x);
+    output_data[destination + 4u] = uint(directions.y);
+    output_data[destination + 5u] = uint(directions.z);
+}
