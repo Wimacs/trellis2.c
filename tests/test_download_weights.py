@@ -46,6 +46,8 @@ class DownloadWeightsTests(unittest.TestCase):
         self.assertIn("microsoft/TRELLIS-image-large", output)
         self.assertIn("camenduru/dinov3-vitl16-pretrain-lvd1689m", output)
         self.assertIn("Acly/BiRefNet-GGUF", output)
+        self.assertIn("DINOv3 License (not MIT)", output)
+        self.assertIn("not covered by the trellis2.c MIT License", output)
         self.assertIn("Dry run complete.", output)
 
 

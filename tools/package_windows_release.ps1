@@ -37,6 +37,13 @@ function Copy-Required($Source, $DestinationDir) {
     Copy-Item -LiteralPath $Source -Destination $DestinationDir -Force
 }
 
+function Copy-Required-As($Source, $Destination) {
+    if (!(Test-Path -LiteralPath $Source)) {
+        throw "Missing required file: $Source"
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function Find-Required($Name, [string[]] $Dirs) {
     foreach ($Dir in $Dirs) {
         if ([string]::IsNullOrWhiteSpace($Dir)) {
@@ -186,6 +193,36 @@ function Copy-ExampleImage($DestinationDir) {
     }
 }
 
+function Copy-LicenseFiles($DestinationDir) {
+    Copy-Required (Join-Path $RepoRoot "LICENSE") $DestinationDir
+    Copy-Required (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") $DestinationDir
+
+    $LicenseDir = Join-Path $DestinationDir "licenses"
+    Ensure-Dir $LicenseDir
+    $Files = [ordered]@{
+        "cgltf-LICENSE.txt" = "3rd\cgltf\LICENSE"
+        "eigen-LICENSE.txt" = "3rd\eigen\LICENSE"
+        "eigen-COPYING.README.txt" = "3rd\eigen\COPYING.README"
+        "eigen-COPYING.MPL2.txt" = "3rd\eigen\COPYING.MPL2"
+        "eigen-COPYING.APACHE.txt" = "3rd\eigen\COPYING.APACHE"
+        "eigen-COPYING.BSD.txt" = "3rd\eigen\COPYING.BSD"
+        "eigen-COPYING.MINPACK.txt" = "3rd\eigen\COPYING.MINPACK"
+        "ggml-LICENSE.txt" = "3rd\ggml\LICENSE"
+        "meshoptimizer-LICENSE.txt" = "3rd\meshoptimizer\LICENSE.md"
+        "raylib-LICENSE.txt" = "3rd\raylib\LICENSE"
+        "raylib-glfw-LICENSE.txt" = "3rd\raylib\src\external\glfw\LICENSE.md"
+        "stb-LICENSE.txt" = "3rd\stb\LICENSE"
+        "xatlas-LICENSE.txt" = "3rd\xatlas\LICENSE"
+        "O-Voxel-LICENSE.txt" = "licenses\O-Voxel-LICENSE.txt"
+        "xatlas-embedded-LICENSES.txt" = "licenses\xatlas-embedded-LICENSES.txt"
+    }
+    foreach ($Name in $Files.Keys) {
+        Copy-Required-As `
+            (Join-Path $RepoRoot $Files[$Name]) `
+            (Join-Path $LicenseDir $Name)
+    }
+}
+
 function Write-Readme($DestinationDir, $Backend) {
     $TitleBackend = if ($Backend -eq "cuda") { "CUDA" } else { "Vulkan" }
     $Extra = if ($Backend -eq "cuda") {
@@ -204,7 +241,9 @@ Run:
 Weights:
   No weights are included in this folder.
   The downloader writes to .\TRELLIS.2\, which the GUI auto-detects.
-  DINOv3 is downloaded anonymously from the public camenduru mirror.
+  DINOv3 is downloaded from a public mirror but remains subject to Meta's
+  DINOv3 License; it is not covered by the trellis2.c MIT License.
+  Review and preserve the model-card and license files downloaded with each model.
   You can also run:
     powershell -ExecutionPolicy Bypass -File .\download_weights.ps1
     powershell -ExecutionPolicy Bypass -File .\download_weights.ps1 -Source modelscope
@@ -217,6 +256,7 @@ Included:
   - runtime DLLs for this backend
   - download_weights.py plus Windows wrapper scripts
   - images.jpg for the first preview image
+  - LICENSE, THIRD_PARTY_NOTICES.md, and licenses\
 
 Notes:
   - GUI title: trellis2 local
@@ -245,6 +285,7 @@ function Copy-Common($DestinationDir, $BuildDir) {
     Write-Launcher $DestinationDir
     Write-DownloadScripts $DestinationDir
     Copy-ExampleImage $DestinationDir
+    Copy-LicenseFiles $DestinationDir
 }
 
 Ensure-Dir $DistDir

@@ -146,3 +146,11 @@ python tools/vkmesh/meshbin_validate.py processed.meshbin \
 ```
 
 Use `--strict` when the application requires non-manifold edges to fail as well.
+
+## License
+
+The vkmesh code and shaders authored for this repository are covered by the
+project's [MIT License](../../LICENSE). xatlas and the other dependencies keep
+their own licenses. Model weights used by the surrounding generation pipeline
+are separate from vkmesh and are not covered by the project MIT License; see
+[the third-party and model notices](../../THIRD_PARTY_NOTICES.md).

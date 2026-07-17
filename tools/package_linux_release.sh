@@ -143,6 +143,15 @@ copy_file() {
     fi
 }
 
+copy_named_file() {
+    local src="$1"
+    local dst="$2"
+    require_file "$src"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        cp -f "$src" "$dst"
+    fi
+}
+
 copy_exec() {
     local src="$1"
     local dst_dir="$2"
@@ -313,6 +322,30 @@ SH
     chmod 755 "$pkg/download_weights.sh"
 }
 
+copy_license_files() {
+    local pkg="$1"
+    local licenses="$pkg/licenses"
+    ensure_dir "$licenses"
+
+    copy_file "$REPO_ROOT/LICENSE" "$pkg"
+    copy_file "$REPO_ROOT/THIRD_PARTY_NOTICES.md" "$pkg"
+    copy_named_file "$REPO_ROOT/3rd/cgltf/LICENSE" "$licenses/cgltf-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/LICENSE" "$licenses/eigen-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/COPYING.README" "$licenses/eigen-COPYING.README.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/COPYING.MPL2" "$licenses/eigen-COPYING.MPL2.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/COPYING.APACHE" "$licenses/eigen-COPYING.APACHE.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/COPYING.BSD" "$licenses/eigen-COPYING.BSD.txt"
+    copy_named_file "$REPO_ROOT/3rd/eigen/COPYING.MINPACK" "$licenses/eigen-COPYING.MINPACK.txt"
+    copy_named_file "$REPO_ROOT/3rd/ggml/LICENSE" "$licenses/ggml-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/meshoptimizer/LICENSE.md" "$licenses/meshoptimizer-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/raylib/LICENSE" "$licenses/raylib-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/raylib/src/external/glfw/LICENSE.md" "$licenses/raylib-glfw-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/stb/LICENSE" "$licenses/stb-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/3rd/xatlas/LICENSE" "$licenses/xatlas-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/licenses/O-Voxel-LICENSE.txt" "$licenses/O-Voxel-LICENSE.txt"
+    copy_named_file "$REPO_ROOT/licenses/xatlas-embedded-LICENSES.txt" "$licenses/xatlas-embedded-LICENSES.txt"
+}
+
 write_run_scripts() {
     local pkg="$1"
     local backend="$2"
@@ -371,6 +404,10 @@ Weights:
   ./download_weights.sh
   ./download_weights.sh --source modelscope
 
+Model weights keep their upstream licenses and are not covered by the
+trellis2.c MIT License. DINOv3 uses Meta's DINOv3 License, not MIT. Review and
+preserve all downloaded model-card and license files.
+
 Run:
 EOF
     if [[ "$flavor" == "gui" ]]; then
@@ -395,6 +432,7 @@ Included:
   - lib/ bundled project and backend runtime libraries
   - download_weights.sh plus tools/download_weights.py
   - images.jpg sample image when available
+  - LICENSE, THIRD_PARTY_NOTICES.md, and licenses/
 
 Notes:
   - GPU drivers are not bundled.
@@ -432,6 +470,7 @@ copy_common_tools() {
     copy_exec "$build_dir/vkmesh" "$pkg/bin"
     write_download_scripts "$pkg"
     copy_example_image "$pkg"
+    copy_license_files "$pkg"
 }
 
 package_one() {

@@ -204,3 +204,20 @@ not.
   --input input.glb \
   --output rigged.glb
 ```
+
+## License
+
+The original source code and documentation authored for this project are
+licensed under the [MIT License](LICENSE).
+
+Third-party code under `3rd/`, files carrying their own notices, model
+weights, datasets, input files, sample assets, and generated outputs are not
+relicensed by the project MIT License. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and preserve the license files
+provided by each dependency and model source.
+
+In particular, DINOv3 weights use Meta's **DINOv3 License, not MIT**. A mirror
+or converted checkpoint does not remove its redistribution, use, and
+trade-control conditions. The release packages contain no model weights; the
+weight downloader keeps upstream model cards and license files where
+available.

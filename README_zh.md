@@ -182,3 +182,16 @@ inverse bind matrix 和 skin weight。展平后的世界空间几何和标准 PB
   --input input.glb \
   --output rigged.glb
 ```
+
+## 许可证
+
+本项目原创的源代码与文档采用 [MIT License](LICENSE)。
+
+`3rd/` 下的第三方代码、带有独立许可声明的文件、模型权重、数据集、输入文件、
+示例资产和生成结果不会因本项目采用 MIT 而被重新授权。详细清单见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，使用或分发时请保留各依赖和
+模型来源提供的许可证文件。
+
+特别需要注意：DINOv3 权重采用 Meta 的 **DINOv3 License，并非 MIT**。
+镜像下载或格式转换不会消除其中的再分发、用途和贸易管制等条件。发布包不包含
+模型权重；权重下载器会在上游提供相关文件时保留 model card 和许可证文件。

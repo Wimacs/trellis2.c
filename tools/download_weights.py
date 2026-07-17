@@ -18,9 +18,14 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT.parent / "TRELLIS.2"
 DEFAULT_TRELLIS_REPO = "microsoft/TRELLIS.2-4B"
 DEFAULT_SPARSE_DECODER_REPO = "microsoft/TRELLIS-image-large"
 # The official Meta repository requires accepting an access agreement. This
-# mirror contains the same model files and supports anonymous downloads.
+# public mirror is used as the default download transport, but it does not
+# relicense the weights: Meta's DINOv3 License still applies.
 DEFAULT_DINO_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
 DEFAULT_BIREFNET_REPO = "Acly/BiRefNet-GGUF"
+DINO_LICENSE_URL = (
+    "https://huggingface.co/facebook/"
+    "dinov3-vitl16-pretrain-lvd1689m/blob/main/LICENSE.md"
+)
 
 TRELLIS_MINIMAL_PATTERNS = [
     "README*",
@@ -318,6 +323,20 @@ def main() -> int:
     include_patterns = split_patterns(args.include)
     ignore_patterns = split_patterns(args.ignore)
     specs = selected_specs(args)
+
+    print(
+        "License notice: downloaded model weights keep their upstream terms "
+        "and are not covered by the trellis2.c MIT License."
+    )
+    downloads_dino = any(
+        spec.local_name == "dinov3-vitl16-pretrain-lvd1689m" for spec in specs
+    )
+    if downloads_dino:
+        print(f"  DINOv3 uses Meta's DINOv3 License (not MIT): {DINO_LICENSE_URL}")
+    print(
+        "  Review and preserve all model-card and license files before use "
+        "or redistribution."
+    )
 
     for spec in specs:
         local_dir = output_dir / spec.local_name
