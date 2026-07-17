@@ -99,23 +99,26 @@ The equivalent image-to-GLB controls are `--mesh-postprocess`, `--mesh-remesh`,
 
 ## Performance
 
-The following are local Release measurements on an RTX 4090 D. Wall time covers
-the complete standalone operation, including host orchestration, submissions,
-and readbacks, but excludes model inference. `Workspace` is vkmesh's own peak;
-the NVML delta also includes Vulkan driver allocations and measurement noise.
+The following are local Release measurements on an RTX 4090 D under Windows
+WDDM. Wall time covers the complete standalone operation, including host
+orchestration, submissions, output compaction, readback, and `.meshbin` writing,
+but excludes model inference. `Workspace` is vkmesh's own tracked peak and does
+not include the Vulkan driver or context.
 
-| Workload | Result | Wall time | Workspace | NVML delta |
-|---|---:|---:|---:|---:|
-| Simplify 5.423M faces to about 1M | 0.984M faces | 1.065-1.110 s | 613.7 MiB | 674 MiB |
-| Simplify 1.992M faces to about 1M | 0.957M faces | 0.657-0.807 s | 224.3 MiB | 288 MiB |
-| Remesh512 on the 1.992M-face fixture | 6.439M faces | 33.50 s | 103.1 MiB | 190.9 MiB |
+| Workload | Result | Wall time | Workspace |
+|---|---:|---:|---:|
+| Simplify 5.423M faces to about 1M | 0.984-0.985M faces | 0.72-0.94 s | 613.7 MiB |
+| Simplify 1.992M faces to about 1M | 0.957-0.958M faces | 0.38-0.47 s | 224.3 MiB |
+| Remesh512 on the 1.992M-face fixture | 6.439M faces | 1.22-1.42 s | 601.6 MiB |
+| Fill holes on a 3.979M-face TRELLIS mesh | 3,556 loops / +23,702 faces | 0.54 s | 339.8 MiB |
 
-Simplification is now close to a one-second operation even on the 5.4M-face
-fixture. Remeshing remains the dominant geometry cost; its time and output size
+Simplification is sub-second on both measured fixtures. Remeshing is still the
+largest of these isolated geometry stages, and its time, output size, and memory
 depend primarily on surface extent, narrow-band occupancy, and
 `--remesh-resolution`, rather than only on the input face count. Results vary by
-driver, GPU, topology, and workspace budget, and parallel atomic selection can
-produce small run-to-run differences in the final face count.
+driver, GPU, topology, storage speed, and workspace budget. Parallel atomic
+selection can also produce small run-to-run differences in the final face
+count.
 
 ## Current limitations
 
