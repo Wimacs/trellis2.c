@@ -1,0 +1,165 @@
+name: release
+
+# Builds the trellis2-server front end and attaches one archive per platform and
+# inference backend to a release. Pushing a server-v* tag publishes; a manual run
+# only leaves build artifacts, so the matrix can be exercised without cutting a
+# version. The tags are namespaced because a fork inherits the upstream tags
+# (including v0.1.0) and a tag name can only exist once.
+#
+# The build is deliberately narrow: TRELLIS2_C_BUILD_TOOLS, _TESTS and
+# _RAYLIB_VIEWER are off, so the artifact is the one executable a hosting process
+# manager needs, not the whole application. The Vulkan SDK is required for every
+# variant because the glTF texture baker and the mesh postprocessor are Vulkan,
+# independently of the inference backend.
+
+on:
+  push:
+    tags: ["server-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            backend: vulkan
+            asset: win-x64-vulkan
+          - os: windows-2022
+            backend: cuda
+            asset: win-x64-cuda
+          - os: ubuntu-22.04
+            backend: vulkan
+            asset: linux-x64-vulkan
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: false
+          stripdown: true
+          cache: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Vulkan loader and shader compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # libvulkan-dev is the loader/headers fallback for find_package(Vulkan).
+          # glslc is NOT an apt package on 22.04 (the name only exists on newer
+          # releases), and it does not need to be: the SDK installed above ships
+          # it and sets VULKAN_SDK, which is exactly where CMake's FindVulkan
+          # looks. Its bin dir goes on PATH anyway so find_program can see it too.
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
+          echo "${VULKAN_SDK}/bin" >> "$GITHUB_PATH"
+          "${VULKAN_SDK}/bin/glslc" --version | head -1
+
+      - name: CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.6.3"
+          method: network
+          use-github-cache: true
+
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          cmake --version | head -1
+          ninja --version
+          if [[ "${{ matrix.backend }}" == "cuda" ]]; then nvcc --version | tail -2; fi
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # The tag is namespaced (server-v0.1.0) so it cannot collide with the
+            # upstream tags a fork inherits. The asset carries only the version.
+            echo "value=${GITHUB_REF_NAME#server-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=dev-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure
+        shell: bash
+        run: |
+          arch=()
+          if [[ "${{ matrix.backend }}" == "cuda" ]]; then
+            # Upstream defaults to 89 (Ada) alone. Cover Ampere through Hopper
+            # instead, so the published CUDA build runs on more than one
+            # generation of card.
+            arch=("-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90")
+          fi
+          # TRELLIS2_C_BUILD_TOOLS stays ON: the vkmesh target lives inside the
+          # tools block, and the server spawns that binary at runtime, so the
+          # release has to configure the tools even though it builds only two
+          # targets from them.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DTRELLIS2_C_BACKEND=${{ matrix.backend }} \
+            -DTRELLIS2_C_BUILD_SERVER=ON \
+            -DTRELLIS2_C_BUILD_TOOLS=ON \
+            -DTRELLIS2_C_BUILD_TESTS=OFF \
+            -DTRELLIS2_C_BUILD_RAYLIB_VIEWER=OFF \
+            "${arch[@]}"
+
+      - name: Build
+        # vkmesh is the mesh postprocess helper the server spawns as a sibling
+        # executable (remesh + UV bake). It is a separate target, and a build of
+        # trellis2-server alone leaves it out of the archive -- which made every
+        # generation fail at the postprocess stage with "vkmesh failed".
+        run: cmake --build build --target trellis2-server vkmesh -j
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="trellis2-server-${{ steps.version.outputs.value }}-${{ matrix.asset }}"
+          mkdir -p dist/stage
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build/trellis2-server.exe build/vkmesh.exe dist/stage/
+            cp LICENSE dist/stage/
+            (cd dist/stage && powershell -NoProfile -Command "Compress-Archive -Path * -DestinationPath ../${name}.zip")
+          else
+            cp build/trellis2-server build/vkmesh dist/stage/
+            cp LICENSE dist/stage/
+            tar -czf "dist/${name}.tar.gz" -C dist/stage .
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -39,6 +39,7 @@ endif()
 
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
+option(TRELLIS2_C_BUILD_SERVER "Build the headless trellis2-server HTTP front end" ON)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib GUI" ON)
 option(TRELLIS2_C_ENABLE_TENSOR_CORES "Prefer tensor-core capable kernels when 16-bit data and hardware support are available" ON)
 option(TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE "Build Vulkan glTF texture baking independent of the inference backend" ON)
@@ -1240,5 +1241,23 @@ if (TRELLIS2_C_BUILD_TOOLS)
         if (UNIX)
             target_link_libraries(trellis-gui PRIVATE m pthread)
         endif()
+    endif()
+endif()
+
+# Headless HTTP front end for the image-to-3D pipeline, for long-lived hosts that
+# spawn one process per model instead of one per request. It has its own option
+# because a managed deployment ships this one executable and nothing else.
+if (TRELLIS2_C_BUILD_SERVER)
+    add_executable(trellis2-server
+        tools/trellis2_server.c
+        tools/trellis_tool_cli.c
+    )
+    target_include_directories(trellis2-server PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
+    target_link_libraries(trellis2-server PRIVATE trellis2_c ggml)
+    if (WIN32)
+        target_link_libraries(trellis2-server PRIVATE ws2_32)
+    endif()
+    if (UNIX)
+        target_link_libraries(trellis2-server PRIVATE m)
     endif()
 endif()
